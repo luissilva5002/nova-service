@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   nova-api:
     build: .
@@ -8,6 +6,8 @@ services:
       - "8000:8000"  # Maps port 8000 on your PC to port 8000 in the container
     volumes:
       # Notice how volumes is indented directly under ports!
-      - C:/Users/Asus/Documents:/app/data/scan_root
-      - ./models:/app/models
+      - C:/Users/Asus/Documents/TEST:/app/data/scan_root
+
+      # (Highly recommended) Map your DB and Models so they persist!
       - ./db:/app/db
+      - ./models:/app/models

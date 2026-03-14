@@ -1,7 +1,7 @@
 {
   "scan_root": "/app/data/scan_root",
-  "model_name": "nova_model_lora.gguf",
-  "model_path": "/app/models/nova_model_lora.gguf",
+  "model_name": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+  "model_path": "/app/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
   "embedding_model": "all-MiniLM-L6-v2",
   "file_types": [".txt", ".xlsx"],
   "max_chunk_size": 512,
