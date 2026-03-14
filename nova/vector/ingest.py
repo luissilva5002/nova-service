@@ -65,45 +65,37 @@ def ingest_documents(folder_path: str, save_path: str = "db/vector_store"):
     
     state = load_state(state_path)
     new_texts = []
+    new_metadata = []  # NEW: Track metadata alongside texts
     updated_state = state.copy()
 
     supported_exts = ['.txt', '.pdf', '.docx', '.csv', '.xlsx']
 
-    # Add these to your ingest_documents function
     ignore_dirs = {
         'build', '.git', 'node_modules', '__pycache__', 'intermediates', 
-        'linux', 'windows', 'macos', 'ios', 'android', 'runner', # App build junk
-        'gerber', 'production', 'export', 'Symbols_Footprints_and_Models' # PCB junk
+        'linux', 'windows', 'macos', 'ios', 'android', 'runner', 
+        'gerber', 'production', 'export', 'Symbols_Footprints_and_Models' 
     }
     
-    # Specific folder names to skip entirely
     skip_keywords = {'raw data', 'test phase', 'dataset', 'labels', 'cmake'}
 
     for root, dirs, files in os.walk(folder_path):
-        # 1. Skip if .nova_ignore is present
         if ".nova_ignore" in files:
             dirs[:] = []
             continue
 
-        # 2. Strict Folder Filtering
         dirs[:] = [d for d in dirs if d not in ignore_dirs 
                    and not d.startswith('.') 
                    and d.lower() not in skip_keywords]
 
-        # 3. File Filtering
         for filename in files:
-            # Skip massive data files or system files
             if filename.lower() in ['cmakelists.txt', 'license.txt']:
                 continue
-
-        for filename in files:
+            
             ext = os.path.splitext(filename)[1].lower()
             
             if ext in supported_exts:
                 file_path = os.path.join(root, filename)
                 
-                # OPTIONAL: Skip files that are too small or look like ML labels
-                # (e.g., skip .txt files under 50 bytes because they are likely just IDs)
                 if ext == '.txt' and os.path.getsize(file_path) < 50:
                     continue
 
@@ -112,9 +104,8 @@ def ingest_documents(folder_path: str, save_path: str = "db/vector_store"):
                 try:
                     mtime = os.path.getmtime(file_path)
                 except FileNotFoundError:
-                    continue # Skip broken files or symlinks
+                    continue
                 
-                # If it's a new file, or it has been modified since we last checked
                 if rel_path not in state or state[rel_path] < mtime:
                     print(f"[INFO] Extracting: {rel_path}")
                     
@@ -122,7 +113,18 @@ def ingest_documents(folder_path: str, save_path: str = "db/vector_store"):
                     
                     if full_text.strip():
                         chunks = split_into_chunks(full_text)
-                        new_texts.extend(chunks)
+                        
+                        # NEW: Capture folder and add to parallel lists
+                        for chunk in chunks:
+                            new_texts.append(chunk)
+                            folder = os.path.dirname(rel_path)
+                            if not folder: 
+                                folder = "root"
+                                
+                            new_metadata.append({
+                                "folder": folder, 
+                                "filename": os.path.basename(rel_path)
+                            })
                         
                     updated_state[rel_path] = mtime
 
@@ -130,12 +132,10 @@ def ingest_documents(folder_path: str, save_path: str = "db/vector_store"):
         print("[INFO] No new documents to ingest. Database is up to date.")
         return
 
-    # 2. Embed the new text
     print(f"[INFO] Ingesting {len(new_texts)} new chunks...")
     new_embeddings = embed_text(new_texts)
     new_embeddings = np.array(new_embeddings).astype("float32")
 
-    # 3. Load existing DB (or create new) and append
     if os.path.exists(index_path) and os.path.exists(pkl_path):
         index = faiss.read_index(index_path)
         with open(pkl_path, "rb") as f:
@@ -146,9 +146,11 @@ def ingest_documents(folder_path: str, save_path: str = "db/vector_store"):
         all_texts = []
 
     index.add(new_embeddings)
-    all_texts.extend(new_texts)
+    
+    # NEW: Save as dictionaries containing the text AND metadata
+    combined_chunks = [{"text": t, "folder": m["folder"], "filename": m["filename"]} for t, m in zip(new_texts, new_metadata)]
+    all_texts.extend(combined_chunks)
 
-    # 4. Save everything
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     faiss.write_index(index, index_path)
     with open(pkl_path, "wb") as f:
