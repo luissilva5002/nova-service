@@ -1,9 +1,0 @@
-Tennis Performance Tracker – Smart BLE-Enabled Sensor Device
-
-The Tennis Performance Tracker is an innovative IoT device designed to monitor and analyze tennis shots in real time. Engineered for players of all levels, the device uses high-precision accelerometers and gyroscopes to capture motion data, which is then transmitted via Bluetooth Low Energy (BLE) to a companion mobile app. The system classifies different types of shots using a custom-trained machine learning model, helping athletes gain insights into their performance.
-
-The compact hardware features a custom PCB with the ESP32-C3 Mini module, optimized for low power consumption and efficient data transmission. The device is lightweight and easily attachable to any racket. It includes battery monitoring, and the entire design is targeted to meet CE and FCC certification standards for EU and global markets.
-
-The companion mobile application, built with Flutter, allows users to view detailed shot analytics, track improvements over time, and personalize their training goals. Data is synced locally and can be stored in the cloud for backup and analysis.
-
-Manufacturing of electronic and plastic components is done in China, with final assembly in Portugal. The project targets a retail price of €50–75, making professional-level tennis analytics affordable to a wide audience.

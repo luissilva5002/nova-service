@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  nova-api:
+    build: .
+    container_name: nova_backend
+    ports:
+      - "8000:8000"  # Maps port 8000 on your PC to port 8000 in the container
+    volumes:
+      # Notice how volumes is indented directly under ports!
+      - C:/Users/Asus/Documents:/app/data/scan_root
+      - ./models:/app/models
+      - ./db:/app/db

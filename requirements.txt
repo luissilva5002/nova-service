@@ -1,0 +1,16 @@
+# N.O.V.A. Core Dependencies
+llama-cpp-python==0.2.24
+faiss-cpu==1.7.4
+numpy==1.26.4
+sentence-transformers==2.2.2
+huggingface_hub==0.14.1
+
+# API / Web Server Dependencies
+fastapi
+uvicorn
+pydantic
+
+pypdf
+python-docx
+pandas
+openpyxl

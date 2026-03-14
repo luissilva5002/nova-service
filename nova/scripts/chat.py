@@ -5,7 +5,7 @@ from nova.vector.db import search_db
 # Global cache for model instance
 _llm = None
 
-def get_llm(model_path: str = "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"):
+def get_llm(model_path: str = "models/nova_model_lora.gguf"):
     global _llm
     if _llm is None:
         _llm = Llama(

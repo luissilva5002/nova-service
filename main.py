@@ -1,30 +1,35 @@
 import json
+from fastapi import FastAPI
+from pydantic import BaseModel
 from nova.vector.ingest import ingest_documents
 from nova.scripts.chat import chat_with_context
 
-SETTINGS_FILE = "settings.json"
+app = FastAPI()
 
-def load_settings(path):
-    with open(path, "r") as f:
-        return json.load(f)
+# Load settings on boot
+with open("settings.json", "r") as f:
+    settings = json.load(f)
 
-def main():
-    settings = load_settings(SETTINGS_FILE)
+# Run the smart ingestion when the server starts up
+@app.on_event("startup")
+def startup_event():
+    print(">> Checking documents for updates...")
+    # Notice we add "/vector_store" here so it perfectly matches db.py!
+    ingest_documents(settings["scan_root"], f"{settings['vector_db_path']}/vector_store")
+    print(">> N.O.V.A. API is ready!")
 
-    documents_path = settings["scan_root"]
-    db_path = settings["vector_db_path"]
-    model_path = settings["model_path"]
+# Define the structure of the data Flutter will send
+class QueryRequest(BaseModel):
+    question: str
 
-    print(">> Ingesting documents...")
-    ingest_documents(documents_path, db_path)
+# Create the endpoint Flutter will call
+@app.post("/chat")
+def chat_endpoint(request: QueryRequest):
+    answer = chat_with_context(
+        question=request.question, 
+        db_path=settings["vector_db_path"], 
+        model_path=settings["model_path"]
+    )
+    return {"response": answer}
 
-    print(">> Ready. Type your question (type 'exit' to quit).")
-    while True:
-        user_input = input("\nYou: ")
-        if user_input.strip().lower() in {"exit", "quit"}:
-            break
-        answer = chat_with_context(user_input, db_path, model_path)
-        print(f"\nN.O.V.A.: {answer}")
-
-if __name__ == "__main__":
-    main()
+# Note: You run this using 'uvicorn main:app --host 0.0.0.0 --port 8000' in your Dockerfile

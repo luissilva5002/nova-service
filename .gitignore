@@ -1,1 +1,21 @@
-models/
+# Python cache and byproduct files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Root level vector store artifacts (based on your folder tree)
+*.index
+*.pkl
+
+# Ignore everything inside db and models directories...
+/db/*
+/models/*
+
+# ...except for their README files (so the folders stay in Git)
+!/db/README.md
+!/models/README.md
+
+# Virtual environments (just in case you use them later)
+venv/
+env/
+.env
