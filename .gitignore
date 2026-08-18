@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# NOVA runtime data (host-mounted, never committed)
+/models/*
+!/models/.gitkeep
+/data/*
+!/data/.gitkeep
+/host_projects/*
+!/host_projects/.gitkeep
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

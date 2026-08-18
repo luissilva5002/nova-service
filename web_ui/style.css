@@ -1,0 +1,146 @@
+* { box-sizing: border-box; }
+
+body {
+    font-family: -apple-system, "Segoe UI", Arial, sans-serif;
+    background: #121212;
+    color: #fff;
+    margin: 0;
+    padding: 20px;
+}
+
+.container {
+    max-width: 640px;
+    margin: auto;
+    display: flex;
+    flex-direction: column;
+    height: 92vh;
+}
+
+.topbar {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 12px;
+}
+
+.topbar h1 {
+    font-size: 22px;
+    letter-spacing: 1px;
+    margin: 0;
+}
+
+.status-dot {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #e74c3c;
+    margin-left: 8px;
+}
+
+.status-dot.online { background: #2ecc71; }
+
+.status-label {
+    font-size: 12px;
+    color: #888;
+}
+
+.panel {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 14px;
+}
+
+.stat {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.stat strong {
+    color: #fff;
+    font-size: 13px;
+    text-transform: none;
+}
+
+.chat-box {
+    flex: 1;
+    border: 1px solid #333;
+    padding: 10px;
+    overflow-y: auto;
+    background: #1e1e1e;
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.msg {
+    margin: 4px 0;
+    padding: 8px 12px;
+    border-radius: 12px;
+    max-width: 80%;
+    line-height: 1.4;
+    font-size: 14px;
+}
+
+.user {
+    background: #005c99;
+    text-align: right;
+    align-self: flex-end;
+}
+
+.nova {
+    background: #2d2d2d;
+    text-align: left;
+    align-self: flex-start;
+}
+
+.input-area {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+input[type="text"] {
+    flex: 1;
+    padding: 12px;
+    border: none;
+    border-radius: 6px;
+    background: #222;
+    color: #fff;
+}
+
+input[type="text"]:focus {
+    outline: 2px solid #0088cc;
+}
+
+button {
+    padding: 12px 20px;
+    border: none;
+    border-radius: 6px;
+    background: #0088cc;
+    color: #fff;
+    cursor: pointer;
+    font-size: 14px;
+}
+
+button:hover { background: #0099e6; }
+
+#micBtn {
+    background: #333;
+    padding: 12px 16px;
+}
+
+#micBtn.recording {
+    background: #e74c3c;
+}

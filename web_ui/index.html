@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NOVA System Control</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header class="topbar">
+            <h1>NOVA <span class="status-dot" id="statusDot"></span></h1>
+            <span class="status-label" id="statusLabel">Connecting...</span>
+        </header>
+
+        <section class="panel" id="statusPanel">
+            <div class="stat"><span>Brain</span><strong id="statBrain">-</strong></div>
+            <div class="stat"><span>Ears (STT)</span><strong id="statStt">-</strong></div>
+            <div class="stat"><span>Mouth (TTS)</span><strong id="statTts">-</strong></div>
+            <div class="stat"><span>Active Project</span><strong id="statProject">-</strong></div>
+            <div class="stat"><span>LLM Speed</span><strong id="statTokensPerSecond">-</strong></div>
+        </section>
+
+        <div id="chat-box" class="chat-box"></div>
+
+        <div class="input-area">
+            <button id="micBtn" title="Hold to talk">&#127908;</button>
+            <input type="text" id="userInput" placeholder="Ask NOVA something..."
+                   onkeydown="if(event.key==='Enter') sendMsg()">
+            <button onclick="sendMsg()">Send</button>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=2"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  nova_server:
+    build: .
+    container_name: nova_core
+    restart: unless-stopped   # auto-launches when the host boots / Docker daemon starts
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount models from host machine so multi-GB GGUF/ONNX weights are
+      # never baked into the image.
+      - ./models:/app/models
+      # Persistent databases (SQLite core store + ChromaDB vector store)
+      - ./data:/app/data
+      # Mount local projects (read-only) so NOVA can inspect/ingest them,
+      # e.g. your Flutter app source trees.
+      - ${NOVA_HOST_PROJECTS_PATH:-./host_projects}:/app/host_projects:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OMP_NUM_THREADS=4         # utilize all 4 cores of a Ryzen 3
+      - NOVA_HOST_PROJECTS_DIR=/app/host_projects
+    deploy:
+      resources:
+        limits:
+          memory: 6.0G             # cap RAM so the host OS never crashes

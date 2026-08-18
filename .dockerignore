@@ -1,0 +1,21 @@
+# Don't send host-mounted runtime data into the build context - these are
+# volume-mounted at runtime (see docker-compose.yml), never baked into the image.
+models/
+data/
+host_projects/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Git / editor
+.git/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+
+# Docs (not needed inside the container)
+README.md

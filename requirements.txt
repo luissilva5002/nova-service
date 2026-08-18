@@ -1,0 +1,25 @@
+# --- Web / API layer ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+websockets>=12.0
+python-multipart>=0.0.9
+
+# --- The Brain (single LLM, tool calling) ---
+llama-cpp-python>=0.2.75
+
+# --- The Ears (Speech-to-Text) ---
+# faster-whisper (CTranslate2-based) instead of whisper-cpp-python: pure
+# pip install, no CMake/compiler step, actively maintained, and faster on
+# CPU. whisper-cpp-python's vendored whisper.cpp CMakeLists.txt is
+# incompatible with modern CMake (>=4.0 dropped support for its
+# `cmake_minimum_required` version) and reliably fails to build.
+faster-whisper>=1.0.0
+
+# --- The Mouth (Text-to-Speech) ---
+piper-tts>=1.2.0
+
+# --- Memory (Tier 2 core store + Tier 3 vector store) ---
+chromadb>=0.4.24
+
+# --- Structured tool-calling payloads ---
+pydantic>=2.6.0
