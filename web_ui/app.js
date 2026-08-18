@@ -7,7 +7,7 @@ const micBtn = document.getElementById('micBtn');
 const modelSelect = document.getElementById('modelSelect');
 const drawer = document.getElementById('drawer');
 
-let uiState = 'idle'; // 'idle' | 'user' | 'nova'
+let uiState = 'idle'; // 'idle' | 'user' | 'thinking' | 'nova'
 let speakTimeout;
 
 const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -26,16 +26,17 @@ ws.onclose = () => {
 
 ws.onmessage = (event) => {
     let payload;
-    setUiState('nova', 4000);
     try {
         payload = JSON.parse(event.data);
     } catch (e) {
         appendMessage('NOVA', event.data, 'nova');
+        setUiState('nova', 4000);
         return;
     }
 
     if (payload.type === 'text') {
         appendMessage('NOVA', payload.text, 'nova');
+        setUiState('nova', 4000);
     } else if (payload.type === 'metrics' && payload.llm) {
         showLlmSpeed(payload.llm);
     } else if (payload.type === 'audio' && payload.audio_b64) {
@@ -46,8 +47,19 @@ ws.onmessage = (event) => {
 function setUiState(state, timeoutMs = 0) {
     uiState = state;
     clearTimeout(speakTimeout);
+
+    if (state === 'thinking') {
+        statusLabel.textContent = 'THINKING...';
+    } else if (state === 'nova') {
+        statusLabel.textContent = 'RESPONDING...';
+    } else if (state === 'user') {
+        statusLabel.textContent = 'LISTENING...';
+    } else if (ws.readyState === WebSocket.OPEN) {
+        statusLabel.textContent = 'ONLINE';
+    }
+
     if (timeoutMs > 0) {
-        speakTimeout = setTimeout(() => { uiState = 'idle'; }, timeoutMs);
+        speakTimeout = setTimeout(() => setUiState('idle'), timeoutMs);
     }
 }
 
@@ -61,7 +73,7 @@ function sendMsg() {
     appendMessage('You', input.value, 'user');
     ws.send(JSON.stringify({ type: 'text', text: input.value }));
     input.value = '';
-    setUiState('nova', 3000);
+    setUiState('thinking', 20000);
 }
 
 function showLlmSpeed(metrics) {
@@ -83,7 +95,7 @@ function playAudioBase64(b64) {
     const wavBuffer = pcmToWav(pcmBytes, 22050);
     const blob = new Blob([wavBuffer], { type: 'audio/wav' });
     const audio = new Audio(URL.createObjectURL(blob));
-    
+
     setUiState('nova');
     audio.play().then(() => {
         setUiState('nova', (blob.size / 44100) * 1000 + 500);
@@ -94,7 +106,7 @@ function pcmToWav(pcmBytes, sampleRate) {
     const header = new ArrayBuffer(44);
     const view = new DataView(header);
     const writeStr = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
-    
+
     writeStr(0, 'RIFF');
     view.setUint32(4, 36 + pcmBytes.length, true);
     writeStr(8, 'WAVE');
@@ -108,7 +120,7 @@ function pcmToWav(pcmBytes, sampleRate) {
     view.setUint16(34, 16, true);
     writeStr(36, 'data');
     view.setUint32(40, pcmBytes.length, true);
-    
+
     const wav = new Uint8Array(44 + pcmBytes.length);
     wav.set(new Uint8Array(header), 0);
     wav.set(pcmBytes, 44);
@@ -162,42 +174,129 @@ setInterval(refreshStatus, 8000);
 // Mic Capture (Hold-to-Talk)
 let mediaRecorder = null;
 let audioChunks = [];
+let mediaStream = null;
+let isRecording = false;
+let permissionPending = false;
 
-micBtn.addEventListener('mousedown', startRecording);
-micBtn.addEventListener('mouseup', stopRecording);
-micBtn.addEventListener('mouseleave', stopRecording);
-
-async function startRecording() {
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorder = new MediaRecorder(stream);
-        audioChunks = [];
-        mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
-        mediaRecorder.onstop = sendRecordedAudio;
-        mediaRecorder.start();
-        micBtn.classList.add('recording');
-        setUiState('user');
-    } catch (e) {
-        console.warn('Microphone unavailable:', e);
+function setRecordingUi(recording) {
+    micBtn.classList.toggle('recording', recording);
+    if (recording) {
+        statusLabel.textContent = 'LISTENING...';
+    } else if (ws.readyState === WebSocket.OPEN && uiState === 'idle') {
+        statusLabel.textContent = 'ONLINE';
     }
+}
+
+function getPreferredRecorderMimeType() {
+    const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4',
+        'audio/ogg;codecs=opus',
+    ];
+    return candidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
+}
+
+function startRecording() {
+    if (isRecording || permissionPending) return;
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        statusLabel.textContent = 'MIC UNSUPPORTED';
+        console.warn('Microphone API unavailable in this browser.');
+        return;
+    }
+
+    if (!window.isSecureContext && !['localhost', '127.0.0.1'].includes(location.hostname)) {
+        statusLabel.textContent = 'USE HTTPS/LOCAL';
+        console.warn('getUserMedia is blocked on insecure origins like Tailscale addresses. Use localhost or HTTPS.');
+        return;
+    }
+
+    permissionPending = true;
+    setRecordingUi(true);
+
+    navigator.mediaDevices.getUserMedia({ audio: true })
+        .then((stream) => {
+            mediaStream = stream;
+            const mimeType = getPreferredRecorderMimeType();
+            const options = mimeType ? { mimeType } : undefined;
+            mediaRecorder = new MediaRecorder(stream, options);
+            audioChunks = [];
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data && e.data.size > 0) audioChunks.push(e.data);
+            };
+            mediaRecorder.onstop = sendRecordedAudio;
+            mediaRecorder.start();
+            isRecording = true;
+            permissionPending = false;
+            setUiState('user');
+        })
+        .catch((e) => {
+            console.warn('Microphone unavailable:', e);
+            statusLabel.textContent = 'MIC BLOCKED';
+            permissionPending = false;
+            isRecording = false;
+            setRecordingUi(false);
+            setUiState('idle');
+        });
 }
 
 function stopRecording() {
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    if (permissionPending) {
+        permissionPending = false;
+        setRecordingUi(false);
+        setUiState('idle');
+        return;
+    }
+
+    if (!isRecording || !mediaRecorder) {
+        setRecordingUi(false);
+        setUiState('idle');
+        return;
+    }
+
+    if (mediaRecorder.state !== 'inactive') {
         mediaRecorder.stop();
     }
-    micBtn.classList.remove('recording');
-    setUiState('idle');
+    if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+    }
+    isRecording = false;
+    setRecordingUi(false);
+    setUiState('thinking', 20000);
 }
+
+function handlePointerDown(event) {
+    event.preventDefault();
+    startRecording();
+}
+
+function handlePointerUp(event) {
+    if (event) event.preventDefault();
+    stopRecording();
+}
+
+micBtn.addEventListener('pointerdown', handlePointerDown);
+micBtn.addEventListener('pointerup', handlePointerUp);
+micBtn.addEventListener('pointerleave', handlePointerUp);
+micBtn.addEventListener('pointercancel', handlePointerUp);
+micBtn.addEventListener('touchstart', (event) => {
+    if (event.touches && event.touches.length > 0) {
+        startRecording();
+    }
+}, { passive: true });
+micBtn.addEventListener('touchend', stopRecording, { passive: true });
+micBtn.addEventListener('touchcancel', stopRecording, { passive: true });
 
 async function sendRecordedAudio() {
     if (!audioChunks.length) return;
-    const blob = new Blob(audioChunks, { type: 'audio/webm' });
+    const mimeType = mediaRecorder && mediaRecorder.mimeType ? mediaRecorder.mimeType : 'audio/webm';
+    const blob = new Blob(audioChunks, { type: mimeType });
     const arrayBuffer = await blob.arrayBuffer();
     const b64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
     ws.send(JSON.stringify({ type: 'audio', audio_b64: b64, mime_type: blob.type, final: true }));
     appendMessage('You', '[Voice Message]', 'user');
-    setUiState('nova', 3000);
 }
 
 // Canvas Visualizer Core
@@ -211,46 +310,67 @@ function drawHUDCore() {
     const cx = canvas.width / 2;
     const cy = canvas.height / 2;
 
-    let strokeColor = 'rgba(88, 80, 236, '; // Idle Violet/Indigo
-    if (uiState === 'nova') strokeColor = 'rgba(0, 210, 255, '; // NOVA Cyan/Blue
-    if (uiState === 'user') strokeColor = 'rgba(99, 102, 241, '; // User Violet
+    // Stark / Jarvis Color Palette Configurations
+    let strokeColor = 'rgba(0, 240, 255, ';     // Idle: Minimal Cyan
+    if (uiState === 'nova') strokeColor = 'rgba(0, 210, 255, ';       // Nova Active: Bright Cyan
+    if (uiState === 'user') strokeColor = 'rgba(56, 189, 248, ';      // User Voice: Electric Arc Blue
+    if (uiState === 'thinking') strokeColor = 'rgba(245, 158, 11, ';  // Thinking Mode: Stark Gold
 
-    // 1. Static Outer Ring
+    const thinking = uiState === 'thinking';
+
+    // 1. Static Ambient Grid Ring
     ctx.beginPath();
     ctx.arc(cx, cy, 190, 0, Math.PI * 2);
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
-    ctx.setLineDash([2, 10]);
+    ctx.strokeStyle = 'rgba(0, 240, 255, 0.06)';
+    ctx.setLineDash([2, 12]);
     ctx.stroke();
 
-    // 2. Rotating Segment Ring
+    // 2. Rotating Segment Ring (Outer Orbital Arc)
     ctx.save();
     ctx.translate(cx, cy);
     ctx.rotate(angle);
     ctx.beginPath();
-    ctx.arc(0, 0, 150, 0, Math.PI * 2);
-    ctx.strokeStyle = strokeColor + '0.4)';
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash([40, 20, 10, 20]);
+    if (thinking) {
+        ctx.setLineDash([60, 20, 10, 20]);
+        ctx.arc(0, 0, 150, 0, Math.PI * 1.5);
+        ctx.strokeStyle = strokeColor + '0.85)';
+        ctx.lineWidth = 2.5;
+    } else {
+        ctx.setLineDash([40, 20, 10, 20]);
+        ctx.arc(0, 0, 150, 0, Math.PI * 2);
+        ctx.strokeStyle = strokeColor + '0.35)';
+        ctx.lineWidth = 1.5;
+    }
     ctx.stroke();
     ctx.restore();
 
-    // 3. Counter-Rotating Inner Ring
+    // 3. Counter-Rotating Inner Ring (Thinking / Processing Node)
     ctx.save();
     ctx.translate(cx, cy);
-    ctx.rotate(-angle * 1.6);
+    ctx.rotate(-angle * 1.8);
     ctx.beginPath();
-    ctx.arc(0, 0, 110, 0, Math.PI * 2);
-    ctx.strokeStyle = strokeColor + '0.25)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([90, 40]);
+    if (thinking) {
+        ctx.setLineDash([120, 30]);
+        ctx.arc(0, 0, 110, 0, Math.PI * 2);
+        ctx.strokeStyle = strokeColor + '0.75)';
+        ctx.lineWidth = 2;
+    } else {
+        ctx.setLineDash([90, 40]);
+        ctx.arc(0, 0, 110, 0, Math.PI * 2);
+        ctx.strokeStyle = strokeColor + '0.2)';
+        ctx.lineWidth = 1;
+    }
     ctx.stroke();
     ctx.restore();
 
-    // 4. Dynamic Audio Wave Core
+    // 4. Dynamic Wave Core (Voice-Reactive Reactor Circle)
     ctx.beginPath();
     const points = 120;
     const baseRadius = 70;
-    let amp = uiState === 'idle' ? 3 : (uiState === 'user' ? 16 : 28);
+    let amp = 2.5; // Idle subtle wave
+    if (uiState === 'user') amp = 18;
+    if (uiState === 'nova') amp = 26;
+    if (thinking) amp = 5 + Math.sin(waveOffset * 3) * 4; // Pulsing thinking core
 
     for (let i = 0; i <= points; i++) {
         const theta = (i / points) * Math.PI * 2;
@@ -265,13 +385,21 @@ function drawHUDCore() {
     ctx.closePath();
     ctx.strokeStyle = strokeColor + '0.95)';
     ctx.lineWidth = 2;
-    ctx.shadowBlur = uiState === 'idle' ? 8 : 20;
+    ctx.shadowBlur = uiState === 'idle' ? 6 : 18;
     ctx.shadowColor = strokeColor + '0.8)';
     ctx.stroke();
     ctx.shadowBlur = 0;
 
-    angle += uiState === 'idle' ? 0.003 : 0.012;
-    waveOffset += uiState === 'idle' ? 0.04 : 0.15;
+    // Motion Velocities
+    let angleStep = 0.003;
+    if (uiState === 'user' || uiState === 'nova') angleStep = 0.012;
+    if (thinking) angleStep = 0.025; // Accelerate orbit while thinking
+    angle += angleStep;
+
+    let waveStep = 0.04;
+    if (uiState === 'user' || uiState === 'nova') waveStep = 0.14;
+    if (thinking) waveStep = 0.09;
+    waveOffset += waveStep;
 
     requestAnimationFrame(drawHUDCore);
 }

@@ -8,11 +8,6 @@ python-multipart>=0.0.9
 llama-cpp-python>=0.2.75
 
 # --- The Ears (Speech-to-Text) ---
-# faster-whisper (CTranslate2-based) instead of whisper-cpp-python: pure
-# pip install, no CMake/compiler step, actively maintained, and faster on
-# CPU. whisper-cpp-python's vendored whisper.cpp CMakeLists.txt is
-# incompatible with modern CMake (>=4.0 dropped support for its
-# `cmake_minimum_required` version) and reliably fails to build.
 faster-whisper>=1.0.0
 
 # --- The Mouth (Text-to-Speech) ---
@@ -23,3 +18,7 @@ chromadb>=0.4.24
 
 # --- Structured tool-calling payloads ---
 pydantic>=2.6.0
+
+# --- Skills & Music Automation ---
+ytmusicapi>=1.8.0
+yt-dlp>=2024.3.10

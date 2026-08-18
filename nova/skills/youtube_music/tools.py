@@ -1,36 +1,36 @@
 """
 nova/skills/youtube_music/tools.py
-Declarative tool definitions for YouTube Music control. The LLM reads
-these descriptions and converts free-form speech ("put on Linkin Park",
-"I'm in the mood for In The End") into a structured call - no keyword
-matching or trigger phrases required.
+Declarative tool definitions for YouTube Music control.
 """
 
 TOOLS = [
     {
         "name": "ytm_play",
-        "description": "Play a track, artist, or album on YouTube Music.",
+        "description": "Play a track, artist, or album on YouTube Music based on prompt intent.",
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Song name, artist, or album"},
+                "query": {
+                    "type": "string",
+                    "description": "Song name, artist, or album query extracted from user prompt.",
+                },
             },
             "required": ["query"],
         },
     },
     {
         "name": "ytm_skip",
-        "description": "Skip to the next track on YouTube Music.",
+        "description": "Skip to the next track or stop current playback.",
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "ytm_pause",
-        "description": "Pause playback on YouTube Music.",
+        "description": "Pause active YouTube Music playback.",
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "ytm_set_volume",
-        "description": "Set YouTube Music playback volume.",
+        "description": "Set YouTube Music playback volume level.",
         "parameters": {
             "type": "object",
             "properties": {

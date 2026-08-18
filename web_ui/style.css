@@ -99,105 +99,6 @@ body {
     outline: none;
 }
 
-@media (max-width: 768px) {
-    body {
-        overflow-y: auto;
-        padding-bottom: 110px;
-    }
-
-    .hud-header {
-        padding: 12px 14px;
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 10px;
-    }
-
-    .brand-title {
-        font-size: 0.95rem;
-        letter-spacing: 2px;
-    }
-
-    .telemetry-panel {
-        width: 100%;
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 8px 12px;
-        font-size: 0.62rem;
-    }
-
-    .stat-item {
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-
-    .core-wrapper {
-        position: relative;
-        top: auto;
-        left: auto;
-        transform: none;
-        width: min(76vw, 360px);
-        height: min(76vw, 360px);
-        margin: 18px auto 0;
-    }
-
-    .hud-controls {
-        position: fixed;
-        left: 50%;
-        bottom: max(12px, env(safe-area-inset-bottom));
-        transform: translateX(-50%);
-        width: min(calc(100% - 20px), 620px);
-        flex-wrap: wrap;
-        border-radius: 18px;
-        padding: 8px;
-        gap: 8px;
-    }
-
-    .hud-input {
-        order: 3;
-        width: 100%;
-        min-width: 0;
-        font-size: 0.85rem;
-    }
-
-    .hud-btn {
-        flex: 1 1 auto;
-        min-width: 0;
-        padding: 10px 12px;
-    }
-
-    .backlog-drawer {
-        width: min(92vw, 380px);
-    }
-}
-
-@media (max-width: 480px) {
-    .brand-title {
-        width: 100%;
-        justify-content: space-between;
-    }
-
-    .status-label {
-        font-size: 0.55rem;
-    }
-
-    .telemetry-panel {
-        grid-template-columns: 1fr;
-    }
-
-    .hud-controls {
-        gap: 6px;
-    }
-
-    .hud-btn {
-        flex-basis: calc(50% - 6px);
-    }
-
-    .hud-input {
-        order: 0;
-    }
-}
-
 /* Central HUD Canvas */
 .core-wrapper {
     position: absolute;
@@ -255,6 +156,10 @@ canvas {
     letter-spacing: 1px;
     text-transform: uppercase;
     transition: all 0.2s ease;
+    min-height: 44px;
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
 }
 
 .hud-btn:hover {
@@ -345,4 +250,231 @@ canvas {
     background: rgba(255, 255, 255, 0.04);
     border: 1px solid rgba(255, 255, 255, 0.08);
     align-self: flex-start;
+}
+
+/* ==========================================================================
+   STARK / JARVIS HUD MOBILE UI OVERHAUL (DOES NOT AFFECT DESKTOP VIEW)
+   ========================================================================== */
+
+@media (max-width: 768px) {
+    body {
+        overflow: hidden;
+        height: 100dvh;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        align-items: center;
+        /* Padding reserves space for fixed bottom control bar so margin: auto vertical centers accurately */
+        padding-bottom: calc(68px + env(safe-area-inset-bottom));
+        background: radial-gradient(circle at center, #050b14 0%, #010306 100%);
+    }
+
+    /* Minimalist HUD Telemetry Header */
+    .hud-header {
+        width: 100%;
+        padding: 12px 16px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+        background: rgba(3, 8, 18, 0.75);
+        backdrop-filter: blur(16px);
+        border-bottom: 1px solid rgba(0, 240, 255, 0.15);
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+        z-index: 20;
+    }
+
+    .brand-title {
+        font-size: 0.85rem;
+        letter-spacing: 3px;
+        color: #e2e8f0;
+        font-family: 'Courier New', Courier, monospace;
+        width: auto;
+    }
+
+    .status-label {
+        font-size: 0.6rem;
+        color: #00f0ff;
+        letter-spacing: 1.5px;
+        text-shadow: 0 0 6px rgba(0, 240, 255, 0.5);
+    }
+
+    .status-dot {
+        width: 6px;
+        height: 6px;
+    }
+
+    .telemetry-panel {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 12px;
+        font-size: 0.58rem;
+        letter-spacing: 1px;
+        color: #475569;
+        text-transform: uppercase;
+        justify-content: flex-end;
+    }
+
+    .stat-item strong {
+        color: #94a3b8;
+    }
+
+    .model-select {
+        background: rgba(0, 0, 0, 0.4);
+        border: 1px solid rgba(0, 240, 255, 0.2);
+        color: #00f0ff;
+        font-size: 0.6rem;
+        border-radius: 4px;
+        padding: 1px 4px;
+    }
+
+    /* Central Arc-Reactor Visualizer Core with Centered Nova Icon */
+    .core-wrapper {
+        position: relative;
+        top: 0;
+        left: 0;
+        transform: none;
+        width: min(76vw, 310px);
+        height: min(76vw, 310px);
+        margin: auto 0;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        /* Nova PNG centered directly behind the canvas rings */
+        background-image: url('/static/assets/nova.png');
+        background-position: center;
+        background-repeat: no-repeat;
+        background-size: 52% auto;
+    }
+
+    canvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        z-index: 2;
+    }
+
+    /* Integrated Bottom Control Pod */
+    .hud-controls {
+        position: fixed;
+        left: 50%;
+        bottom: max(16px, env(safe-area-inset-bottom));
+        transform: translateX(-50%);
+        width: calc(100% - 24px);
+        max-width: 460px;
+        flex-wrap: nowrap;
+        background: rgba(6, 12, 24, 0.85);
+        border: 1px solid rgba(0, 240, 255, 0.25);
+        border-radius: 28px;
+        padding: 6px 8px;
+        gap: 6px;
+        backdrop-filter: blur(20px);
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8), inset 0 0 12px rgba(0, 240, 255, 0.08);
+        z-index: 20;
+    }
+
+    .hud-input {
+        order: 2;
+        flex: 1;
+        min-width: 0;
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(0, 240, 255, 0.15);
+        border-radius: 20px;
+        color: #e2e8f0;
+        font-size: 0.8rem;
+        padding: 8px 12px;
+    }
+
+    .hud-input::placeholder {
+        color: #475569;
+        font-size: 0.72rem;
+        letter-spacing: 0.5px;
+    }
+
+    .hud-btn {
+        flex: 0 0 auto;
+        min-width: 0;
+        padding: 8px 12px;
+        font-size: 0.68rem;
+        border-radius: 18px;
+        border: 1px solid rgba(0, 240, 255, 0.2);
+        background: rgba(0, 240, 255, 0.04);
+        color: #cbd5e1;
+        min-height: 38px;
+    }
+
+    #micBtn {
+        order: 1;
+        background: rgba(0, 240, 255, 0.12);
+        border-color: rgba(0, 240, 255, 0.4);
+        color: #00f0ff;
+        font-weight: 600;
+        padding: 8px 14px;
+        box-shadow: 0 0 10px rgba(0, 240, 255, 0.15);
+    }
+
+    #micBtn.recording {
+        background: rgba(239, 68, 68, 0.25);
+        border-color: #ef4444;
+        color: #f87171;
+        box-shadow: 0 0 18px rgba(239, 68, 68, 0.4);
+    }
+
+    /* Backlog Drawer Overhaul */
+    .backlog-drawer {
+        width: 100vw;
+        height: 100dvh;
+        right: -100vw;
+        background: rgba(3, 7, 15, 0.96);
+        backdrop-filter: blur(24px);
+        border-left: none;
+        border-top: 1px solid rgba(0, 240, 255, 0.2);
+        padding: 20px 16px;
+    }
+
+    .drawer-header {
+        font-size: 0.75rem;
+        color: #00f0ff;
+        border-bottom-color: rgba(0, 240, 255, 0.15);
+    }
+
+    .msg {
+        font-size: 0.8rem;
+        border-radius: 8px;
+    }
+
+    .msg.user {
+        background: rgba(0, 240, 255, 0.08);
+        border: 1px solid rgba(0, 240, 255, 0.2);
+        color: #00f0ff;
+    }
+
+    .msg.nova {
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        color: #e2e8f0;
+    }
+}
+
+@media (max-width: 480px) {
+    .hud-header {
+        padding: 10px 12px;
+    }
+
+    .telemetry-panel {
+        font-size: 0.52rem;
+        gap: 4px 8px;
+    }
+
+    .hud-controls {
+        gap: 5px;
+        padding: 5px 6px;
+    }
+
+    .hud-btn {
+        padding: 6px 10px;
+        font-size: 0.65rem;
+    }
 }
