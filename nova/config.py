@@ -26,11 +26,25 @@ HOST = os.getenv("NOVA_HOST", "0.0.0.0")
 PORT = int(os.getenv("NOVA_PORT", "8000"))
 
 # --------------------------------------------------------------------------
-# The Brain (single LLM) - Qwen 2.5 3B or Llama 3.2 3B, GGUF, Q4_K_M
+# The Brain - selectable local GGUF models (Q4_K_M)
 # --------------------------------------------------------------------------
-LLM_MODEL_PATH = Path(
-    os.getenv("NOVA_LLM_MODEL_PATH", MODELS_DIR / "brain" / "qwen2.5-3b-instruct-q4_k_m.gguf")
-)
+LLM_MODELS = {
+    "qwen3-1.7b": {
+        "label": "Qwen3 1.7B",
+        "path": MODELS_DIR / "brain" / "Qwen_Qwen3-1.7B-Q4_K_M.gguf",
+    },
+    "qwen3-0.6b": {
+        "label": "Qwen3 0.6B",
+        "path": MODELS_DIR / "brain" / "Qwen3-0.6B-Q4_K_M.gguf",
+    },
+    "qwen2.5-3b": {
+        "label": "Qwen2.5 3B",
+        "path": MODELS_DIR / "brain" / "qwen2.5-3b-instruct-q4_k_m.gguf",
+    },
+}
+LLM_DEFAULT_MODEL_ID = os.getenv("NOVA_LLM_MODEL", "qwen2.5-3b")
+# Backward-compatible override for deployments that set NOVA_LLM_MODEL_PATH.
+LLM_MODEL_PATH = Path(os.getenv("NOVA_LLM_MODEL_PATH", LLM_MODELS[LLM_DEFAULT_MODEL_ID]["path"]))
 LLM_CONTEXT_SIZE = int(os.getenv("NOVA_LLM_CTX", "4096"))
 LLM_THREADS = int(os.getenv("OMP_NUM_THREADS", os.getenv("NOVA_LLM_THREADS", "4")))
 LLM_GPU_LAYERS = int(os.getenv("NOVA_LLM_GPU_LAYERS", "0"))  # 0 = CPU only (Ryzen 3 target)
@@ -45,10 +59,12 @@ NOVA_PERSONA_PROMPT = os.getenv(
 )
 
 # --------------------------------------------------------------------------
-# The Ears - whisper.cpp (STT)
+# The Ears - faster-whisper (STT)
 # --------------------------------------------------------------------------
-WHISPER_MODEL_PATH = Path(
-    os.getenv("NOVA_WHISPER_MODEL_PATH", MODELS_DIR / "whisper" / "ggml-base.en.bin")
+# faster-whisper downloads a CTranslate2 model directory from Hugging Face.
+# This must be a directory, not the legacy whisper.cpp .bin model file.
+WHISPER_MODEL_CACHE_DIR = Path(
+    os.getenv("NOVA_WHISPER_CACHE_DIR", MODELS_DIR / "whisper" / "faster_whisper_cache")
 )
 WHISPER_FILLER_PROMPT = (
     "Clean transcript without filler words, ums, or hesitations."

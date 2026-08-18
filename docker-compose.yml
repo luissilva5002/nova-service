@@ -11,6 +11,8 @@ services:
       # Mount models from host machine so multi-GB GGUF/ONNX weights are
       # never baked into the image.
       - ./models:/app/models
+      # Live-edit the web dashboard without rebuilding the image.
+      - ./web_ui:/app/web_ui:ro
       # Persistent databases (SQLite core store + ChromaDB vector store)
       - ./data:/app/data
       # Mount local projects (read-only) so NOVA can inspect/ingest them,

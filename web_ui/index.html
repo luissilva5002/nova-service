@@ -3,34 +3,51 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NOVA System Control</title>
+    <title>NOVA // System Control</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <div class="container">
-        <header class="topbar">
-            <h1>NOVA <span class="status-dot" id="statusDot"></span></h1>
-            <span class="status-label" id="statusLabel">Connecting...</span>
-        </header>
 
-        <section class="panel" id="statusPanel">
-            <div class="stat"><span>Brain</span><strong id="statBrain">-</strong></div>
-            <div class="stat"><span>Ears (STT)</span><strong id="statStt">-</strong></div>
-            <div class="stat"><span>Mouth (TTS)</span><strong id="statTts">-</strong></div>
-            <div class="stat"><span>Active Project</span><strong id="statProject">-</strong></div>
-            <div class="stat"><span>LLM Speed</span><strong id="statTokensPerSecond">-</strong></div>
-        </section>
-
-        <div id="chat-box" class="chat-box"></div>
-
-        <div class="input-area">
-            <button id="micBtn" title="Hold to talk">&#127908;</button>
-            <input type="text" id="userInput" placeholder="Ask NOVA something..."
-                   onkeydown="if(event.key==='Enter') sendMsg()">
-            <button onclick="sendMsg()">Send</button>
+    <!-- HUD Header Bar -->
+    <header class="hud-header">
+        <div class="brand-title">
+            <span class="status-dot" id="statusDot"></span>
+            NOVA <span class="status-label" id="statusLabel">CONNECTING...</span>
         </div>
+
+        <div class="telemetry-panel">
+            <div class="stat-item">BRAIN: <strong id="statBrain">-</strong></div>
+            <div class="stat-item">STT: <strong id="statStt">-</strong></div>
+            <div class="stat-item">TTS: <strong id="statTts">-</strong></div>
+            <div class="stat-item">SPEED: <strong id="statTokensPerSecond">0.0 tok/s</strong></div>
+            <div class="stat-item">
+                <select id="modelSelect" class="model-select" disabled></select>
+            </div>
+        </div>
+    </header>
+
+    <!-- Center Visualizer Core -->
+    <main class="core-wrapper">
+        <canvas id="orbCanvas" width="480" height="480"></canvas>
+    </main>
+
+    <!-- Floating HUD Command Bar -->
+    <div class="hud-controls">
+        <button id="micBtn" class="hud-btn" title="Hold to Talk">🎙 Mic</button>
+        <input type="text" id="userInput" class="hud-input" placeholder="Initiate command sequence..." onkeydown="if(event.key==='Enter') sendMsg()" />
+        <button class="hud-btn" onclick="sendMsg()">Send</button>
+        <button class="hud-btn" onclick="toggleDrawer()">Backlog</button>
     </div>
 
-    <script src="/static/app.js?v=2"></script>
+    <!-- Hidden Conversation Backlog Drawer -->
+    <aside class="backlog-drawer" id="drawer">
+        <div class="drawer-header">
+            <span>// CONVERSATION BACKLOG</span>
+            <span class="close-btn" onclick="toggleDrawer()">✕</span>
+        </div>
+        <div id="chat-box" class="chat-box"></div>
+    </aside>
+
+    <script src="/static/app.js"></script>
 </body>
 </html>

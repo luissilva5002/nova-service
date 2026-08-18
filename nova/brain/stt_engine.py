@@ -16,9 +16,10 @@ int8 quantization.
 import io
 import logging
 import re
+import subprocess
 import wave
 
-from nova.config import WHISPER_MODEL_PATH, WHISPER_FILLER_PROMPT
+from nova.config import WHISPER_MODEL_CACHE_DIR, WHISPER_FILLER_PROMPT
 
 logger = logging.getLogger("nova.stt_engine")
 
@@ -33,7 +34,7 @@ except ImportError:  # pragma: no cover
 _FILLER_PATTERN = re.compile(r"\b(uh+|um+|erm+|like|you know)\b[,]?\s*", re.IGNORECASE)
 
 # faster-whisper model size/name (auto-downloaded from Hugging Face into
-# WHISPER_MODEL_PATH on first use, then cached there for subsequent runs).
+# WHISPER_MODEL_CACHE_DIR on first use, then cached there for subsequent runs).
 # Options: tiny.en, base.en, small.en, medium.en, distil-large-v3, etc.
 WHISPER_MODEL_SIZE = "base.en"
 
@@ -42,21 +43,22 @@ class STTEngine:
     def __init__(self):
         self._model = None
         self._loaded = False
+        self._load_attempted = False
 
     def load(self) -> None:
-        if self._loaded:
+        if self._load_attempted:
             return
+        self._load_attempted = True
         if not _WHISPER_AVAILABLE:
             logger.warning(
                 "faster-whisper not installed - STT engine running in STUB mode."
             )
-            self._loaded = True
             return
 
-        WHISPER_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        WHISPER_MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         logger.info(
             "Loading faster-whisper model '%s' (cache dir: %s) ...",
-            WHISPER_MODEL_SIZE, WHISPER_MODEL_PATH,
+            WHISPER_MODEL_SIZE, WHISPER_MODEL_CACHE_DIR,
         )
         try:
             # int8 compute type keeps this fast and light on a Ryzen 3 CPU.
@@ -64,12 +66,12 @@ class STTEngine:
                 WHISPER_MODEL_SIZE,
                 device="cpu",
                 compute_type="int8",
-                download_root=str(WHISPER_MODEL_PATH),
+                download_root=str(WHISPER_MODEL_CACHE_DIR),
             )
         except Exception:
             logger.exception("Failed to load faster-whisper model - STT engine running in STUB mode.")
             self._model = None
-        self._loaded = True
+        self._loaded = self._model is not None
 
     def transcribe(self, audio_bytes: bytes, sample_rate: int = 16000) -> str:
         """
@@ -93,6 +95,28 @@ class STTEngine:
         )
         text = " ".join(segment.text.strip() for segment in segments)
         return self._strip_residual_fillers(text)
+
+    def transcribe_media(self, audio_bytes: bytes) -> str:
+        """Transcribe browser-recorded WebM/Opus audio via FFmpeg conversion."""
+        if not audio_bytes:
+            return ""
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le",
+                    "-ac", "1", "-ar", "16000", "pipe:1",
+                ],
+                input=audio_bytes,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            logger.warning("Could not decode microphone audio: %s", exc)
+            return ""
+        return self.transcribe(result.stdout, sample_rate=16000)
 
     @staticmethod
     def _pcm16_to_wav(pcm_bytes: bytes, sample_rate: int) -> io.BytesIO:

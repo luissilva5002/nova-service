@@ -13,7 +13,7 @@ import base64
 import json
 import logging
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
@@ -73,12 +73,27 @@ async def get_status():
         "tts_loaded": tts_engine._loaded,
         "active_project": core_store.get_fact("active_project"),
         "voices_available": tts_engine.list_available_voices(),
+        "models": llm_engine.list_models(),
     }
 
 
 @app.get("/api/skills")
 async def get_skills():
     return {"skills": tool_router.list_skills()}
+
+
+@app.post("/api/models/{model_id}")
+async def select_model(model_id: str):
+    """Unload the active local model and load an installed selection."""
+    try:
+        return llm_engine.select_model(model_id)
+    except ValueError as exc:
+        status_code = 404 if str(exc).startswith("Unknown model:") else 500
+        raise HTTPException(status_code=status_code, detail=f"Could not load model: {exc}") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - report a failed local model load to the UI
+        raise HTTPException(status_code=500, detail=f"Could not load model: {exc}") from exc
 
 
 @app.post("/api/ingest/{project_id}")
@@ -161,7 +176,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 audio_buffer.extend(base64.b64decode(message.get("audio_b64", "")))
                 if not message.get("final"):
                     continue  # keep buffering until the client signals end-of-utterance
-                user_text = stt_engine.transcribe(bytes(audio_buffer))
+                user_text = stt_engine.transcribe_media(bytes(audio_buffer))
                 audio_buffer.clear()
             else:
                 user_text = message.get("text", "")
