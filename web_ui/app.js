@@ -6,9 +6,13 @@ const statusLabel = document.getElementById('statusLabel');
 const micBtn = document.getElementById('micBtn');
 const modelSelect = document.getElementById('modelSelect');
 const drawer = document.getElementById('drawer');
+const coreWrapper = document.getElementById('coreWrapper');
 
 let uiState = 'idle'; // 'idle' | 'user' | 'thinking' | 'nova'
 let speakTimeout;
+let audioFallbackTimeout;
+let thinkingStartedAt = 0;
+const MIN_THINKING_MS = 700; // spinner stays visible at least this long, even on instant replies
 
 const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
 const ws = new WebSocket(`${wsProtocol}://${location.host}/ws/chat`);
@@ -36,19 +40,53 @@ ws.onmessage = (event) => {
 
     if (payload.type === 'text') {
         appendMessage('NOVA', payload.text, 'nova');
-        setUiState('nova', 4000);
+        // Stay in 'thinking' - audio hasn't started yet, TTS is still
+        // synthesizing. If no audio message follows shortly (e.g. TTS
+        // stub mode / disabled, or an open_url action with no TTS),
+        // fall back so we don't get stuck.
+        clearTimeout(audioFallbackTimeout);
+        audioFallbackTimeout = setTimeout(() => {
+            if (uiState === 'thinking') setUiState('nova', 4000);
+        }, 4000);
     } else if (payload.type === 'metrics' && payload.llm) {
         showLlmSpeed(payload.llm);
+        // Still thinking/streaming - leave the spinner running.
+    } else if (payload.type === 'open_url' && payload.url) {
+        if (payload.text) appendMessage('NOVA', payload.text, 'nova');
+        // Slight delay so the message above renders before navigation.
+        // Using location.href (not window.open) so mobile OSes can route
+        // this to an installed app via universal/app links, falling back
+        // to the browser automatically if no app claims the link.
+        setTimeout(() => { window.location.href = payload.url; }, 300);
     } else if (payload.type === 'audio' && payload.audio_b64) {
+        clearTimeout(audioFallbackTimeout); // audio arrived, cancel the fallback
         playAudioBase64(payload.audio_b64);
     }
 };
 
 function setUiState(state, timeoutMs = 0) {
+    // Enforce a minimum visible duration for 'thinking' before allowing a
+    // transition away from it - otherwise a fast model can make the
+    // spinner flash for a single frame.
+    if (uiState === 'thinking' && state !== 'thinking') {
+        const elapsed = Date.now() - thinkingStartedAt;
+        if (elapsed < MIN_THINKING_MS) {
+            setTimeout(() => setUiState(state, timeoutMs), MIN_THINKING_MS - elapsed);
+            return;
+        }
+    }
+
     uiState = state;
     clearTimeout(speakTimeout);
 
+    // Toggle the CSS-driven spinner rings via a class instead of per-frame
+    // JS. These animate on the compositor thread, so they keep spinning
+    // even if the main JS thread (and canvas rAF loop) stalls - which it
+    // will while the host CPU is pinned at 100% during LLM inference.
+    coreWrapper.classList.toggle('is-thinking', state === 'thinking');
+
     if (state === 'thinking') {
+        thinkingStartedAt = Date.now();
         statusLabel.textContent = 'THINKING...';
     } else if (state === 'nova') {
         statusLabel.textContent = 'RESPONDING...';
@@ -73,6 +111,8 @@ function sendMsg() {
     appendMessage('You', input.value, 'user');
     ws.send(JSON.stringify({ type: 'text', text: input.value }));
     input.value = '';
+    // Safety net only - the real exit from 'thinking' happens when audio
+    // actually starts playing (see playAudioBase64), not here.
     setUiState('thinking', 20000);
 }
 
@@ -96,6 +136,8 @@ function playAudioBase64(b64) {
     const blob = new Blob([wavBuffer], { type: 'audio/wav' });
     const audio = new Audio(URL.createObjectURL(blob));
 
+    // Audio is actually about to play now - this is the real transition
+    // out of 'thinking' into 'nova' (speaking).
     setUiState('nova');
     audio.play().then(() => {
         setUiState('nova', (blob.size / 44100) * 1000 + 500);
@@ -264,6 +306,8 @@ function stopRecording() {
     }
     isRecording = false;
     setRecordingUi(false);
+    // Safety net only - the real exit from 'thinking' happens when audio
+    // actually starts playing (see playAudioBase64), not here.
     setUiState('thinking', 20000);
 }
 
@@ -297,6 +341,7 @@ async function sendRecordedAudio() {
     const b64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
     ws.send(JSON.stringify({ type: 'audio', audio_b64: b64, mime_type: blob.type, final: true }));
     appendMessage('You', '[Voice Message]', 'user');
+    // uiState is already 'thinking' (set by stopRecording) - leave it running.
 }
 
 // Canvas Visualizer Core
@@ -310,67 +355,66 @@ function drawHUDCore() {
     const cx = canvas.width / 2;
     const cy = canvas.height / 2;
 
-    // Stark / Jarvis Color Palette Configurations
-    let strokeColor = 'rgba(0, 240, 255, ';     // Idle: Minimal Cyan
-    if (uiState === 'nova') strokeColor = 'rgba(0, 210, 255, ';       // Nova Active: Bright Cyan
-    if (uiState === 'user') strokeColor = 'rgba(56, 189, 248, ';      // User Voice: Electric Arc Blue
-    if (uiState === 'thinking') strokeColor = 'rgba(245, 158, 11, ';  // Thinking Mode: Stark Gold
+    let strokeColor = 'rgba(88, 80, 236, ';   // Idle Violet/Indigo
+    if (uiState === 'nova') strokeColor = 'rgba(0, 210, 255, ';       // NOVA Cyan/Blue
+    if (uiState === 'user') strokeColor = 'rgba(99, 102, 241, ';      // User Violet
+    if (uiState === 'thinking') strokeColor = 'rgba(245, 158, 11, ';  // Processing Amber
 
     const thinking = uiState === 'thinking';
 
-    // 1. Static Ambient Grid Ring
+    // 1. Static Outer Ring
     ctx.beginPath();
     ctx.arc(cx, cy, 190, 0, Math.PI * 2);
-    ctx.strokeStyle = 'rgba(0, 240, 255, 0.06)';
-    ctx.setLineDash([2, 12]);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
+    ctx.setLineDash([2, 10]);
     ctx.stroke();
 
-    // 2. Rotating Segment Ring (Outer Orbital Arc)
+    // 2. Rotating Segment Ring
     ctx.save();
     ctx.translate(cx, cy);
     ctx.rotate(angle);
     ctx.beginPath();
     if (thinking) {
-        ctx.setLineDash([60, 20, 10, 20]);
-        ctx.arc(0, 0, 150, 0, Math.PI * 1.5);
-        ctx.strokeStyle = strokeColor + '0.85)';
-        ctx.lineWidth = 2.5;
+        ctx.setLineDash([]);
+        ctx.arc(0, 0, 150, 0, Math.PI * 0.55);
+        ctx.strokeStyle = strokeColor + '0.9)';
+        ctx.lineWidth = 3;
     } else {
         ctx.setLineDash([40, 20, 10, 20]);
         ctx.arc(0, 0, 150, 0, Math.PI * 2);
-        ctx.strokeStyle = strokeColor + '0.35)';
+        ctx.strokeStyle = strokeColor + '0.4)';
         ctx.lineWidth = 1.5;
     }
     ctx.stroke();
     ctx.restore();
 
-    // 3. Counter-Rotating Inner Ring (Thinking / Processing Node)
+    // 3. Counter-Rotating Inner Ring
     ctx.save();
     ctx.translate(cx, cy);
-    ctx.rotate(-angle * 1.8);
+    ctx.rotate(-angle * 1.6);
     ctx.beginPath();
     if (thinking) {
-        ctx.setLineDash([120, 30]);
-        ctx.arc(0, 0, 110, 0, Math.PI * 2);
-        ctx.strokeStyle = strokeColor + '0.75)';
+        ctx.setLineDash([]);
+        ctx.arc(0, 0, 110, 0, Math.PI * 0.35);
+        ctx.strokeStyle = strokeColor + '0.65)';
         ctx.lineWidth = 2;
     } else {
         ctx.setLineDash([90, 40]);
         ctx.arc(0, 0, 110, 0, Math.PI * 2);
-        ctx.strokeStyle = strokeColor + '0.2)';
+        ctx.strokeStyle = strokeColor + '0.25)';
         ctx.lineWidth = 1;
     }
     ctx.stroke();
     ctx.restore();
 
-    // 4. Dynamic Wave Core (Voice-Reactive Reactor Circle)
+    // 4. Dynamic Audio Wave Core
     ctx.beginPath();
     const points = 120;
     const baseRadius = 70;
-    let amp = 2.5; // Idle subtle wave
-    if (uiState === 'user') amp = 18;
-    if (uiState === 'nova') amp = 26;
-    if (thinking) amp = 5 + Math.sin(waveOffset * 3) * 4; // Pulsing thinking core
+    let amp = 3; // idle
+    if (uiState === 'user') amp = 16;
+    if (uiState === 'nova') amp = 28;
+    if (thinking) amp = 6 + Math.sin(waveOffset * 2) * 3;
 
     for (let i = 0; i <= points; i++) {
         const theta = (i / points) * Math.PI * 2;
@@ -385,20 +429,19 @@ function drawHUDCore() {
     ctx.closePath();
     ctx.strokeStyle = strokeColor + '0.95)';
     ctx.lineWidth = 2;
-    ctx.shadowBlur = uiState === 'idle' ? 6 : 18;
+    ctx.shadowBlur = uiState === 'idle' ? 8 : 20;
     ctx.shadowColor = strokeColor + '0.8)';
     ctx.stroke();
     ctx.shadowBlur = 0;
 
-    // Motion Velocities
     let angleStep = 0.003;
     if (uiState === 'user' || uiState === 'nova') angleStep = 0.012;
-    if (thinking) angleStep = 0.025; // Accelerate orbit while thinking
+    if (thinking) angleStep = 0.02;
     angle += angleStep;
 
     let waveStep = 0.04;
-    if (uiState === 'user' || uiState === 'nova') waveStep = 0.14;
-    if (thinking) waveStep = 0.09;
+    if (uiState === 'user' || uiState === 'nova') waveStep = 0.15;
+    if (thinking) waveStep = 0.08;
     waveOffset += waveStep;
 
     requestAnimationFrame(drawHUDCore);

@@ -12,6 +12,8 @@ Execution -> TTS -> Audio Out. Exposes:
 import base64
 import json
 import logging
+import re
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -104,11 +106,51 @@ async def post_ingest(project_id: str):
     return result
 
 
-async def run_pipeline(user_text: str) -> tuple[str, bytes, dict]:
+def _extract_tool_call_from_text(content: str) -> Optional[dict]:
+    """
+    Recovers a tool call the model emitted as free-form text instead of
+    a structured `tool_calls` field (small models like Qwen3-0.6B often
+    do this instead of honoring the grammar-constrained tool-call API).
+
+    Handles the common case where the model doubles the outer JSON
+    braces, e.g.:
+        <tool_call>{{"name": "x", "arguments": {...}}}</tool_call>
+    which is syntactically invalid JSON as-is (json.loads raises on the
+    doubled braces) - so we peel one layer of outer braces and retry
+    before giving up.
+    """
+    match = re.search(r"<tool_call>(.*?)</tool_call>", content, re.S)
+    raw = match.group(1).strip() if match else content.strip()
+
+    candidates = [raw]
+    if raw.startswith("{{") and raw.endswith("}}"):
+        candidates.append(raw[1:-1].strip())
+
+    first, last = raw.find("{"), raw.rfind("}")
+    if first != -1 and last > first:
+        trimmed = raw[first:last + 1]
+        candidates.append(trimmed)
+        if trimmed.startswith("{{") and trimmed.endswith("}}"):
+            candidates.append(trimmed[1:-1].strip())
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict) and "name" in parsed:
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+async def run_pipeline(user_text: str) -> tuple[str, bytes, dict, Optional[dict]]:
     """
     Runs one full NOVA turn on already-transcribed text:
       Brain (tool intent) -> [Skill execution + feedback loop] -> reply text
-    Returns (reply_text, synthesized_audio_bytes, LLM generation metrics).
+    Returns (reply_text, synthesized_audio_bytes, LLM generation metrics,
+    client_action). client_action is an optional dict (e.g. {"type":
+    "open_url", "url": ..., "message": ...}) the WebSocket handler
+    forwards to the client so it can act on it (e.g. open a deep link).
     Kept as a standalone function so both the WebSocket handler and any
     future REST /api/chat endpoint can reuse it.
     """
@@ -121,29 +163,93 @@ async def run_pipeline(user_text: str) -> tuple[str, bytes, dict]:
         tool_schemas=tool_router.tool_schemas,
         memory_context=memory_context,
     )
+    # Debug: log the LLM decision so we can trace tool_call vs text paths
+    logger.info("LLM decision: %s", json.dumps(decision) if isinstance(decision, dict) else str(decision))
 
-    if decision["type"] == "tool_call":
+    # Some models output the tool call wrapped in text (e.g. a <tool_call> block)
+    # instead of using the structured tool_calls API field. Detect and recover
+    # a tool_call embedded in the text output so the skill dispatch path still runs.
+    if isinstance(decision, dict) and decision.get("type") == "text":
+        content = decision.get("content", "")
+        if "<tool_call" in content:
+            parsed = _extract_tool_call_from_text(content)
+            if parsed:
+                decision = {
+                    "type": "tool_call",
+                    "name": parsed.get("name"),
+                    "arguments": parsed.get("arguments", {}),
+                    "metrics": decision.get("metrics", {}),
+                }
+                logger.info("Recovered tool_call from LLM text output: %s", json.dumps(decision))
+            else:
+                logger.warning("Found <tool_call> in output but failed to parse JSON: %r", content)
+
+    audio_bytes = b""
+    generation_metrics = {}
+    client_action = None
+
+    if isinstance(decision, dict) and decision.get("type") == "tool_call":
         tool_result = tool_router.dispatch(decision["name"], decision["arguments"])
-        # Response Feedback Loop: feed the tool's result back through the
-        # brain so NOVA replies naturally instead of reading raw JSON.
+
+        # Normalize tool_result into a user-friendly string to feed back to the LLM
+        user_prompt_for_llm = ""
+        try:
+            if isinstance(tool_result, dict):
+                # Audio payload produced by the tool
+                if tool_result.get("type") == "audio":
+                    try:
+                        from pathlib import Path
+                        audio_path = Path(tool_result.get("path", ""))
+                        if audio_path.exists():
+                            audio_bytes = audio_path.read_bytes()
+                        else:
+                            logger.warning("Tool returned audio path that does not exist: %s", audio_path)
+                    except Exception:
+                        logger.exception("Failed to read audio file returned by tool.")
+                    user_prompt_for_llm = tool_result.get("message") or f"Executed tool {decision['name']} (audio)."
+                elif tool_result.get("type") == "open_url":
+                    # Instruct client to open a URL (e.g. YouTube Music deep link)
+                    client_action = tool_result
+                    user_prompt_for_llm = tool_result.get("message") or f"Executed tool {decision['name']} (open_url)."
+                else:
+                    # Generic dict result: prefer human 'message' key if present
+                    user_prompt_for_llm = tool_result.get("message") if tool_result.get("message") else json.dumps(tool_result)
+            else:
+                # tool_result is a string (normal case)
+                user_prompt_for_llm = str(tool_result)
+        except Exception:
+            logger.exception("Error normalizing tool result for feedback loop.")
+            user_prompt_for_llm = str(tool_result)
+
+        # Response Feedback Loop: ask the brain to confirm / describe the action
         reply_text, generation_metrics = await llm_engine.generate_raw_with_metrics(
-            system_prompt="Confirm this action result to the user in one natural spoken sentence.",
-            user_prompt=tool_result,
+            system_prompt="Confirm this action result to the user in one natural spoken sentence. If the action produced audio, also say that playback has started.",
+            user_prompt=user_prompt_for_llm,
             max_tokens=64,
         )
-        reply_text = reply_text.strip() or tool_result
+
+        # Ensure reply_text is a string
+        if not isinstance(reply_text, str):
+            reply_text = str(reply_text)
+        reply_text = reply_text.strip()
+
     else:
-        reply_text = decision["content"]
-        generation_metrics = decision.get("metrics", {})
+        reply_text = decision.get("content") if isinstance(decision, dict) else str(decision)
+        generation_metrics = decision.get("metrics", {}) if isinstance(decision, dict) else {}
 
     core_store.log_message("nova", reply_text)
 
+    # If the tool produced audio bytes, prefer them over TTS.
+    if audio_bytes:
+        return reply_text, audio_bytes, generation_metrics, client_action
+
+    # Otherwise synthesize TTS as before.
     audio_chunks = []
     async for chunk in tts_engine.synthesize_stream(reply_text):
         audio_chunks.append(chunk)
     audio_bytes = b"".join(audio_chunks)
 
-    return reply_text, audio_bytes, generation_metrics
+    return reply_text, audio_bytes, generation_metrics, client_action
 
 
 @app.websocket("/ws/chat")
@@ -155,6 +261,8 @@ async def websocket_endpoint(websocket: WebSocket):
       {"type": "audio", "audio_b64": "...", "final": true} -> voice input
     Replies with:
       {"type": "text", "text": "..."}                   -> NOVA's spoken reply text
+      {"type": "metrics", "llm": {...}}                  -> generation throughput stats
+      {"type": "open_url", "url": "...", "text": "..."}  -> ask client to navigate/open a link
       {"type": "audio", "audio_b64": "..."}              -> synthesized speech (streamed)
     """
     await websocket.accept()
@@ -184,10 +292,28 @@ async def websocket_endpoint(websocket: WebSocket):
             if not user_text.strip():
                 continue
 
-            reply_text, audio_bytes, generation_metrics = await run_pipeline(user_text)
+            reply_text, audio_bytes, generation_metrics, client_action = await run_pipeline(user_text)
+
+            # Log what we are about to send to the client (debug)
+            logger.info(
+                "Sending to WS client: text=%s, open_url=%s, audio_bytes=%s",
+                reply_text,
+                client_action.get("url") if client_action and isinstance(client_action, dict) else None,
+                'yes' if audio_bytes else 'no',
+            )
 
             await websocket.send_text(json.dumps({"type": "text", "text": reply_text}))
             await websocket.send_text(json.dumps({"type": "metrics", "llm": generation_metrics}))
+
+            # If the tool asked the client to open a URL, send that action
+            if client_action and isinstance(client_action, dict) and client_action.get("type") == "open_url":
+                logger.info("Forwarding open_url to client: %s", client_action.get("url"))
+                await websocket.send_text(json.dumps({
+                    "type": "open_url",
+                    "url": client_action.get("url"),
+                    "text": client_action.get("message"),
+                }))
+
             if audio_bytes:
                 await websocket.send_text(json.dumps({
                     "type": "audio",

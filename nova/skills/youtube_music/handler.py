@@ -69,43 +69,16 @@ class YoutubeMusicSkill(BaseSkill):
 
                 video_url = f"https://music.youtube.com/watch?v={video_id}"
 
-                # 2. Stop currently playing song
+                # 2. Stop currently playing song (ffplay) if present
                 self._stop_current_playback()
 
-                # 3. Extract stream URL via yt-dlp
-                stream_cmd = [
-                    sys.executable,
-                    "-m",
-                    "yt_dlp",
-                    "-g",
-                    "-f",
-                    "ba/b",
-                    video_url,
-                ]
-                stream_url = (
-                    subprocess.check_output(stream_cmd, stderr=subprocess.DEVNULL)
-                    .decode()
-                    .strip()
-                )
-
-                # 4. Stream audio headlessly using container's ffmpeg (ffplay)
-                if stream_url:
-                    self._player_process = subprocess.Popen(
-                        [
-                            "ffplay",
-                            "-nodisp",
-                            "-autoexit",
-                            "-loglevel",
-                            "quiet",
-                            stream_url,
-                        ],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    logger.info("Playing video_id=%s with title=%r", video_id, title)
-                    return f"Playing {title} by {artist}."
-
-                return f"Could not extract audio stream for {title}."
+                # 3. Prefer opening the track in the user's client (browser/app).
+                #    Return a structured response telling the server to instruct
+                #    the client to open the YouTube Music URL. This causes the
+                #    web UI to navigate to the URL (which will open the native
+                #    app on many phones if installed).
+                logger.info("Requesting client to open YouTube Music URL for video_id=%s title=%r", video_id, title)
+                return {"type": "open_url", "url": video_url, "message": f"Opening {title} by {artist} on your device."}
 
             except Exception as e:
                 logger.exception("Error executing ytm_play")
