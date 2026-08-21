@@ -12,6 +12,9 @@ venv/
 /host_projects/*
 !/host_projects/.gitkeep
 
+# Local environment file (contains secrets)
+.env
+
 # OS / editor
 .DS_Store
 .idea/

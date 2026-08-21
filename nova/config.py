@@ -42,7 +42,23 @@ LLM_MODELS = {
         "path": MODELS_DIR / "brain" / "qwen2.5-3b-instruct-q4_k_m.gguf",
     },
 }
-LLM_DEFAULT_MODEL_ID = os.getenv("NOVA_LLM_MODEL", "qwen2.5-3b")
+# Determine default LLM model. Prefer an explicit value set in this config file
+# (hard-coded default) but still allow an environment override for advanced users.
+_hardcoded_default = "qwen3-1.7b"
+_requested_llm = os.getenv("NOVA_LLM_MODEL")
+if _requested_llm and _requested_llm in LLM_MODELS:
+    LLM_DEFAULT_MODEL_ID = _requested_llm
+else:
+    if _requested_llm and _requested_llm not in LLM_MODELS:
+        import logging as _logging
+
+        _logging.getLogger("nova.config").warning(
+            "Requested NOVA_LLM_MODEL=%r not found in LLM_MODELS; falling back to hard-coded default %r",
+            _requested_llm,
+            _hardcoded_default,
+        )
+    LLM_DEFAULT_MODEL_ID = _hardcoded_default
+
 # Backward-compatible override for deployments that set NOVA_LLM_MODEL_PATH.
 LLM_MODEL_PATH = Path(os.getenv("NOVA_LLM_MODEL_PATH", LLM_MODELS[LLM_DEFAULT_MODEL_ID]["path"]))
 LLM_CONTEXT_SIZE = int(os.getenv("NOVA_LLM_CTX", "4096"))

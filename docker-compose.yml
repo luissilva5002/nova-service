@@ -7,6 +7,7 @@ services:
     restart: unless-stopped   # auto-launches when the host boots / Docker daemon starts
     ports:
       - "8000:8000"
+      - "8080:8080" # Maps local OAuth callback
     volumes:
       # Mount models from host machine so multi-GB GGUF/ONNX weights are
       # never baked into the image.
@@ -18,6 +19,8 @@ services:
       # Mount local projects (read-only) so NOVA can inspect/ingest them,
       # e.g. your Flutter app source trees.
       - ${NOVA_HOST_PROJECTS_PATH:-./host_projects}:/app/host_projects:ro
+    env_file:
+      - .env
     environment:
       - PYTHONUNBUFFERED=1
       - OMP_NUM_THREADS=4         # utilize all 4 cores of a Ryzen 3
