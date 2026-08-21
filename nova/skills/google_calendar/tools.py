@@ -56,23 +56,50 @@ TOOLS = [
     },
     {
         "name": "gc_update_event",
-        "description": "Update fields on an existing event. Provide event_id and fields to change.",
+        "description": (
+            "Update fields on an existing event. You almost never know the "
+            "real event_id from conversation alone - instead, describe the "
+            "event using 'query' (its summary/title, e.g. 'DB exam') and "
+            "optionally 'date' (YYYY-MM-DD, if the user mentioned one) so "
+            "the correct event can be located automatically. Only pass "
+            "event_id directly if you were explicitly told the exact ID "
+            "string earlier in this conversation."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "event_id": {"type": "string"},
-                "summary": {"type": "string"},
+                "event_id": {"type": "string", "description": "Exact Google Calendar event ID, only if already known."},
+                "query": {"type": "string", "description": "Event title/summary to search for, if event_id is not known."},
+                "date": {"type": "string", "description": "YYYY-MM-DD to narrow the search, if mentioned by the user."},
+                "summary": {"type": "string", "description": "New title, if changing it."},
                 "description": {"type": "string"},
                 "start": {"type": "string"},
                 "end": {"type": "string"},
                 "calendar_id": {"type": "string", "description": "Optional calendar id (default: primary)"},
             },
-            "required": ["event_id"]
+            "required": []
         },
     },
     {
         "name": "gc_delete_event",
-        "description": "Delete an event by event_id.",
-        "parameters": {"type": "object", "properties": {"event_id": {"type": "string"}, "calendar_id": {"type": "string"}}, "required": ["event_id"]},
+        "description": (
+            "Delete an event. You almost never know the real event_id from "
+            "conversation alone - instead, describe the event using 'query' "
+            "(its summary/title, e.g. 'DB exam') and optionally 'date' "
+            "(YYYY-MM-DD, if the user mentioned one) so the correct event "
+            "can be located automatically. Only pass event_id directly if "
+            "you were explicitly told the exact ID string earlier in this "
+            "conversation."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "Exact Google Calendar event ID, only if already known."},
+                "query": {"type": "string", "description": "Event title/summary to search for, if event_id is not known."},
+                "date": {"type": "string", "description": "YYYY-MM-DD to narrow the search, if mentioned by the user."},
+                "calendar_id": {"type": "string"},
+            },
+            "required": []
+        },
     },
 ]
