@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import re
+import uuid
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -27,6 +28,13 @@ from nova.brain.tts_engine import tts_engine
 from nova.brain.tool_router import tool_router
 from nova.memory.core_store import core_store
 from nova.memory.memory_agent import memory_agent
+from nova.memory.session_memory import (
+    append_turn,
+    clear_session,
+    get_context,
+    get_session_snapshot,
+    get_session_summary,
+)
 from nova.ingestion.pipeline import ingest_project
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -143,7 +151,109 @@ def _extract_tool_call_from_text(content: str) -> Optional[dict]:
     return None
 
 
-async def run_pipeline(user_text: str) -> tuple[str, bytes, dict, Optional[dict]]:
+def _extract_name_from_text(text: str) -> Optional[str]:
+    patterns = [
+        r"\bmy name is\s+([A-Za-z][A-Za-z'\- ]{1,40})",
+        r"\bi am\s+([A-Za-z][A-Za-z'\- ]{1,40})",
+        r"\bcall me\s+([A-Za-z][A-Za-z'\- ]{1,40})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            extracted = match.group(1).strip().rstrip(".?! ")
+            if extracted.lower().startswith("working "):
+                continue
+            return extracted
+    return None
+
+
+def _select_relevant_facts(user_text: str, facts: dict) -> dict:
+    lower = user_text.strip().lower()
+    relevant: dict = {}
+    if re.search(r"\bwhat\s+(?:is|'s)\s+my\s+name\b|\bwho\s+am\s+i\b|\bwhat\s+is\s+my\s+full\s+name\b", lower):
+        for key in ("name", "personal_info"):
+            if key in facts:
+                relevant[key] = facts[key]
+    if re.search(r"\bwhat\s+(?:is|'s)\s+my\s+project\b|\bwhat\s+project\s+am\s+i\s+working\s+on\b|\bwhat\s+am\s+i\s+working\s+on\b", lower):
+        for key in ("active_project", "project", "project_fact"):
+            if key in facts:
+                relevant[key] = facts[key]
+    if re.search(r"\bwhat\s+(?:is|'s)\s+my\s+favorite\s+artist\b|\bwho\s+is\s+my\s+favorite\s+artist\b", lower):
+        for key in ("favorite_artist", "artist"):
+            if key in facts:
+                relevant[key] = facts[key]
+    return relevant
+
+
+def _answer_from_memory(user_text: str, facts: dict, session_history: list[dict]) -> Optional[str]:
+    lower = user_text.strip().lower()
+
+    if re.search(r"\bwhat\s+(?:is|'s)\s+my\s+name\b|\bwho\s+am\s+i\b|\bwhat\s+is\s+my\s+full\s+name\b", lower):
+        name = facts.get("name")
+        if not name:
+            personal = facts.get("personal_info", {})
+            name = personal.get("name") if isinstance(personal, dict) else None
+        if not name:
+            for turn in reversed(session_history):
+                if turn.get("role") == "user":
+                    extracted = _extract_name_from_text(str(turn.get("content", "")))
+                    if extracted:
+                        name = extracted
+                        break
+        if name:
+            return f"Your name is {name}."
+
+    if re.search(r"\bwhat\s+(?:is|'s)\s+my\s+project\b|\bwhat\s+project\s+am\s+i\s+working\s+on\b|\bwhat\s+am\s+i\s+working\s+on\b", lower):
+        project = facts.get("active_project") or facts.get("project") or facts.get("project_fact")
+        if project:
+            return f"Your active project is {project}."
+
+    if re.search(r"\bwhat\s+(?:is|'s)\s+my\s+favorite\s+artist\b|\bwho\s+is\s+my\s+favorite\s+artist\b", lower):
+        artist = facts.get("favorite_artist") or facts.get("artist")
+        if artist:
+            return f"Your favorite artist is {artist}."
+
+    return None
+
+
+def _handle_session_commands(user_text: str, session_id: str) -> Optional[str]:
+    """Handle one-shot session commands that should not go through the LLM."""
+    lower = user_text.strip().lower()
+    if re.search(r"\b(clear|reset)\b.*\b(chat|conversation|history)\b", lower):
+        clear_session(session_id)
+        return "I cleared this chat history."
+
+    if re.search(r"\b(show|display|what is)\b.*\b(session|chat)\b.*\b(context|memory|history)\b", lower):
+        snapshot = get_session_snapshot(session_id, limit=20)
+        return json.dumps({
+            "summary": snapshot["summary"],
+            "history": snapshot["history"],
+        }, ensure_ascii=False)
+
+    if re.search(r"\bshow\b.*\bsummary\b", lower) or re.search(r"\bcurrent\b.*\bsummary\b", lower):
+        return json.dumps({"summary": get_session_summary(session_id)}, ensure_ascii=False)
+
+    if re.search(r"\bremember\b.*\bproject\b.*\bfact\b", lower) or re.search(r"\bproject\b.*\bfact\b", lower):
+        matched = re.search(r"(?:project\s+fact|remember\s+(?:this\s+as\s+)?(?:a\s+)?project\s+fact)[:\s]+(.+)", user_text, re.I)
+        if matched:
+            fact = matched.group(1).strip().rstrip(".?! ")
+            if fact:
+                core_store.set_fact("project_fact", fact)
+                return "I saved that as a project fact in persistent memory."
+
+    remember_match = re.search(r"\b(?:remember|save(?: this)?|note(?: that)?)\b(?:\s+that)?\s*(.+)", user_text, re.I)
+    if remember_match:
+        fact = remember_match.group(1).strip().rstrip(".?! ")
+        if fact:
+            key = "remembered_note"
+            if re.search(r"\bproject\b", fact, re.I):
+                key = "project_fact"
+            core_store.set_fact(key, fact)
+            return "I saved that to my persistent memory."
+    return None
+
+
+async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str, bytes, dict, Optional[dict]]:
     """
     Runs one full NOVA turn on already-transcribed text:
       Brain (tool intent) -> [Skill execution + feedback loop] -> reply text
@@ -154,10 +264,52 @@ async def run_pipeline(user_text: str) -> tuple[str, bytes, dict, Optional[dict]
     Kept as a standalone function so both the WebSocket handler and any
     future REST /api/chat endpoint can reuse it.
     """
+    session_command = _handle_session_commands(user_text, session_id)
+    if session_command is not None:
+        reply_text = session_command
+        generation_metrics = {"completion_tokens": 0, "elapsed_seconds": 0.0, "tokens_per_second": 0.0}
+        audio_bytes = b""
+        client_action = None
+        append_turn(session_id, "user", user_text)
+        append_turn(session_id, "assistant", reply_text)
+        core_store.log_message("user", user_text)
+        core_store.log_message("nova", reply_text)
+        audio_chunks = []
+        async for chunk in tts_engine.synthesize_stream(reply_text):
+            audio_chunks.append(chunk)
+        audio_bytes = b"".join(audio_chunks)
+        return reply_text, audio_bytes, generation_metrics, client_action
+
     core_store.log_message("user", user_text)
     await memory_agent.process_turn(user_text)
 
-    memory_context = json.dumps(core_store.all_facts())
+    session_history = get_context(session_id, limit=12)
+    session_summary = get_session_summary(session_id)
+    facts = core_store.all_facts()
+    direct_answer = _answer_from_memory(user_text, facts, session_history)
+    if direct_answer is not None:
+        reply_text = direct_answer
+        generation_metrics = {"completion_tokens": 0, "elapsed_seconds": 0.0, "tokens_per_second": 0.0}
+        audio_bytes = b""
+        client_action = None
+        append_turn(session_id, "user", user_text)
+        append_turn(session_id, "assistant", reply_text)
+        core_store.log_message("nova", reply_text)
+        audio_chunks = []
+        async for chunk in tts_engine.synthesize_stream(reply_text):
+            audio_chunks.append(chunk)
+        audio_bytes = b"".join(audio_chunks)
+        return reply_text, audio_bytes, generation_metrics, client_action
+
+    relevant_facts = _select_relevant_facts(user_text, facts)
+    memory_context = json.dumps(
+        {
+            "chat_context_summary": session_summary,
+            "recent_chat_turns": session_history,
+            "relevant_persistent_memory": relevant_facts,
+        },
+        ensure_ascii=False,
+    )
     decision = await llm_engine.generate_with_tools(
         user_text=user_text,
         tool_schemas=tool_router.tool_schemas,
@@ -248,6 +400,8 @@ async def run_pipeline(user_text: str) -> tuple[str, bytes, dict, Optional[dict]
         reply_text = decision.get("content") if isinstance(decision, dict) else str(decision)
         generation_metrics = decision.get("metrics", {}) if isinstance(decision, dict) else {}
 
+    append_turn(session_id, "user", user_text)
+    append_turn(session_id, "assistant", reply_text)
     core_store.log_message("nova", reply_text)
 
     # If the tool produced audio bytes, prefer them over TTS.
@@ -277,7 +431,9 @@ async def websocket_endpoint(websocket: WebSocket):
       {"type": "audio", "audio_b64": "..."}              -> synthesized speech (streamed)
     """
     await websocket.accept()
-    logger.info("Client connected to /ws/chat")
+    session_id = getattr(websocket, "_nova_session_id", None) or str(uuid.uuid4())
+    setattr(websocket, "_nova_session_id", session_id)
+    logger.info("Client connected to /ws/chat with session_id=%s", session_id)
     audio_buffer = bytearray()
 
     try:
@@ -304,7 +460,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if not user_text.strip():
                 continue
 
-            reply_text, audio_bytes, generation_metrics, client_action = await run_pipeline(user_text)
+            reply_text, audio_bytes, generation_metrics, client_action = await run_pipeline(user_text, session_id=session_id)
 
             # Log what we are about to send to the client (debug)
             logger.info(
