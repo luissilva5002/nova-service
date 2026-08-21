@@ -12,6 +12,7 @@ This is intentionally the ONLY LLM in the system (see architecture
 doc "Anatomy of NOVA's Single-Brain System") - whisper.cpp and Piper
 are non-LLM "organs", not separate brains.
 """
+import datetime
 import json
 import logging
 import time
@@ -261,8 +262,27 @@ class LLMEngine:
         return text, self._generation_metrics(completion, started_at, text)
 
     @staticmethod
+    def _current_date_context() -> str:
+        """
+        Returns the current date plus a lookup table of the next 14 days'
+        dates and weekday names. Small local models (e.g. Qwen3-1.7B) can
+        reliably READ "Friday = 2026-08-28" off a list, but cannot reliably
+        COMPUTE "today + 4 days" via arithmetic - so give them the answer
+        pre-computed instead of asking them to derive it.
+        """
+        now = datetime.datetime.now().astimezone()
+        lines = [now.strftime("Current date and time: %A, %Y-%m-%d %H:%M %z")]
+        lines.append("Upcoming dates (use these directly - do not calculate offsets yourself):")
+        for offset in range(14):
+            day = now + datetime.timedelta(days=offset)
+            label = "Today" if offset == 0 else ("Tomorrow" if offset == 1 else day.strftime("%A"))
+            lines.append(f"  {label}: {day.strftime('%Y-%m-%d')}")
+        return "\n".join(lines)
+
+
+    @staticmethod
     def _build_system_prompt(memory_context: str, tool_schemas: list) -> str:
-        parts = [NOVA_PERSONA_PROMPT]
+        parts = [NOVA_PERSONA_PROMPT, LLMEngine._current_date_context()]
         if memory_context:
             parts.append(f"Known user context: {memory_context}")
         return "\n\n".join(parts)

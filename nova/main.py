@@ -285,6 +285,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not message.get("final"):
                     continue  # keep buffering until the client signals end-of-utterance
                 user_text = stt_engine.transcribe_media(bytes(audio_buffer))
+                logger.info("Transcribed user text: %r", user_text)
                 audio_buffer.clear()
             else:
                 user_text = message.get("text", "")

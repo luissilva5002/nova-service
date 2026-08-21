@@ -31,7 +31,15 @@ TOOLS = [
     },
     {
         "name": "gc_create_event",
-        "description": "Create a calendar event. Provide summary, start/end (RFC3339) or start + duration_minutes.",
+        "description": (
+            "Create a calendar event. Provide summary, start/end (RFC3339) or "
+            "start + duration_minutes. If the user states an explicit date "
+            "(e.g. a specific day and month), use exactly that date - do NOT "
+            "substitute today's date. Only use today's date if the user says "
+            "'today' or gives no date at all. Compute relative dates (e.g. "
+            "'tomorrow', 'Friday') using the upcoming-dates list provided in "
+            "system context."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
