@@ -119,6 +119,63 @@ def _looks_like_real_event_id(value: str) -> bool:
     return bool(_REAL_EVENT_ID_PATTERN.match(value.strip()))
 
 
+def _local_now() -> datetime.datetime:
+    return datetime.datetime.now().astimezone()
+
+
+def _format_event_time(start_value: Optional[str], end_value: Optional[str] = None) -> str:
+    """Return a human-friendly event time string without raw RFC3339 noise.
+
+    We keep the original event timezone offset when Google already supplied one;
+    only apply an explicit user timezone override when configured. Converting a
+    time to the container/server timezone (for example UTC) can shift the visible
+    time by one or more hours and cause events to appear earlier than they really are.
+    """
+    if not start_value:
+        return "time not specified"
+
+    tz_name = _env("GOOGLE_CALENDAR_TIMEZONE")
+    target_tz = tz.gettz(tz_name) if tz_name else None
+
+    try:
+        if "T" in start_value:
+            start_dt = datetime.datetime.fromisoformat(start_value)
+            if start_dt.tzinfo is not None and target_tz is not None:
+                start_dt = start_dt.astimezone(target_tz)
+
+            if end_value and "T" in end_value:
+                try:
+                    end_dt = datetime.datetime.fromisoformat(end_value)
+                    if end_dt.tzinfo is not None and target_tz is not None:
+                        end_dt = end_dt.astimezone(target_tz)
+                    return f"{start_dt.strftime('%I:%M %p').lstrip('0')} to {end_dt.strftime('%I:%M %p').lstrip('0')}"
+                except ValueError:
+                    pass
+
+            return start_dt.strftime('%I:%M %p').lstrip('0')
+
+        try:
+            start_date = datetime.date.fromisoformat(start_value)
+            return start_date.strftime('%b %d')
+        except ValueError:
+            return start_value
+    except ValueError:
+        return start_value
+
+
+def _format_event_line(ev: dict) -> str:
+    summary = ev.get("summary", "(no title)")
+    start = ev.get("start", {}).get("dateTime", ev.get("start", {}).get("date"))
+    end = ev.get("end", {}).get("dateTime", ev.get("end", {}).get("date"))
+    time_text = _format_event_time(start, end)
+
+    if start and "T" in str(start):
+        return f"- {summary} at {time_text}"
+    if start and "-" in str(start):
+        return f"- {summary} on {time_text}"
+    return f"- {summary}"
+
+
 class GoogleCalendarSkill(BaseSkill):
     def __init__(self):
         self._service = None
@@ -151,7 +208,9 @@ class GoogleCalendarSkill(BaseSkill):
             return "Unknown Google Calendar command."
         except Exception as exc:
             logger.exception("Error executing %s", tool_name)
-            return f"Google Calendar operation failed: {exc}"
+            # Keep the raw exception in logs for debugging, but return a simple user
+            # sentence so the interface does not leak API details or stack traces.
+            raise RuntimeError(f"I couldn't complete that calendar task.") from exc
 
     def _list_today(self, arguments: dict) -> str:
         calendar_id = arguments.get("calendar_id", "primary")
@@ -166,14 +225,16 @@ class GoogleCalendarSkill(BaseSkill):
         )
         items = events_result.get("items", [])
         if not items:
-            return "You have no events scheduled for today."
-        lines = []
-        for ev in items:
-            start = ev.get("start", {}).get("dateTime", ev.get("start", {}).get("date"))
+            return "You do not have any events scheduled for today."
+        if len(items) == 1:
+            ev = items[0]
             summary = ev.get("summary", "(no title)")
-            event_id = ev.get("id")
-            lines.append(f"- {summary} at {start} (id: {event_id})")
-        return "Today's events:\n" + "\n".join(lines)
+            start = ev.get("start", {}).get("dateTime", ev.get("start", {}).get("date"))
+            end = ev.get("end", {}).get("dateTime", ev.get("end", {}).get("date"))
+            time_text = _format_event_time(start, end)
+            return f"Today you have {summary} at {time_text} on your calendar."
+        lines = [_format_event_line(ev) for ev in items]
+        return "Today you have:\n" + "\n".join(lines)
 
     def _find(self, arguments: dict) -> str:
         query = arguments.get("query")
@@ -189,13 +250,8 @@ class GoogleCalendarSkill(BaseSkill):
         items = events_result.get("items", [])
         if not items:
             return f"No events found matching '{query}'."
-        lines = []
-        for ev in items:
-            start = ev.get("start", {}).get("dateTime", ev.get("start", {}).get("date"))
-            summary = ev.get("summary", "(no title)")
-            event_id = ev.get("id")
-            lines.append(f"- {summary} at {start} (id: {event_id})")
-        return "Found events:\n" + "\n".join(lines)
+        lines = [_format_event_line(ev) for ev in items]
+        return "I found these events:\n" + "\n".join(lines)
 
     def _resolve_event(self, arguments: dict) -> tuple[Optional[dict], Optional[str]]:
         """
@@ -258,11 +314,7 @@ class GoogleCalendarSkill(BaseSkill):
             return None, f"I couldn't find an event matching '{query}'{when}."
 
         if len(items) > 1:
-            lines = []
-            for ev in items:
-                start = ev.get("start", {}).get("dateTime", ev.get("start", {}).get("date"))
-                summary = ev.get("summary", "(no title)")
-                lines.append(f"- {summary} at {start}")
+            lines = [_format_event_line(ev) for ev in items]
             return None, (
                 f"I found multiple events matching '{query}' - please be more specific "
                 f"(e.g. include the date):\n" + "\n".join(lines)
@@ -277,16 +329,31 @@ class GoogleCalendarSkill(BaseSkill):
         start = arguments.get("start")
         if not start:
             return "Missing event start time. Provide an RFC3339 timestamp or a date-time string."
+
+        try:
+            start_dt = datetime.datetime.fromisoformat(start)
+        except ValueError as exc:
+            return f"Invalid start time '{start}'. Use an RFC3339 timestamp like 2026-08-22T22:00:00+01:00."
+
         end = arguments.get("end")
         duration = arguments.get("duration_minutes")
-        # If end not provided, compute using duration
-        if not end:
-            if duration:
-                dt_start = datetime.datetime.fromisoformat(start)
-                dt_end = dt_start + datetime.timedelta(minutes=int(duration))
-                end = dt_end.isoformat()
-            else:
-                return "Provide either end or duration_minutes to create an event."
+        if end:
+            try:
+                end_dt = datetime.datetime.fromisoformat(end)
+            except ValueError:
+                return f"Invalid end time '{end}'. Use an RFC3339 timestamp like 2026-08-22T23:30:00+01:00."
+
+            # Many natural-language requests use 'midnight' or 'till midnight' for
+            # overnight events, yielding an end time like 00:00 of the same date.
+            # Treat that as the next day when the start is later in the evening.
+            if end_dt <= start_dt and end_dt.hour <= 3:
+                end_dt = end_dt + datetime.timedelta(days=1)
+                end = end_dt.isoformat()
+        elif duration:
+            end_dt = start_dt + datetime.timedelta(minutes=int(duration))
+            end = end_dt.isoformat()
+        else:
+            return "Provide either end or duration_minutes to create an event."
 
         event_body = {"summary": summary, "start": {"dateTime": start}, "end": {"dateTime": end}}
         if arguments.get("description"):
@@ -297,8 +364,8 @@ class GoogleCalendarSkill(BaseSkill):
         calendar_id = arguments.get("calendar_id", "primary")
         self._ensure_service()
         ev = self._service.events().insert(calendarId=calendar_id, body=event_body).execute()
-        eid = ev.get("id")
-        return f"Created event '{summary}' starting at {start}. Event id: {eid}."
+        time_text = _format_event_time(start, end)
+        return f"Created {summary} for {time_text}."
 
     def _update_event(self, arguments: dict) -> str:
         self._ensure_service()
@@ -321,7 +388,13 @@ class GoogleCalendarSkill(BaseSkill):
         if not updated:
             return "No updatable fields provided."
         ev = self._service.events().update(calendarId=calendar_id, eventId=ev["id"], body=ev).execute()
-        return f"Updated event: {ev.get('summary', '')}."
+        summary = ev.get("summary", "event")
+        start = ev.get("start", {}).get("dateTime")
+        end = ev.get("end", {}).get("dateTime")
+        time_text = _format_event_time(start, end)
+        if time_text and time_text != "time not specified":
+            return f"Updated {summary} to {time_text}."
+        return f"Updated {summary}."
 
     def _delete_event(self, arguments: dict) -> str:
         self._ensure_service()
@@ -332,7 +405,7 @@ class GoogleCalendarSkill(BaseSkill):
         calendar_id = arguments.get("calendar_id", "primary")
         summary = ev.get("summary", "(no title)")
         self._service.events().delete(calendarId=calendar_id, eventId=ev["id"]).execute()
-        return f"Deleted event '{summary}'."
+        return f"Deleted {summary} from your calendar."
 
 
 # Expose skill instance discovered by ToolRouter

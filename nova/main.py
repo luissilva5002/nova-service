@@ -189,49 +189,60 @@ async def run_pipeline(user_text: str) -> tuple[str, bytes, dict, Optional[dict]
     client_action = None
 
     if isinstance(decision, dict) and decision.get("type") == "tool_call":
-        tool_result = tool_router.dispatch(decision["name"], decision["arguments"])
-
-        # Normalize tool_result into a user-friendly string to feed back to the LLM
-        user_prompt_for_llm = ""
         try:
-            if isinstance(tool_result, dict):
-                # Audio payload produced by the tool
-                if tool_result.get("type") == "audio":
-                    try:
-                        from pathlib import Path
-                        audio_path = Path(tool_result.get("path", ""))
-                        if audio_path.exists():
-                            audio_bytes = audio_path.read_bytes()
-                        else:
-                            logger.warning("Tool returned audio path that does not exist: %s", audio_path)
-                    except Exception:
-                        logger.exception("Failed to read audio file returned by tool.")
-                    user_prompt_for_llm = tool_result.get("message") or f"Executed tool {decision['name']} (audio)."
-                elif tool_result.get("type") == "open_url":
-                    # Instruct client to open a URL (e.g. YouTube Music deep link)
-                    client_action = tool_result
-                    user_prompt_for_llm = tool_result.get("message") or f"Executed tool {decision['name']} (open_url)."
+            tool_result = tool_router.dispatch(decision["name"], decision["arguments"])
+        except Exception as exc:
+            logger.exception("Tool execution failed for %s with arguments %s", decision.get("name"), decision.get("arguments"))
+            reply_text = "I couldn't complete that task. Please try again."
+            generation_metrics = decision.get("metrics", {}) if isinstance(decision, dict) else {}
+            tool_result = None
+        else:
+            # Plain-text tool results should be returned directly to the user.
+            # A second LLM rewrite is useful for audio/open_url actions, but it
+            # causes nonsense like "calendar updated" when the user only wanted
+            # a read/query result from a tool.
+            try:
+                if isinstance(tool_result, dict):
+                    # Audio payload produced by the tool
+                    if tool_result.get("type") == "audio":
+                        try:
+                            from pathlib import Path
+                            audio_path = Path(tool_result.get("path", ""))
+                            if audio_path.exists():
+                                audio_bytes = audio_path.read_bytes()
+                            else:
+                                logger.warning("Tool returned audio path that does not exist: %s", audio_path)
+                        except Exception:
+                            logger.exception("Failed to read audio file returned by tool.")
+                        user_prompt_for_llm = tool_result.get("message") or f"Executed tool {decision['name']} (audio)."
+                    elif tool_result.get("type") == "open_url":
+                        # Instruct client to open a URL (e.g. YouTube Music deep link)
+                        client_action = tool_result
+                        user_prompt_for_llm = tool_result.get("message") or f"Executed tool {decision['name']} (open_url)."
+                    else:
+                        # Generic dict result: prefer human 'message' key if present
+                        user_prompt_for_llm = tool_result.get("message") if tool_result.get("message") else json.dumps(tool_result)
+                        reply_text = str(user_prompt_for_llm)
+                        generation_metrics = decision.get("metrics", {})
+                    if tool_result.get("type") in {"audio", "open_url"}:
+                        # Response Feedback Loop: ask the brain to confirm / describe the action
+                        reply_text, generation_metrics = await llm_engine.generate_raw_with_metrics(
+                            system_prompt="Confirm this action result to the user in one natural spoken sentence. If the action produced audio, also say that playback has started.",
+                            user_prompt=user_prompt_for_llm,
+                            max_tokens=64,
+                        )
+                        if not isinstance(reply_text, str):
+                            reply_text = str(reply_text)
+                        reply_text = reply_text.strip()
                 else:
-                    # Generic dict result: prefer human 'message' key if present
-                    user_prompt_for_llm = tool_result.get("message") if tool_result.get("message") else json.dumps(tool_result)
-            else:
-                # tool_result is a string (normal case)
-                user_prompt_for_llm = str(tool_result)
-        except Exception:
-            logger.exception("Error normalizing tool result for feedback loop.")
-            user_prompt_for_llm = str(tool_result)
-
-        # Response Feedback Loop: ask the brain to confirm / describe the action
-        reply_text, generation_metrics = await llm_engine.generate_raw_with_metrics(
-            system_prompt="Confirm this action result to the user in one natural spoken sentence. If the action produced audio, also say that playback has started.",
-            user_prompt=user_prompt_for_llm,
-            max_tokens=64,
-        )
-
-        # Ensure reply_text is a string
-        if not isinstance(reply_text, str):
-            reply_text = str(reply_text)
-        reply_text = reply_text.strip()
+                    # Tool result is a string: use it directly so reads and updates are not
+                    # reworded by a second model pass into generic or wrong outputs.
+                    reply_text = str(tool_result).strip()
+                    generation_metrics = decision.get("metrics", {})
+            except Exception:
+                logger.exception("Error normalizing tool result for feedback loop.")
+                reply_text = str(tool_result).strip() if tool_result is not None else "I couldn't complete that task. Please try again."
+                generation_metrics = decision.get("metrics", {})
 
     else:
         reply_text = decision.get("content") if isinstance(decision, dict) else str(decision)
