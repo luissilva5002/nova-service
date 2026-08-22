@@ -7,7 +7,7 @@ list, create, update and delete events.
 Configuration (set these in .env or environment):
   GOOGLE_CLIENT_ID
   GOOGLE_CLIENT_SECRET
-  GOOGLE_TOKEN_PATH (optional, default: ./data/google_calendar_token.json)
+  GOOGLE_TOKEN_PATH (optional, default: ./persistent_memory/credentials/google_calendar_token.json)
   GOOGLE_CALENDAR_TIMEZONE (optional, e.g. Europe/London)
 
 This skill exposes a `skill` instance (BaseSkill subclass) discovered by the
@@ -52,7 +52,20 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def _token_path() -> str:
-    return _env("GOOGLE_TOKEN_PATH", os.path.join("data", "google_calendar_token.json"))
+    configured = _env("GOOGLE_TOKEN_PATH", os.path.join("persistent_memory", "credentials", "google_calendar_token.json"))
+    token_path = os.path.expanduser(configured or "")
+    if not os.path.isabs(token_path):
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        candidates = [
+            os.path.join(os.getcwd(), token_path),
+            os.path.join(project_root, token_path),
+            os.path.join(project_root, "data", os.path.basename(token_path)),
+        ]
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        return os.path.join(project_root, token_path)
+    return token_path
 
 
 def _load_credentials() -> Optional[object]:

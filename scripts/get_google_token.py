@@ -13,7 +13,11 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from google_auth_oauthlib.flow import InstalledAppFlow
+try:
+    from google_auth_oauthlib.flow import InstalledAppFlow
+except ModuleNotFoundError as exc:
+    print("Missing Google OAuth dependencies. Install them with: python3 -m pip install -r requirements.txt", file=sys.stderr)
+    raise SystemExit(1) from exc
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 REDIRECT_URI = "http://localhost:8080/"
@@ -36,7 +40,21 @@ def main() -> None:
         }
     }
 
-    token_path = Path(os.environ.get("GOOGLE_TOKEN_PATH", os.path.join("data", "google_calendar_token.json")))
+    configured = os.environ.get("GOOGLE_TOKEN_PATH", os.path.join("persistent_memory", "credentials", "google_calendar_token.json"))
+    token_path = Path(configured)
+    if not token_path.is_absolute():
+        project_root = Path(__file__).resolve().parents[1]
+        candidates = [
+            Path.cwd() / token_path,
+            project_root / token_path,
+            project_root / "data" / token_path.name,
+        ]
+        for candidate in candidates:
+            if candidate.exists() or str(candidate).endswith(str(token_path)):
+                token_path = candidate
+                break
+        else:
+            token_path = project_root / token_path
 
     flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
     flow.redirect_uri = REDIRECT_URI
@@ -70,6 +88,7 @@ def main() -> None:
     token_path.write_text(creds.to_json(), encoding="utf-8")
 
     print(f"\nSUCCESS - token saved to {token_path.resolve()}")
+    print("This is the default secure storage path for Google Calendar OAuth tokens.")
     print(f"Has refresh_token: {bool(creds.refresh_token)}")
 
 

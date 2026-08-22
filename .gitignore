@@ -21,3 +21,5 @@ venv/
 .vscode/
 
 /persistent_memory/
+
+google_calendar_token.json

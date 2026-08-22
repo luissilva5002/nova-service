@@ -4,12 +4,51 @@ Writes to / reads from NOVA's persistent Obsidian-vault memory
 (nova/memory/vault_store.py).
 """
 import logging
+import re
 
 from nova.memory import vault_store
 from nova.skills.base_skill import BaseSkill
 from nova.skills.remember.tools import TOOLS
 
 logger = logging.getLogger("nova.skills.remember")
+
+
+def _compact_memory_fact(content: str) -> str:
+    """Reduce a raw sentence to the shortest meaningful fact.
+
+    This keeps the persistent vault readable and avoids saving giant quoted
+    clauses exactly as the user spoke them.
+    """
+    text = str(content or "").strip()
+    if not text:
+        return ""
+
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # simple named-entity patterns
+    for pattern in [
+        r"^my\s+name\s+is\s+(.+)$",
+        r"^i\s+am\s+(.+)$",
+        r"^i'm\s+(.+)$",
+        r"^call\s+me\s+(.+)$",
+        r"^i\s+study\s+at\s+(.+)$",
+        r"^i\s+am\s+a\s+(.+)$",
+    ]:
+        match = re.match(pattern, text, re.I)
+        if match:
+            return match.group(1).rstrip(".?! ")
+
+    if re.match(r"^i am a? (.+?) at (.+)$", text, re.I):
+        match = re.match(r"^i am a? (.+?) at (.+)$", text, re.I)
+        left = match.group(1).strip().rstrip(".?! ")
+        right = match.group(2).strip().rstrip(".?! ")
+        if left and right:
+            return f"You are a {left} at {right}."
+
+    if " at " in text and re.search(r"\b(student|studying|study|engineering)\b", text, re.I):
+        return text.rstrip(".?! ")
+
+    return text.rstrip(".?! ")
 
 
 class RememberSkill(BaseSkill):
@@ -32,12 +71,13 @@ class RememberSkill(BaseSkill):
         if not box or not content:
             return "I need a topic and a preference to save."
         tags = arguments.get("tags") if isinstance(arguments.get("tags"), list) else None
+        compact = _compact_memory_fact(content)
         try:
-            vault_store.write_preference(box, content, tags=tags)
-            return f"Saved that preference under '{box}'."
+            vault_store.write_preference(box, compact, tags=tags)
+            return "I'll be sure to remember that."
         except Exception as exc:  # pragma: no cover - best effort
             logger.exception("Failed to write preference note")
-            return f"I couldn't save that preference: {exc}"
+            return "I couldn't save that preference right now."
 
     def _update_knowledge(self, arguments: dict) -> str:
         box = str(arguments.get("box") or "").strip()
@@ -46,12 +86,13 @@ class RememberSkill(BaseSkill):
             return "I need a topic and a fact to save."
         subcategory = arguments.get("subcategory") or None
         tags = arguments.get("tags") if isinstance(arguments.get("tags"), list) else None
+        compact = _compact_memory_fact(content)
         try:
-            vault_store.write_knowledge(box, content, subcategory=subcategory, tags=tags)
-            return f"Saved that under '{box}' in my knowledge notes."
+            vault_store.write_knowledge(box, compact, subcategory=subcategory, tags=tags)
+            return "I'll be sure to remember that."
         except Exception as exc:  # pragma: no cover - best effort
             logger.exception("Failed to write knowledge note")
-            return f"I couldn't save that: {exc}"
+            return "I couldn't save that right now."
 
     def _recall(self, arguments: dict) -> str:
         category = str(arguments.get("category") or "").strip()
