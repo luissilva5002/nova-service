@@ -37,6 +37,15 @@
         <input type="text" id="userInput" class="hud-input" placeholder="Initiate command sequence..." onkeydown="if(event.key==='Enter') sendMsg()" />
         <button class="hud-btn" onclick="sendMsg()">Send</button>
         <button class="hud-btn" onclick="toggleDrawer()">Backlog</button>
+        <button class="hud-btn" onclick="toggleMemoryMap()">Memory Map</button>
+    </div>
+
+    <div id="memoryMapPanel" class="memory-map-panel hidden">
+        <div class="memory-map-header">
+            <span>// PERSISTENT MEMORY MAP</span>
+            <button class="hud-btn small" onclick="toggleMemoryMap()">Close</button>
+        </div>
+        <svg id="memoryMapSvg" class="memory-map-svg" viewBox="0 0 1000 720" preserveAspectRatio="xMidYMid meet"></svg>
     </div>
 
     <!-- Hidden Conversation Backlog Drawer -->

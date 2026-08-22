@@ -7,6 +7,8 @@ const micBtn = document.getElementById('micBtn');
 const modelSelect = document.getElementById('modelSelect');
 const drawer = document.getElementById('drawer');
 const coreWrapper = document.getElementById('coreWrapper');
+const memoryMapPanel = document.getElementById('memoryMapPanel');
+const memoryMapSvg = document.getElementById('memoryMapSvg');
 
 let uiState = 'idle'; // 'idle' | 'user' | 'thinking' | 'nova'
 let speakTimeout;
@@ -14,12 +16,31 @@ let audioFallbackTimeout;
 let thinkingStartedAt = 0;
 const MIN_THINKING_MS = 700; // spinner stays visible at least this long, even on instant replies
 
+const SESSION_STORAGE_KEY = 'nova_session_id';
+
+function getOrCreateSessionId() {
+    try {
+        const existing = localStorage.getItem(SESSION_STORAGE_KEY);
+        if (existing) return existing;
+        const id = (window.crypto && typeof window.crypto.randomUUID === 'function')
+            ? window.crypto.randomUUID()
+            : `nova-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        localStorage.setItem(SESSION_STORAGE_KEY, id);
+        return id;
+    } catch (e) {
+        console.warn('Falling back to transient session id because localStorage is unavailable.', e);
+        return `nova-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+}
+
+const sessionId = getOrCreateSessionId();
 const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
-const ws = new WebSocket(`${wsProtocol}://${location.host}/ws/chat`);
+const ws = new WebSocket(`${wsProtocol}://${location.host}/ws/chat?session_id=${encodeURIComponent(sessionId)}`);
 
 ws.onopen = () => {
     statusDot.classList.add('online');
     statusLabel.textContent = 'ONLINE';
+    ws.send(JSON.stringify({ type: 'session', session_id: sessionId }));
     refreshStatus();
 };
 
@@ -103,6 +124,126 @@ function setUiState(state, timeoutMs = 0) {
 
 function toggleDrawer() {
     drawer.classList.toggle('open');
+}
+
+async function toggleMemoryMap() {
+    if (!memoryMapPanel) return;
+    const hidden = memoryMapPanel.classList.contains('hidden');
+    if (hidden) {
+        memoryMapPanel.classList.remove('hidden');
+        await renderMemoryMap();
+    } else {
+        memoryMapPanel.classList.add('hidden');
+    }
+}
+
+async function renderMemoryMap() {
+    if (!memoryMapSvg) return;
+    try {
+        const response = await fetch('/api/memory/graph');
+        if (!response.ok) throw new Error(`Memory graph fetch failed (${response.status})`);
+        const graph = await response.json();
+        renderMemoryGraph(graph);
+    } catch (error) {
+        console.warn('Could not load memory map', error);
+        memoryMapSvg.innerHTML = '<text x="500" y="360" text-anchor="middle" fill="#e2e8f0" font-size="18">Memory map unavailable</text>';
+    }
+}
+
+function renderMemoryGraph(graph) {
+    const svgNS = 'http://www.w3.org/2000/svg';
+    memoryMapSvg.innerHTML = '';
+
+    const defs = document.createElementNS(svgNS, 'defs');
+    const filter = document.createElementNS(svgNS, 'filter');
+    filter.setAttribute('id', 'mapGlow');
+    filter.innerHTML = '<feGaussianBlur stdDeviation="2.5" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>';
+    defs.appendChild(filter);
+    memoryMapSvg.appendChild(defs);
+
+    const nodes = graph.nodes || [];
+    const links = graph.links || [];
+    const nodeMap = new Map(nodes.map(node => [node.id, node]));
+
+    for (const link of links) {
+        const source = nodeMap.get(link.source);
+        const target = nodeMap.get(link.target);
+        if (!source || !target) continue;
+
+        const line = document.createElementNS(svgNS, 'line');
+        line.setAttribute('x1', source.x);
+        line.setAttribute('y1', source.y);
+        line.setAttribute('x2', target.x);
+        line.setAttribute('y2', target.y);
+        line.setAttribute('stroke', 'rgba(96,165,250,0.5)');
+        line.setAttribute('stroke-width', '1.5');
+        line.setAttribute('stroke-linecap', 'round');
+        line.setAttribute('filter', 'url(#mapGlow)');
+        memoryMapSvg.appendChild(line);
+
+        const label = document.createElementNS(svgNS, 'text');
+        label.setAttribute('x', (source.x + target.x) / 2);
+        label.setAttribute('y', (source.y + target.y) / 2 - 8);
+        label.setAttribute('fill', '#a5b4fc');
+        label.setAttribute('font-size', '10');
+        label.setAttribute('text-anchor', 'middle');
+        label.textContent = link.label || '';
+        memoryMapSvg.appendChild(label);
+    }
+
+    for (const node of nodes) {
+        const group = document.createElementNS(svgNS, 'g');
+        group.setAttribute('transform', `translate(${node.x}, ${node.y})`);
+
+        const width = Math.max(120, Math.min(180, 80 + (node.label.length * 6.5)));
+        const height = Math.max(56, 48 + Math.min((node.facts || []).length * 12, 32));
+
+        const box = document.createElementNS(svgNS, 'rect');
+        box.setAttribute('x', -(width / 2));
+        box.setAttribute('y', -(height / 2));
+        box.setAttribute('width', width);
+        box.setAttribute('height', height);
+        box.setAttribute('rx', '16');
+        box.setAttribute('fill', 'rgba(14, 16, 28, 0.9)');
+        box.setAttribute('stroke', 'rgba(96,165,250,0.9)');
+        box.setAttribute('stroke-width', '1.4');
+        box.setAttribute('filter', 'url(#mapGlow)');
+        group.appendChild(box);
+
+        const title = document.createElementNS(svgNS, 'text');
+        title.setAttribute('x', '0');
+        title.setAttribute('y', '-6');
+        title.setAttribute('text-anchor', 'middle');
+        title.setAttribute('fill', '#e2e8f0');
+        title.setAttribute('font-size', '13');
+        title.setAttribute('font-weight', '700');
+        title.textContent = node.label.length > 16 ? `${node.label.slice(0, 15)}…` : node.label;
+        group.appendChild(title);
+
+        const type = document.createElementNS(svgNS, 'text');
+        type.setAttribute('x', '0');
+        type.setAttribute('y', '12');
+        type.setAttribute('text-anchor', 'middle');
+        type.setAttribute('fill', '#7dd3fc');
+        type.setAttribute('font-size', '10');
+        type.textContent = node.type || 'concept';
+        group.appendChild(type);
+
+        const facts = node.facts || [];
+        for (let i = 0; i < facts.length; i += 1) {
+            const entry = document.createElementNS(svgNS, 'text');
+            entry.setAttribute('x', '0');
+            entry.setAttribute('y', 28 + (i * 11));
+            entry.setAttribute('text-anchor', 'middle');
+            entry.setAttribute('fill', '#cbd5e1');
+            entry.setAttribute('font-size', '9');
+            const value = typeof facts[i].value === 'object' ? JSON.stringify(facts[i].value) : String(facts[i].value || facts[i].key);
+            entry.textContent = `${facts[i].key}: ${value}`.slice(0, 24);
+            group.appendChild(entry);
+        }
+
+        memoryMapSvg.appendChild(group);
+    }
 }
 
 function sendMsg() {

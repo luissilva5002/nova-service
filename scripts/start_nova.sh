@@ -20,6 +20,23 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
+# Clean any stale compose state before starting; this avoids some Docker Desktop
+# WSL bind-mount issues when a previous container was interrupted mid-start.
+docker compose down --remove-orphans >/dev/null 2>&1 || true
+docker compose rm -sf nova_core >/dev/null 2>&1 || true
+
 docker compose build
-docker compose up -d
+
+if ! docker compose up -d; then
+  echo "" >&2
+  echo "Docker Desktop / WSL bind-mount startup failed." >&2
+  echo "This usually means Docker Desktop is in a stale state." >&2
+  echo "Fix it by:" >&2
+  echo "  1) Fully close Docker Desktop." >&2
+  echo "  2) In WSL: wsl --shutdown" >&2
+  echo "  3) Re-open WSL and start Docker Desktop again." >&2
+  echo "  4) Run: bash scripts/start_nova.sh" >&2
+  exit 1
+fi
+
 docker compose logs -f

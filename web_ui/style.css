@@ -207,6 +207,51 @@ canvas {
     right: 0;
 }
 
+.memory-map-panel {
+    position: fixed;
+    inset: 90px 40px 110px 40px;
+    background: rgba(7, 10, 20, 0.8);
+    border: 1px solid var(--glass-border);
+    border-radius: 18px;
+    backdrop-filter: blur(20px);
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+    z-index: 35;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+    overflow: hidden;
+}
+
+.memory-map-panel.hidden {
+    opacity: 0;
+    pointer-events: none;
+    transform: scale(0.98);
+}
+
+.memory-map-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--glass-border);
+    letter-spacing: 2px;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+}
+
+.memory-map-svg {
+    width: 100%;
+    height: calc(100% - 60px);
+    display: block;
+    transform: perspective(1200px) rotateX(12deg) rotateY(-6deg);
+    transform-origin: center;
+}
+
+.hud-btn.small {
+    padding: 6px 10px;
+    min-height: 32px;
+    border-radius: 12px;
+    font-size: 0.65rem;
+}
+
 .drawer-header {
     display: flex;
     justify-content: space-between;

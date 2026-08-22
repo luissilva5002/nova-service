@@ -98,7 +98,9 @@ PIPER_VOICE_CONFIG_PATH = Path(
 )
 
 # --------------------------------------------------------------------------
-# Memory (Tier 2: SQLite core store, Tier 3: ChromaDB vector store)
+# Operational state (SQLite): conversation log, ingestion caches.
+# NOT the persistent-memory "brain" - see PERSISTENT_MEMORY_VAULT_DIR below
+# for that. Also Tier 3: ChromaDB vector store for ingested project code.
 # --------------------------------------------------------------------------
 CORE_STORE_DB_PATH = Path(os.getenv("NOVA_CORE_STORE_DB", DATA_DIR / "core_store.db"))
 VECTOR_STORE_DIR = Path(os.getenv("NOVA_VECTOR_STORE_DIR", DATA_DIR / "vector_store"))
@@ -107,6 +109,15 @@ VECTOR_STORE_COLLECTION = os.getenv("NOVA_VECTOR_COLLECTION", "nova_projects")
 # How many top-matching chunks the RAG retrieval step injects per turn.
 # Kept low deliberately (see architecture doc: "Strict RAG Limits").
 RAG_TOP_K = int(os.getenv("NOVA_RAG_TOP_K", "2"))
+
+# --------------------------------------------------------------------------
+# Persistent Memory - Obsidian-compatible Markdown vault (long-term memory)
+# --------------------------------------------------------------------------
+# Top-level (not nested under DATA_DIR) so it's easy to mount as its own
+# Docker volume and browse/edit directly with Obsidian on the host machine.
+PERSISTENT_MEMORY_VAULT_DIR = Path(os.getenv("NOVA_VAULT_DIR", BASE_DIR / "persistent_memory"))
+(PERSISTENT_MEMORY_VAULT_DIR / "preferences").mkdir(parents=True, exist_ok=True)
+(PERSISTENT_MEMORY_VAULT_DIR / "knowledge").mkdir(parents=True, exist_ok=True)
 
 # --------------------------------------------------------------------------
 # Ingestion (dynamic project ingestion / two-tier filtering)

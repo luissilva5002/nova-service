@@ -15,6 +15,7 @@ piper-tts>=1.2.0
 
 # --- Memory (Tier 2 core store + Tier 3 vector store) ---
 chromadb>=0.4.24
+pyyaml>=6.0.0
 
 # --- Structured tool-calling payloads ---
 pydantic>=2.6.0

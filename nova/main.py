@@ -27,6 +27,7 @@ from nova.brain.stt_engine import stt_engine
 from nova.brain.tts_engine import tts_engine
 from nova.brain.tool_router import tool_router
 from nova.memory.core_store import core_store
+from nova.memory import vault_store
 from nova.memory.memory_agent import memory_agent
 from nova.memory.session_memory import (
     append_turn,
@@ -81,7 +82,7 @@ async def get_status():
         "brain_loaded": llm_engine._loaded,
         "stt_loaded": stt_engine._loaded,
         "tts_loaded": tts_engine._loaded,
-        "active_project": core_store.get_fact("active_project"),
+        "active_project": vault_store.get_profile_fields().get("active_project"),
         "voices_available": tts_engine.list_available_voices(),
         "models": llm_engine.list_models(),
     }
@@ -90,6 +91,56 @@ async def get_status():
 @app.get("/api/skills")
 async def get_skills():
     return {"skills": tool_router.list_skills()}
+
+
+@app.get("/api/memory/graph")
+async def get_memory_graph():
+    """Export the persistent Obsidian-vault graph in a UI-friendly shape."""
+    return vault_store.get_memory_graph()
+
+
+@app.get('/api/memory/entity/{entity_id}')
+async def get_memory_entity(entity_id: str):
+    """Return full note details for a given graph node id.
+
+    The graph node ids are deterministic SHA1 hashes of the vault-relative
+    note path (see vault_store.get_memory_graph), so we compute the same id
+    and return structured info the client can display.
+    """
+    import hashlib
+    from pathlib import Path as _Path
+
+    for category in ("preferences", "knowledge"):
+        notes = vault_store.list_notes(category)
+        for note in notes:
+            try:
+                rel = _Path(note["path"]).relative_to(vault_store.PERSISTENT_MEMORY_VAULT_DIR)
+            except Exception:
+                rel = _Path(note["path"])
+            nid = hashlib.sha1(str(rel).encode("utf-8")).hexdigest()
+            if nid == entity_id:
+                raw = vault_store.read_note(category, note["box"], note["subcategory"])
+                frontmatter = {}
+                body = ""
+                if raw:
+                    try:
+                        fm, body = vault_store._split_frontmatter(raw)
+                        frontmatter = fm or {}
+                    except Exception:
+                        body = raw
+                excerpt = (body.strip().splitlines()[0] if body and body.strip() else "")[:800]
+                return {
+                    "id": nid,
+                    "label": note.get("title") or note.get("box"),
+                    "type": category,
+                    "path": note.get("path"),
+                    "tags": frontmatter.get("tags", []),
+                    "frontmatter": {k: v for k, v in frontmatter.items() if k not in {"linked_notes"}},
+                    "linked_notes": frontmatter.get("linked_notes", []),
+                    "excerpt": excerpt,
+                    "body": body,
+                }
+    raise HTTPException(status_code=404, detail="Entity not found")
 
 
 @app.post("/api/models/{model_id}")
@@ -238,18 +289,13 @@ def _handle_session_commands(user_text: str, session_id: str) -> Optional[str]:
         if matched:
             fact = matched.group(1).strip().rstrip(".?! ")
             if fact:
-                core_store.set_fact("project_fact", fact)
-                return "I saved that as a project fact in persistent memory."
+                vault_store.write_knowledge("project_notes", fact)
+                return "I saved that as a project fact in my persistent memory."
 
-    remember_match = re.search(r"\b(?:remember|save(?: this)?|note(?: that)?)\b(?:\s+that)?\s*(.+)", user_text, re.I)
-    if remember_match:
-        fact = remember_match.group(1).strip().rstrip(".?! ")
-        if fact:
-            key = "remembered_note"
-            if re.search(r"\bproject\b", fact, re.I):
-                key = "project_fact"
-            core_store.set_fact(key, fact)
-            return "I saved that to my persistent memory."
+    # Generic remember/save handling is intentionally disabled here.
+    # The explicit remember workflow must be resolved by the LLM-based memory
+    # agent using surrounding chat context, not by a regex that captures the
+    # trailing fragment after "remember".
     return None
 
 
@@ -285,7 +331,7 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
 
     session_history = get_context(session_id, limit=12)
     session_summary = get_session_summary(session_id)
-    facts = core_store.all_facts()
+    facts = vault_store.get_profile_fields()
     direct_answer = _answer_from_memory(user_text, facts, session_history)
     if direct_answer is not None:
         reply_text = direct_answer
@@ -302,11 +348,14 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
         return reply_text, audio_bytes, generation_metrics, client_action
 
     relevant_facts = _select_relevant_facts(user_text, facts)
+    vault_context = vault_store.get_context_snippet(query=user_text)
     memory_context = json.dumps(
         {
             "chat_context_summary": session_summary,
             "recent_chat_turns": session_history,
-            "relevant_persistent_memory": relevant_facts,
+            "relevant_profile_fields": relevant_facts,
+            "preferences": vault_context["preferences"],
+            "relevant_knowledge": vault_context["relevant_knowledge"],
         },
         ensure_ascii=False,
     )
@@ -431,7 +480,8 @@ async def websocket_endpoint(websocket: WebSocket):
       {"type": "audio", "audio_b64": "..."}              -> synthesized speech (streamed)
     """
     await websocket.accept()
-    session_id = getattr(websocket, "_nova_session_id", None) or str(uuid.uuid4())
+    query_session_id = websocket.query_params.get("session_id") if websocket.query_params else None
+    session_id = query_session_id or getattr(websocket, "_nova_session_id", None) or str(uuid.uuid4())
     setattr(websocket, "_nova_session_id", session_id)
     logger.info("Client connected to /ws/chat with session_id=%s", session_id)
     audio_buffer = bytearray()
@@ -446,6 +496,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 message = {"type": "text", "text": raw}
 
             msg_type = message.get("type", "text")
+            if msg_type == "session" and isinstance(message.get("session_id"), str) and message["session_id"].strip():
+                session_id = message["session_id"].strip()
+                setattr(websocket, "_nova_session_id", session_id)
+                logger.info("Updated WS session_id from client handshake to %s", session_id)
+                continue
 
             if msg_type == "audio":
                 audio_buffer.extend(base64.b64decode(message.get("audio_b64", "")))
@@ -455,6 +510,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info("Transcribed user text: %r", user_text)
                 audio_buffer.clear()
             else:
+                if isinstance(message.get("session_id"), str) and message["session_id"].strip():
+                    session_id = message["session_id"].strip()
+                    setattr(websocket, "_nova_session_id", session_id)
                 user_text = message.get("text", "")
 
             if not user_text.strip():

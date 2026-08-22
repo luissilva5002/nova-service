@@ -1,6 +1,11 @@
+"""
+nova/skills/remember/handler.py
+Writes to / reads from NOVA's persistent Obsidian-vault memory
+(nova/memory/vault_store.py).
+"""
 import logging
 
-from nova.memory.core_store import core_store
+from nova.memory import vault_store
 from nova.skills.base_skill import BaseSkill
 from nova.skills.remember.tools import TOOLS
 
@@ -13,22 +18,63 @@ class RememberSkill(BaseSkill):
         return TOOLS
 
     def execute(self, tool_name: str, arguments: dict) -> str:
-        if tool_name != "remember_fact":
-            return "Unknown remember command."
+        if tool_name == "update_user_preference":
+            return self._update_preference(arguments)
+        if tool_name == "update_user_knowledge":
+            return self._update_knowledge(arguments)
+        if tool_name == "recall_note":
+            return self._recall(arguments)
+        return "Unknown remember command."
 
-        key = str(arguments.get("key") or "remembered_fact").strip()
-        value = arguments.get("value")
-        if not key or value is None:
-            return "I need a key and a value to store this memory."
-
+    def _update_preference(self, arguments: dict) -> str:
+        box = str(arguments.get("box") or "").strip()
+        content = str(arguments.get("content") or "").strip()
+        if not box or not content:
+            return "I need a topic and a preference to save."
+        tags = arguments.get("tags") if isinstance(arguments.get("tags"), list) else None
         try:
-            core_store.set_fact(key, value)
-            category = (arguments.get("category") or "memory").strip()
-            logger.info("Stored remembered fact under key=%s category=%s", key, category)
-            return f"Saved {key} to my memory."
+            vault_store.write_preference(box, content, tags=tags)
+            return f"Saved that preference under '{box}'."
         except Exception as exc:  # pragma: no cover - best effort
-            logger.exception("Failed to save fact to memory")
-            return f"I couldn't save that memory: {exc}"
+            logger.exception("Failed to write preference note")
+            return f"I couldn't save that preference: {exc}"
+
+    def _update_knowledge(self, arguments: dict) -> str:
+        box = str(arguments.get("box") or "").strip()
+        content = str(arguments.get("content") or "").strip()
+        if not box or not content:
+            return "I need a topic and a fact to save."
+        subcategory = arguments.get("subcategory") or None
+        tags = arguments.get("tags") if isinstance(arguments.get("tags"), list) else None
+        try:
+            vault_store.write_knowledge(box, content, subcategory=subcategory, tags=tags)
+            return f"Saved that under '{box}' in my knowledge notes."
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.exception("Failed to write knowledge note")
+            return f"I couldn't save that: {exc}"
+
+    def _recall(self, arguments: dict) -> str:
+        category = str(arguments.get("category") or "").strip()
+        box = arguments.get("box")
+        query = arguments.get("query")
+
+        if category not in ("preferences", "knowledge"):
+            return "Please specify whether to look in preferences or knowledge."
+
+        if box:
+            body = vault_store.read_note_body(category, box)
+            if body is None:
+                return f"I don't have a '{box}' note in {category}."
+            return body[:600]
+
+        if query:
+            results = vault_store.search_notes(query, category=category)
+            if not results:
+                return f"I couldn't find anything matching '{query}' in {category}."
+            lines = [f"- {r['title']}: {r['snippet']}" for r in results]
+            return "Found:\n" + "\n".join(lines)
+
+        return "Please tell me a topic box name or a search query."
 
 
 skill = RememberSkill()
