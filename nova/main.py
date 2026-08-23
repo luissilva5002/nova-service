@@ -26,7 +26,7 @@ from nova.brain.llm_engine import llm_engine
 from nova.brain.stt_engine import stt_engine
 from nova.brain.tts_engine import tts_engine
 from nova.brain.tool_router import tool_router
-from nova.brain.intent_router import classify_intent, filter_tools_for_intent, wants_vault_context, is_small_talk
+from nova.brain.intent_router import classify_intent_llm, filter_tools_for_intent, wants_vault_context, is_small_talk
 from nova.memory.core_store import core_store
 from nova.memory import vault_store
 from nova.memory.memory_agent import memory_agent
@@ -400,7 +400,7 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
         return reply_text, audio_bytes, generation_metrics, client_action
 
     core_store.log_message("user", user_text)
-    intent = classify_intent(user_text)
+    intent = await classify_intent_llm(user_text, llm_engine)
     logger.info("Classified intent=%s for user_text=%r", intent, user_text)
 
     if intent == "memory_write":
