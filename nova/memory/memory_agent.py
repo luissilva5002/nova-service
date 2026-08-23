@@ -67,7 +67,10 @@ FACT_EXTRACTION_INSTRUCTION = (
     "Do not wrap the JSON in markdown fences. Do not include commentary. Only a JSON array of objects with 'target_box', 'fact', 'confidence', and 'source_turn_hint'."
 )
 
-REMEMBER_KEYWORDS = re.compile(r"\b(remember|note that|save this|keep in mind|write down)\b", re.I)
+REMEMBER_KEYWORDS = re.compile(
+    r"\b(?:remember|note that|save this|save to memory|store this in memory|create a memory|make a memory|keep in mind|write down)\b",
+    re.I,
+)
 PERSONAL_FACT_PATTERNS = [
     r"\bmy\s+name\s+is\b",
     r"\bi\s+am\s+(?:a\s+)?[A-Za-z][A-Za-z'\- ]{2,80}\b",
@@ -85,7 +88,13 @@ def _looks_like_personal_fact(user_text: str) -> bool:
     lower = user_text.lower()
     if not lower:
         return False
-    return bool(REMEMBER_KEYWORDS.search(user_text))
+    if REMEMBER_KEYWORDS.search(user_text):
+        return True
+
+    if re.search(r"\b(?:create|make|save|store)\s+(?:a\s+)?memory\b", user_text, re.I):
+        return True
+
+    return False
 
 
 class MemoryAgent:

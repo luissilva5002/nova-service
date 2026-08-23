@@ -245,6 +245,125 @@ canvas {
     transform-origin: center;
 }
 
+.memory-note-viewer {
+    position: absolute;
+    right: 20px;
+    top: 72px;
+    bottom: 20px;
+    width: min(32vw, 370px);
+    background: rgba(8, 12, 24, 0.92);
+    border: 1px solid var(--glass-border);
+    border-radius: 16px;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(18px);
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.memory-note-viewer.hidden {
+    display: none;
+}
+
+.memory-note-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 16px 18px 12px;
+    border-bottom: 1px solid var(--glass-border);
+    background: rgba(15, 22, 38, 0.8);
+}
+
+.memory-note-kicker {
+    font-size: 0.65rem;
+    letter-spacing: 2px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+}
+
+.memory-note-header h3 {
+    font-size: 1.05rem;
+    letter-spacing: 0.04em;
+    line-height: 1.4;
+}
+
+.memory-note-meta {
+    margin-top: 4px;
+    font-size: 0.65rem;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+}
+
+.memory-note-body {
+    flex: 1;
+    overflow: auto;
+    padding: 18px;
+    line-height: 1.6;
+    color: var(--text-main);
+    font-size: 0.9rem;
+}
+
+.memory-note-body.loading,
+.memory-note-body.error {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-dim);
+}
+
+.memory-note-body h1,
+.memory-note-body h2,
+.memory-note-body h3,
+.memory-note-body h4,
+.memory-note-body h5,
+.memory-note-body h6 {
+    margin: 0.8em 0 0.45em;
+    color: #7dd3fc;
+    letter-spacing: 0.04em;
+}
+
+.memory-note-body p,
+.memory-note-body ul,
+.memory-note-body ol,
+.memory-note-body blockquote,
+.memory-note-body pre {
+    margin-bottom: 0.9em;
+}
+
+.memory-note-body ul,
+.memory-note-body ol {
+    padding-left: 1.3rem;
+}
+
+.memory-note-body code {
+    background: rgba(14, 20, 30, 0.9);
+    border: 1px solid rgba(125, 211, 252, 0.2);
+    border-radius: 6px;
+    padding: 0.12rem 0.38rem;
+    font-size: 0.85em;
+}
+
+.memory-note-body pre {
+    background: rgba(14, 20, 30, 0.9);
+    border: 1px solid rgba(125, 211, 252, 0.2);
+    border-radius: 12px;
+    padding: 12px;
+    overflow-x: auto;
+}
+
+.memory-note-body a {
+    color: #7dd3fc;
+    text-decoration: underline;
+}
+
+.memory-note-body blockquote {
+    border-left: 2px solid rgba(125, 211, 252, 0.7);
+    padding-left: 12px;
+    color: #cbd5e1;
+}
+
 .hud-btn.small {
     padding: 6px 10px;
     min-height: 32px;

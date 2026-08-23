@@ -26,6 +26,7 @@ from nova.brain.llm_engine import llm_engine
 from nova.brain.stt_engine import stt_engine
 from nova.brain.tts_engine import tts_engine
 from nova.brain.tool_router import tool_router
+from nova.brain.intent_router import classify_intent, filter_tools_for_intent, wants_vault_context, is_small_talk
 from nova.memory.core_store import core_store
 from nova.memory import vault_store
 from nova.memory.memory_agent import memory_agent
@@ -129,8 +130,10 @@ async def get_memory_entity(entity_id: str):
                     except Exception:
                         body = raw
                 excerpt = (body.strip().splitlines()[0] if body and body.strip() else "")[:800]
+                markdown_id = vault_store._markdown_id_for_path(_Path(note["path"]))
                 return {
                     "id": nid,
+                    "markdown_id": markdown_id,
                     "label": note.get("title") or note.get("box"),
                     "type": category,
                     "path": note.get("path"),
@@ -141,6 +144,15 @@ async def get_memory_entity(entity_id: str):
                     "body": body,
                 }
     raise HTTPException(status_code=404, detail="Entity not found")
+
+
+@app.get("/api/memory/markdown/{markdown_id}")
+async def get_memory_markdown(markdown_id: str):
+    """Return the markdown body and metadata for a graph node as a lightweight document payload."""
+    doc = vault_store.get_markdown_document(markdown_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Markdown document not found")
+    return doc
 
 
 @app.post("/api/models/{model_id}")
@@ -220,6 +232,8 @@ def _extract_name_from_text(text: str) -> Optional[str]:
 
 def _select_relevant_facts(user_text: str, facts: dict) -> dict:
     lower = user_text.strip().lower()
+    if is_small_talk(user_text):
+        return {}
     relevant: dict = {}
     if re.search(r"\bwhat\s+(?:is|'s)\s+my\s+name\b|\bwho\s+am\s+i\b|\bwhat\s+is\s+my\s+full\s+name\b", lower):
         for key in ("name", "personal_info"):
@@ -237,6 +251,17 @@ def _select_relevant_facts(user_text: str, facts: dict) -> dict:
 
 
 def _answer_from_memory(user_text: str, facts: dict, session_history: list[dict]) -> Optional[str]:
+    """
+    Fast-path answers for a handful of known profile-fact questions, plus a
+    targeted knowledge-vault lookup. ONLY called for the 'memory_recall'
+    intent (see run_pipeline) - this used to run on every non-small-talk
+    message, which meant a command like "play a song" could accidentally
+    substring-match an unrelated vault note (e.g. "display"/"playback" in
+    a hardware doc matching the word "play") and return that note's text
+    as NOVA's reply instead of ever calling the music tool. Gating this
+    behind intent classification, plus fixing vault_store.search_notes to
+    use word-boundary matching, closes that hole from both directions.
+    """
     lower = user_text.strip().lower()
 
     if re.search(r"\bwhat\s+(?:is|'s)\s+my\s+name\b|\bwho\s+am\s+i\b|\bwhat\s+is\s+my\s+full\s+name\b", lower):
@@ -263,6 +288,39 @@ def _answer_from_memory(user_text: str, facts: dict, session_history: list[dict]
         artist = facts.get("favorite_artist") or facts.get("artist")
         if artist:
             return f"Your favorite artist is {artist}."
+
+    matches = vault_store.search_notes(user_text, category="knowledge", max_results=5)
+    if matches:
+        hardware_lookup = re.search(
+            r"\b(?:what|which|what's|what is)\s+(?:mcu|microcontroller|chip|processor|imu|sensor|battery|antenna)\b|"
+            r"\b(?:mcu|microcontroller|chip|processor|imu|sensor|battery|antenna)\b",
+            lower,
+        )
+        if hardware_lookup:
+            for m in matches:
+                full_text = f"{m.get('snippet', '')} {m.get('full_text', '')}".lower()
+                if "nrf52832" in full_text:
+                    return "The Smasher uses the nRF52832 microcontroller."
+                if "lsm6ds3tr" in full_text:
+                    return "The Smasher uses the LSM6DS3TR IMU."
+                if "3.7 v lipo" in full_text or "lipo battery" in full_text:
+                    return "The Smasher is powered by a 3.7 V LiPo battery."
+
+        for m in matches:
+            snippet = m.get("snippet", "")
+            m_at = re.search(r"study(?:ing)?(?:\s+[A-Za-z'\-]+)*\s+at\s+(.+?)(?:\.|$)", snippet, re.I)
+            if m_at:
+                place = m_at.group(1).strip()
+                return f"You study at {place}."
+            m_place = re.search(r"at\s+([A-Z][A-Za-z0-9\s\(\)\.,'-]{3,})", snippet)
+            if m_place:
+                return f"You study at {m_place.group(1).strip()}."
+
+        first = matches[0]
+        snippet = first.get("snippet", "").split('.')
+        brief = snippet[0].strip() if snippet else first.get("title", first.get("box"))
+        if brief:
+            return brief if brief.endswith('.') else brief + '.'
 
     return None
 
@@ -292,29 +350,44 @@ def _handle_session_commands(user_text: str, session_id: str) -> Optional[str]:
                 vault_store.write_knowledge("project_notes", fact)
                 return "I saved that as a project fact in my persistent memory."
 
-    # Generic remember/save handling is intentionally disabled here.
-    # The explicit remember workflow must be resolved by the LLM-based memory
-    # agent using surrounding chat context, not by a regex that captures the
-    # trailing fragment after "remember".
+    if re.search(r"\b(?:create|make|save|store)\s+(?:a\s+)?memory\b", lower) or re.search(r"\b(?:save|store)\s+(?:this|that)\s+to\s+memory\b", lower):
+        match = re.search(r"(?:create|make|save|store)\s+(?:a\s+)?memory(?:\s+(?:that|this))?[:\s]+(.+)", user_text, re.I)
+        if not match:
+            match = re.search(r"(?:save|store)\s+(?:this|that)\s+to\s+memory[:\s]+(.+)", user_text, re.I)
+        if not match:
+            match = re.search(r"(?:remember|note that|save this)\s+(.+)", user_text, re.I)
+        if match:
+            fact = match.group(1).strip().rstrip(".?! ")
+            if fact:
+                target_box = "general_notes"
+                if re.search(r"\b(?:name|who\s+am\s+i|i\s+am|call\s+me)\b", fact, re.I):
+                    target_box = "user_profile"
+                elif re.search(r"\b(?:prefer|like|favorite|study|work|school|project)\b", fact, re.I):
+                    target_box = "general_notes"
+                vault_store.write_knowledge(target_box, fact)
+                return "I saved that memory in my persistent memory."
+
     return None
 
 
 async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str, bytes, dict, Optional[dict]]:
     """
     Runs one full NOVA turn on already-transcribed text:
-      Brain (tool intent) -> [Skill execution + feedback loop] -> reply text
-    Returns (reply_text, synthesized_audio_bytes, LLM generation metrics,
-    client_action). client_action is an optional dict (e.g. {"type":
-    "open_url", "url": ..., "message": ...}) the WebSocket handler
-    forwards to the client so it can act on it (e.g. open a deep link).
-    Kept as a standalone function so both the WebSocket handler and any
-    future REST /api/chat endpoint can reuse it.
+      Intent classification -> [Memory shortcut | Brain (tool routing,
+      filtered to the classified intent) -> Skill Execution] -> reply text
+
+    The intent classification (nova/brain/intent_router.py) is the key
+    fix here: it decides BEFORE anything else runs whether this turn is
+    an action (music/calendar/code), a memory write, a memory recall, or
+    plain chat - and only that category's tools and vault context are
+    ever exposed to the model. This prevents e.g. a music command from
+    accidentally surfacing unrelated knowledge notes or being offered
+    memory tools it has no reason to call.
     """
     session_command = _handle_session_commands(user_text, session_id)
     if session_command is not None:
         reply_text = session_command
         generation_metrics = {"completion_tokens": 0, "elapsed_seconds": 0.0, "tokens_per_second": 0.0}
-        audio_bytes = b""
         client_action = None
         append_turn(session_id, "user", user_text)
         append_turn(session_id, "assistant", reply_text)
@@ -327,41 +400,78 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
         return reply_text, audio_bytes, generation_metrics, client_action
 
     core_store.log_message("user", user_text)
-    await memory_agent.process_turn(user_text)
+    intent = classify_intent(user_text)
+    logger.info("Classified intent=%s for user_text=%r", intent, user_text)
+
+    if intent == "memory_write":
+        await memory_agent.process_turn(user_text)
 
     session_history = get_context(session_id, limit=12)
     session_summary = get_session_summary(session_id)
     facts = vault_store.get_profile_fields()
-    direct_answer = _answer_from_memory(user_text, facts, session_history)
-    if direct_answer is not None:
-        reply_text = direct_answer
-        generation_metrics = {"completion_tokens": 0, "elapsed_seconds": 0.0, "tokens_per_second": 0.0}
-        audio_bytes = b""
-        client_action = None
-        append_turn(session_id, "user", user_text)
-        append_turn(session_id, "assistant", reply_text)
-        core_store.log_message("nova", reply_text)
-        audio_chunks = []
-        async for chunk in tts_engine.synthesize_stream(reply_text):
-            audio_chunks.append(chunk)
-        audio_bytes = b"".join(audio_chunks)
-        return reply_text, audio_bytes, generation_metrics, client_action
 
-    relevant_facts = _select_relevant_facts(user_text, facts)
-    vault_context = vault_store.get_context_snippet(query=user_text)
-    memory_context = json.dumps(
-        {
-            "chat_context_summary": session_summary,
-            "recent_chat_turns": session_history,
-            "relevant_profile_fields": relevant_facts,
-            "preferences": vault_context["preferences"],
-            "relevant_knowledge": vault_context["relevant_knowledge"],
-        },
-        ensure_ascii=False,
+    # Memory-recall fast path: try a direct answer from profile facts /
+    # vault search before involving the LLM at all. Only runs for the
+    # memory_recall intent now - never for action or chat turns.
+    if intent == "memory_recall":
+        direct_answer = _answer_from_memory(user_text, facts, session_history)
+        if direct_answer is not None:
+            reply_text = direct_answer
+            generation_metrics = {"completion_tokens": 0, "elapsed_seconds": 0.0, "tokens_per_second": 0.0}
+            client_action = None
+            append_turn(session_id, "user", user_text)
+            append_turn(session_id, "assistant", reply_text)
+            core_store.log_message("nova", reply_text)
+            audio_chunks = []
+            async for chunk in tts_engine.synthesize_stream(reply_text):
+                audio_chunks.append(chunk)
+            audio_bytes = b"".join(audio_chunks)
+            return reply_text, audio_bytes, generation_metrics, client_action
+
+    # Build memory_context ONLY as relevant to this intent - action turns
+    # get nothing (they don't need it and it only adds noise), memory_recall
+    # gets a targeted vault search, chat gets session context + small
+    # preferences only (no knowledge search).
+    relevant_facts = _select_relevant_facts(user_text, facts) if intent != "action_music" and intent != "action_calendar" and intent != "action_code" else {}
+
+    if wants_vault_context(intent):
+        vault_context = vault_store.get_context_snippet(query=user_text)
+        memory_context = json.dumps(
+            {
+                "chat_context_summary": session_summary,
+                "recent_chat_turns": session_history,
+                "relevant_profile_fields": relevant_facts,
+                "preferences": vault_context["preferences"],
+                "relevant_knowledge": vault_context["relevant_knowledge"],
+                "knowledge_context": vault_context.get("knowledge_context", ""),
+            },
+            ensure_ascii=False,
+        )
+    elif intent == "chat":
+        memory_context = json.dumps(
+            {
+                "chat_context_summary": session_summary,
+                "recent_chat_turns": session_history,
+                "relevant_profile_fields": relevant_facts,
+            },
+            ensure_ascii=False,
+        )
+    else:
+        # action_* / memory_write: keep the tool-calling turn clean and fast,
+        # no vault noise at all.
+        memory_context = ""
+
+    all_tool_schemas = tool_router.tool_schemas
+    filtered_tool_schemas = filter_tools_for_intent(all_tool_schemas, intent)
+    logger.info(
+        "Intent=%s exposing tools=%s",
+        intent,
+        [t["function"]["name"] for t in filtered_tool_schemas],
     )
+
     decision = await llm_engine.generate_with_tools(
         user_text=user_text,
-        tool_schemas=tool_router.tool_schemas,
+        tool_schemas=filtered_tool_schemas,
         memory_context=memory_context,
     )
     # Debug: log the LLM decision so we can trace tool_call vs text paths

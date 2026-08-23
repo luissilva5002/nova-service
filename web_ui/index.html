@@ -43,9 +43,11 @@
     <div id="memoryMapPanel" class="memory-map-panel hidden">
         <div class="memory-map-header">
             <span>// PERSISTENT MEMORY MAP</span>
+            <button class="hud-btn small" onclick="memoryGraphFocus = null; renderMemoryMap();">Root</button>
             <button class="hud-btn small" onclick="toggleMemoryMap()">Close</button>
         </div>
         <svg id="memoryMapSvg" class="memory-map-svg" viewBox="0 0 1000 720" preserveAspectRatio="xMidYMid meet"></svg>
+        <aside id="memoryNoteViewer" class="memory-note-viewer hidden" aria-live="polite"></aside>
     </div>
 
     <!-- Hidden Conversation Backlog Drawer -->

@@ -45,9 +45,14 @@ def _slugify(name: str) -> str:
 
 
 def _note_path(category: str, box: str, subcategory: Optional[str] = None) -> Path:
-    if category not in ("preferences", "knowledge"):
+    if category not in ("preferences", "knowledge", "user"):
         raise ValueError(f"Unknown vault category: {category!r}")
-    root = PREFERENCES_DIR if category == "preferences" else KNOWLEDGE_DIR
+    if category == "preferences":
+        root = PREFERENCES_DIR
+    elif category == "knowledge":
+        root = KNOWLEDGE_DIR
+    else:
+        root = PERSISTENT_MEMORY_VAULT_DIR / "user"
     slug = _slugify(box)
     if subcategory:
         return root / _slugify(subcategory) / f"{slug}.md"
@@ -61,7 +66,22 @@ def _paired_note_path(category: str, box: str) -> Path:
     return _note_path(other, box)
 
 
+def _resolve_existing_note_path(path: Path) -> Path:
+    """Resolve a note path even when the vault stores an extensionless file.
+
+    Some notes in the Obsidian-style vault are persisted as plain filenames
+    without a .md suffix, while the rest of the system expects .md paths.
+    """
+    if path.exists():
+        return path
+    alt = path.with_suffix("") if path.suffix == ".md" else path
+    if alt.exists():
+        return alt
+    return path
+
+
 def _read_raw(path: Path) -> Optional[str]:
+    path = _resolve_existing_note_path(path)
     if not path.exists():
         return None
     return path.read_text(encoding="utf-8")
@@ -101,17 +121,18 @@ def _ensure_note(
 ) -> tuple[Path, dict, str]:
     path = _note_path(category, box, subcategory)
     path.parent.mkdir(parents=True, exist_ok=True)
-    raw = _read_raw(path)
+    resolved = _resolve_existing_note_path(path)
+    raw = _read_raw(resolved)
     if raw is None:
         title = box.replace("_", " ").strip().title()
         frontmatter = _default_frontmatter(title, category, tags)
         body = f"\n# {title}\n\n## Updates\n"
-        return path, frontmatter, body
+        return resolved, frontmatter, body
     frontmatter, body = _split_frontmatter(raw)
     if tags:
         existing = set(frontmatter.get("tags", []) or [])
         frontmatter["tags"] = sorted(existing | set(tags))
-    return path, frontmatter, body
+    return resolved, frontmatter, body
 
 
 def _append_entry(body: str, content: str) -> str:
@@ -184,7 +205,8 @@ def write_knowledge(
 
 
 def read_note(category: str, box: str, subcategory: Optional[str] = None) -> Optional[str]:
-    return _read_raw(_note_path(category, box, subcategory))
+    path = _resolve_existing_note_path(_note_path(category, box, subcategory))
+    return _read_raw(path)
 
 
 def read_note_body(category: str, box: str, subcategory: Optional[str] = None) -> Optional[str]:
@@ -196,50 +218,163 @@ def read_note_body(category: str, box: str, subcategory: Optional[str] = None) -
 
 
 def list_notes(category: str) -> list[dict]:
-    root = PREFERENCES_DIR if category == "preferences" else KNOWLEDGE_DIR
+    if category == "preferences":
+        root = PREFERENCES_DIR
+    elif category == "knowledge":
+        root = KNOWLEDGE_DIR
+    elif category == "user":
+        root = PERSISTENT_MEMORY_VAULT_DIR / "user"
+    else:
+        return []
     if not root.exists():
         return []
     notes = []
-    for path in sorted(root.rglob("*.md")):
-        raw = _read_raw(path) or ""
+    seen_paths: set[Path] = set()
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            continue
+        if path.name.startswith("."):
+            continue
+        if path.suffix not in {".md", ""}:
+            continue
+        real_path = _resolve_existing_note_path(path)
+        if real_path in seen_paths:
+            continue
+        seen_paths.add(real_path)
+        raw = _read_raw(real_path) or ""
         frontmatter, _ = _split_frontmatter(raw)
+        note_name = real_path.stem or real_path.name
         notes.append({
-            "box": path.stem,
-            "subcategory": path.parent.name if path.parent != root else None,
-            "path": str(path),
-            "title": frontmatter.get("title", path.stem),
+            "box": note_name,
+            "subcategory": real_path.parent.name if real_path.parent != root else None,
+            "path": str(real_path),
+            "title": frontmatter.get("title", note_name),
             "tags": frontmatter.get("tags", []),
         })
     return notes
 
 
-def search_notes(query: str, category: Optional[str] = None, max_results: int = 5) -> list[dict]:
-    """Simple case-insensitive keyword search across vault notes. No
-    embeddings needed at this scale - a personal vault of markdown files."""
+_MEMORY_STOPWORDS = {
+    "a", "an", "and", "are", "at", "be", "been", "being", "by", "can", "could",
+    "create", "do", "does", "did", "doing", "for", "from", "good", "hello", "hey",
+    "hi", "how", "i", "im", "in", "is", "it", "its", "just", "me", "memory",
+    "morning", "my", "nova", "of", "on", "or", "our", "please", "remember",
+    "save", "should", "so", "store", "sup", "that", "the", "their", "them",
+    "there", "these", "they", "this", "those", "to", "today", "up", "us", "was",
+    "we", "what", "when", "where", "who", "why", "will", "with", "would",
+    "write", "you", "your", "yours"
+}
+
+
+def _extract_memory_keywords(query: str) -> list[str]:
+    """Remove small-talk and filler tokens so a greeting like 'how are you' does
+    not trigger a memory lookup on unrelated knowledge."""
     query = (query or "").strip().lower()
     if not query:
         return []
-    keywords = [w for w in re.split(r"\W+", query) if len(w) > 2]
+    keywords = []
+    for token in re.split(r"\W+", query):
+        token = token.strip()
+        if len(token) <= 2:
+            continue
+        if token in _MEMORY_STOPWORDS:
+            continue
+        keywords.append(token)
+    return keywords
+
+
+def search_notes(query: str, category: Optional[str] = None, max_results: int = 5) -> list[dict]:
+    """Keyword search across vault notes, using WORD-BOUNDARY matching only.
+
+    Previously this used plain substring checks (`kw in lower`), which
+    meant a query containing "play" would match "display", "playback",
+    "player", etc. anywhere in a note's body - causing completely
+    unrelated notes (e.g. hardware docs) to be surfaced for commands
+    like "play a song". Word-boundary regex matching fixes that; a
+    keyword must appear as a whole word to count as a match.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    if re.search(r"\b(?:remember|note that|save this|save to memory|create a memory|make a memory|store this in memory|write down)\b", query, re.I):
+        return []
+    keywords = _extract_memory_keywords(query)
     if not keywords:
         return []
 
-    categories = [category] if category in ("preferences", "knowledge") else ["preferences", "knowledge"]
-    results = []
+    keyword_patterns = [re.compile(rf"\b{re.escape(kw)}\b", re.I) for kw in keywords]
+
+    categories = [category] if category in ("preferences", "knowledge", "user") else ["preferences", "knowledge", "user"]
+    ranked = []
     for cat in categories:
         for note in list_notes(cat):
             raw = _read_raw(Path(note["path"])) or ""
-            lower = raw.lower()
-            if any(kw in lower for kw in keywords) or any(kw in note["title"].lower() for kw in keywords):
-                _, body = _split_frontmatter(raw)
-                snippet = body.strip().replace("\n", " ")[:280]
-                results.append({
-                    "category": cat,
-                    "box": note["box"],
-                    "subcategory": note["subcategory"],
-                    "title": note["title"],
-                    "snippet": snippet,
-                })
-    return results[:max_results]
+            title = note["title"]
+            score = 0
+            for pattern in keyword_patterns:
+                if pattern.search(title):
+                    score += 10
+                score += len(pattern.findall(raw))
+            if score <= 0:
+                continue
+            _, body = _split_frontmatter(raw)
+            clean_body = body.strip().replace("\n", " ")
+            snippet = clean_body[:280]
+            ranked.append({
+                "category": cat,
+                "box": note["box"],
+                "subcategory": note["subcategory"],
+                "title": note["title"],
+                "snippet": snippet,
+                "full_text": clean_body[:4000],
+                "_score": score,
+            })
+    ranked.sort(key=lambda item: item["_score"], reverse=True)
+    for item in ranked:
+        item.pop("_score", None)
+    return ranked[:max_results]
+
+def _markdown_id_for_path(path: Path) -> str:
+    """Stable, human-readable reference for a markdown document.
+
+    The id is derived from the vault-relative path so it remains deterministic
+    across restarts and editor sessions while still being compact enough for
+    client-side fetches and debugging.
+    """
+    try:
+        rel = path.relative_to(PERSISTENT_MEMORY_VAULT_DIR).with_suffix("")
+    except ValueError:
+        rel = path.with_suffix("")
+    return rel.as_posix().replace("/", "__").replace("\\", "__").strip("_") or "note"
+
+
+def resolve_note_by_markdown_id(markdown_id: str) -> Optional[dict]:
+    """Look up the note metadata for a markdown_id string."""
+    if not markdown_id:
+        return None
+    for category in ("preferences", "knowledge", "user"):
+        for note in list_notes(category):
+            path = Path(note["path"])
+            if _markdown_id_for_path(path) == markdown_id:
+                return {**note, "category": category}
+    return None
+
+
+def get_markdown_document(markdown_id: str) -> Optional[dict]:
+    """Fetch a note's body and metadata for the lightweight document API."""
+    note = resolve_note_by_markdown_id(markdown_id)
+    if note is None:
+        return None
+    raw = _read_raw(Path(note["path"])) or ""
+    frontmatter, body = _split_frontmatter(raw)
+    title = frontmatter.get("title") or note.get("title") or Path(note["path"]).stem
+    updated = frontmatter.get("updated") or datetime.fromtimestamp(Path(note["path"]).stat().st_mtime, tz=timezone.utc).isoformat()
+    return {
+        "id": markdown_id,
+        "title": title,
+        "content": (body or "").strip() or "# " + title + "\n",
+        "updated_at": updated,
+    }
 
 
 def get_profile_fields() -> dict:
@@ -281,85 +416,150 @@ def get_context_snippet(query: str = "", max_preference_chars: int = 800, max_kn
         combined_preferences = combined_preferences[:max_preference_chars].rstrip() + "..."
 
     knowledge_matches = search_notes(query, category="knowledge", max_results=max_knowledge_notes) if query else []
+    full_context_blocks = []
+    for match in knowledge_matches:
+        full_text = (match.get("full_text") or match.get("snippet") or "").strip()
+        if full_text:
+            full_context_blocks.append(f"### {match['title']}\n{full_text}")
 
     return {
         "profile": get_profile_fields(),
         "preferences": combined_preferences,
         "relevant_knowledge": knowledge_matches,
+        "knowledge_context": "\n\n".join(full_context_blocks),
     }
 
 
 def get_memory_graph(max_nodes: int = 60) -> dict:
-    """Builds a UI-friendly node/link graph from the vault's WikiLinks, for
-    the /api/memory/graph endpoint (replaces the old SQLite entity graph).
+    """Return a folder-aware graph of the memory vault.
 
-    Notes on IDs: Use a stable deterministic id derived from the note path so
-    clients can maintain node identity across restarts/edits.
+    The graph mixes two node kinds:
+      - folder: a directory container
+      - document: a markdown note
+
+    Document nodes still include a stable markdown_id so clients can fetch the
+    note content on demand, while folder nodes allow UI zooming into nested
+    memory containers.
     """
     import math
     from hashlib import sha1
 
-    pref_notes = [{**n, "type": "preferences"} for n in list_notes("preferences")]
-    know_notes = [{**n, "type": "knowledge"} for n in list_notes("knowledge")]
-    all_notes = (pref_notes + know_notes)[:max_nodes]
-    if not all_notes:
-        return {"root": "user", "nodes": [], "links": []}
+    nodes: list[dict] = []
+    links: list[dict] = []
+    folder_ids: dict[str, str] = {}
+    title_to_id: dict[str, str] = {}
 
-    # Deterministic id per-note: SHA1 of the note's vault-relative path
-    def _note_id_for_path(path_str: str) -> str:
-        try:
-            p = Path(path_str)
-            rel = str(p.relative_to(PERSISTENT_MEMORY_VAULT_DIR))
-        except Exception:
-            rel = path_str
+    def _id_for_rel(rel: str) -> str:
         return sha1(rel.encode("utf-8")).hexdigest()
 
-    title_to_id: dict[str, str] = {}
-    path_map: dict[str, dict] = {}
-    for note in all_notes:
-        nid = _note_id_for_path(note["path"])
-        title_to_id[note["title"]] = nid
-        path_map[nid] = note
-
-    nodes = []
-    links = []
-    seen_links: set[tuple[str, str]] = set()
-    count = len(all_notes)
-
-    for i, note in enumerate(all_notes):
-        angle = 2 * math.pi * i / max(count, 1)
-        radius = 260
-        x = 500 + math.cos(angle) * radius
-        y = 360 + math.sin(angle) * radius * 0.8
-        note_id = title_to_id[note["title"]]
-
-        raw = _read_raw(Path(note["path"])) or ""
-        fm, body = _split_frontmatter(raw)
-        excerpt = (body.strip().splitlines()[0] if body.strip() else "")[:240]
-        tags = fm.get("tags", []) if isinstance(fm, dict) else []
-
+    def _ensure_folder(category: str, rel_dir: str, depth: int = 0, parent_id: Optional[str] = None) -> str:
+        key = f"{category}:{rel_dir or '.'}"
+        if key in folder_ids:
+            return folder_ids[key]
+        folder_id = _id_for_rel(f"{category}:{rel_dir or '.'}")
+        folder_ids[key] = folder_id
+        label = Path(rel_dir).name if rel_dir and rel_dir != "." else category.title()
         nodes.append({
-            "id": note_id,
-            "label": note["title"],
-            "type": note["type"],
-            "path": note.get("path"),
-            "tags": tags,
-            "facts": [],
-            "excerpt": excerpt,
-            "x": round(x, 2),
-            "y": round(y, 2),
-            "size": 100,
+            "id": folder_id,
+            "label": label,
+            "kind": "folder",
+            "type": category,
+            "path": str(PERSISTENT_MEMORY_VAULT_DIR / category / rel_dir) if rel_dir else str(PERSISTENT_MEMORY_VAULT_DIR / category),
+            "parent_id": parent_id,
+            "depth": depth,
+            "x": 500,
+            "y": 360,
+            "size": 140,
         })
+        if parent_id:
+            links.append({"source": parent_id, "target": folder_id, "label": "contains", "kind": "folder"})
+        return folder_id
 
+    for category in ("user", "preferences", "knowledge"):
+        if category == "user":
+            root_dir = PERSISTENT_MEMORY_VAULT_DIR / "user"
+        elif category == "preferences":
+            root_dir = PREFERENCES_DIR
+        else:
+            root_dir = KNOWLEDGE_DIR
+        if not root_dir.exists():
+            continue
+        category_root_id = _ensure_folder(category, ".", depth=0)
+        for path in sorted(root_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            if path.suffix not in {".md", ""}:
+                continue
+            rel = path.relative_to(root_dir)
+            rel_str = rel.as_posix()
+            parent_rel = rel.parent
+            parent_id = category_root_id
+            if parent_rel != Path("."):
+                current_rel = Path(".")
+                for part in parent_rel.parts:
+                    current_rel = current_rel / part
+                    parent_id = _ensure_folder(category, current_rel.as_posix(), depth=len(current_rel.parts), parent_id=parent_id)
+
+            raw = _read_raw(path) or ""
+            fm, body = _split_frontmatter(raw)
+            title = (fm.get("title") if isinstance(fm, dict) else None) or path.stem or path.name
+            doc_id = _id_for_rel(f"{category}:{rel_str}")
+            title_to_id[title] = doc_id
+
+            nodes.append({
+                "id": doc_id,
+                "label": title,
+                "kind": "document",
+                "type": category,
+                "markdown_id": _markdown_id_for_path(path),
+                "path": str(path),
+                "parent_id": parent_id,
+                "depth": max(1, len(rel.parts)),
+                "excerpt": (body.strip().splitlines()[0] if body.strip() else "")[:220],
+                "tags": fm.get("tags", []) if isinstance(fm, dict) else [],
+                "facts": [],
+                "x": 500,
+                "y": 360,
+                "size": 110,
+            })
+            links.append({"source": parent_id, "target": doc_id, "label": "contains", "kind": "document"})
+
+    visible = [n for n in nodes if n.get("kind") in {"folder", "document"}]
+    if not visible:
+        return {"root": "user", "nodes": [], "links": []}
+
+    folder_nodes = [n for n in visible if n["kind"] == "folder"]
+    document_nodes = [n for n in visible if n["kind"] == "document"]
+    count = len(visible)
+
+    for index, node in enumerate(visible):
+        angle = 2 * math.pi * index / max(count, 1)
+        radius = 220 + (node.get("depth", 1) * 75)
+        x = 500 + math.cos(angle) * radius
+        y = 360 + math.sin(angle) * radius * 0.75
+        if node["kind"] == "folder":
+            x = 500 + (node.get("depth", 0) * 180) - 90
+            y = 360 + (index % 5) * 70 - 140
+        node["x"] = round(x, 2)
+        node["y"] = round(y, 2)
+
+    seen_links: set[tuple[str, str, str]] = set()
+    for node in document_nodes:
+        raw = _read_raw(Path(node["path"])) or ""
         for match in _WIKILINK_PATTERN.finditer(raw):
             target_title = match.group(1).strip()
             target_id = title_to_id.get(target_title)
-            if target_id is None or target_id == note_id:
+            if target_id is None or target_id == node["id"]:
                 continue
-            key = (note_id, target_id, "linked")
+            key = (node["id"], target_id, "linked")
             if key in seen_links:
                 continue
             seen_links.add(key)
-            links.append({"source": note_id, "target": target_id, "label": "linked", "metadata": {}})
+            links.append({"source": node["id"], "target": target_id, "label": "linked", "kind": "reference"})
+
+    if len(nodes) > max_nodes:
+        visible_ids = {n["id"] for n in nodes[:max_nodes]}
+        nodes = nodes[:max_nodes]
+        links = [link for link in links if link["source"] in visible_ids and link["target"] in visible_ids]
 
     return {"root": "user", "nodes": nodes, "links": links}

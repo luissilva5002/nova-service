@@ -9,11 +9,13 @@ const drawer = document.getElementById('drawer');
 const coreWrapper = document.getElementById('coreWrapper');
 const memoryMapPanel = document.getElementById('memoryMapPanel');
 const memoryMapSvg = document.getElementById('memoryMapSvg');
+const memoryNoteViewer = document.getElementById('memoryNoteViewer');
 
 let uiState = 'idle'; // 'idle' | 'user' | 'thinking' | 'nova'
 let speakTimeout;
 let audioFallbackTimeout;
 let thinkingStartedAt = 0;
+let memoryGraphFocus = null;
 const MIN_THINKING_MS = 700; // spinner stays visible at least this long, even on instant replies
 
 const SESSION_STORAGE_KEY = 'nova_session_id';
@@ -143,6 +145,7 @@ async function renderMemoryMap() {
         const response = await fetch('/api/memory/graph');
         if (!response.ok) throw new Error(`Memory graph fetch failed (${response.status})`);
         const graph = await response.json();
+        memoryGraphFocus = null;
         renderMemoryGraph(graph);
     } catch (error) {
         console.warn('Could not load memory map', error);
@@ -161,22 +164,41 @@ function renderMemoryGraph(graph) {
     defs.appendChild(filter);
     memoryMapSvg.appendChild(defs);
 
-    const nodes = graph.nodes || [];
+    let nodes = graph.nodes || [];
     const links = graph.links || [];
     const nodeMap = new Map(nodes.map(node => [node.id, node]));
+
+    if (memoryGraphFocus) {
+        const focusNode = nodeMap.get(memoryGraphFocus);
+        if (focusNode && focusNode.kind === 'folder') {
+            const visibleIds = new Set([focusNode.id]);
+            const queue = [focusNode.id];
+            while (queue.length) {
+                const currentId = queue.shift();
+                for (const link of links) {
+                    if (link.source === currentId && link.kind !== 'reference') {
+                        visibleIds.add(link.target);
+                        queue.push(link.target);
+                    }
+                }
+            }
+            nodes = nodes.filter(node => visibleIds.has(node.id));
+        }
+    }
 
     for (const link of links) {
         const source = nodeMap.get(link.source);
         const target = nodeMap.get(link.target);
         if (!source || !target) continue;
+        if (memoryGraphFocus && !nodes.some(node => node.id === source.id || node.id === target.id)) continue;
 
         const line = document.createElementNS(svgNS, 'line');
         line.setAttribute('x1', source.x);
         line.setAttribute('y1', source.y);
         line.setAttribute('x2', target.x);
         line.setAttribute('y2', target.y);
-        line.setAttribute('stroke', 'rgba(96,165,250,0.5)');
-        line.setAttribute('stroke-width', '1.5');
+        line.setAttribute('stroke', link.kind === 'reference' ? 'rgba(96,165,250,0.6)' : 'rgba(125,211,252,0.45)');
+        line.setAttribute('stroke-width', link.kind === 'reference' ? '1.8' : '1.4');
         line.setAttribute('stroke-linecap', 'round');
         line.setAttribute('filter', 'url(#mapGlow)');
         memoryMapSvg.appendChild(line);
@@ -194,9 +216,18 @@ function renderMemoryGraph(graph) {
     for (const node of nodes) {
         const group = document.createElementNS(svgNS, 'g');
         group.setAttribute('transform', `translate(${node.x}, ${node.y})`);
+        group.style.cursor = node.kind === 'folder' ? 'pointer' : node.markdown_id ? 'pointer' : 'default';
+        group.addEventListener('click', () => {
+            if (node.kind === 'folder') {
+                memoryGraphFocus = node.id;
+                renderMemoryGraph(graph);
+                return;
+            }
+            if (node.markdown_id) openMemoryNode(node);
+        });
 
-        const width = Math.max(120, Math.min(180, 80 + (node.label.length * 6.5)));
-        const height = Math.max(56, 48 + Math.min((node.facts || []).length * 12, 32));
+        const width = node.kind === 'folder' ? 160 : Math.max(120, Math.min(180, 80 + (node.label.length * 6.5)));
+        const height = node.kind === 'folder' ? 68 : Math.max(56, 48 + Math.min((node.facts || []).length * 12, 32));
 
         const box = document.createElementNS(svgNS, 'rect');
         box.setAttribute('x', -(width / 2));
@@ -204,46 +235,187 @@ function renderMemoryGraph(graph) {
         box.setAttribute('width', width);
         box.setAttribute('height', height);
         box.setAttribute('rx', '16');
-        box.setAttribute('fill', 'rgba(14, 16, 28, 0.9)');
-        box.setAttribute('stroke', 'rgba(96,165,250,0.9)');
+        box.setAttribute('fill', node.kind === 'folder' ? 'rgba(59, 130, 246, 0.18)' : 'rgba(14, 16, 28, 0.9)');
+        box.setAttribute('stroke', node.kind === 'folder' ? 'rgba(125, 211, 252, 0.9)' : 'rgba(96,165,250,0.9)');
         box.setAttribute('stroke-width', '1.4');
         box.setAttribute('filter', 'url(#mapGlow)');
         group.appendChild(box);
 
         const title = document.createElementNS(svgNS, 'text');
         title.setAttribute('x', '0');
-        title.setAttribute('y', '-6');
+        title.setAttribute('y', node.kind === 'folder' ? '-10' : '-6');
         title.setAttribute('text-anchor', 'middle');
         title.setAttribute('fill', '#e2e8f0');
-        title.setAttribute('font-size', '13');
+        title.setAttribute('font-size', node.kind === 'folder' ? '12' : '13');
         title.setAttribute('font-weight', '700');
-        title.textContent = node.label.length > 16 ? `${node.label.slice(0, 15)}…` : node.label;
+        title.textContent = node.label.length > 18 ? `${node.label.slice(0, 17)}…` : node.label;
         group.appendChild(title);
 
         const type = document.createElementNS(svgNS, 'text');
         type.setAttribute('x', '0');
-        type.setAttribute('y', '12');
+        type.setAttribute('y', node.kind === 'folder' ? '12' : '12');
         type.setAttribute('text-anchor', 'middle');
         type.setAttribute('fill', '#7dd3fc');
         type.setAttribute('font-size', '10');
-        type.textContent = node.type || 'concept';
+        type.textContent = node.kind === 'folder' ? 'container' : (node.type || 'concept');
         group.appendChild(type);
-
-        const facts = node.facts || [];
-        for (let i = 0; i < facts.length; i += 1) {
-            const entry = document.createElementNS(svgNS, 'text');
-            entry.setAttribute('x', '0');
-            entry.setAttribute('y', 28 + (i * 11));
-            entry.setAttribute('text-anchor', 'middle');
-            entry.setAttribute('fill', '#cbd5e1');
-            entry.setAttribute('font-size', '9');
-            const value = typeof facts[i].value === 'object' ? JSON.stringify(facts[i].value) : String(facts[i].value || facts[i].key);
-            entry.textContent = `${facts[i].key}: ${value}`.slice(0, 24);
-            group.appendChild(entry);
-        }
 
         memoryMapSvg.appendChild(group);
     }
+}
+
+function escapeHtml(value = '') {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function convertMarkdownInline(text = '') {
+    let html = escapeHtml(text);
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    return html;
+}
+
+function renderMarkdownContent(markdown = '') {
+    const lines = (markdown || '').replace(/\r\n/g, '\n').split('\n');
+    const blocks = [];
+    let listItems = [];
+    let paragraph = [];
+    let codeBlock = [];
+    let inCode = false;
+
+    const flushParagraph = () => {
+        if (paragraph.length) {
+            blocks.push(`<p>${convertMarkdownInline(paragraph.join(' ').trim())}</p>`);
+            paragraph = [];
+        }
+    };
+
+    const flushList = () => {
+        if (listItems.length) {
+            blocks.push(`<ul>${listItems.map(item => `<li>${convertMarkdownInline(item)}</li>`).join('')}</ul>`);
+            listItems = [];
+        }
+    };
+
+    const flushCode = () => {
+        if (codeBlock.length) {
+            blocks.push(`<pre><code>${escapeHtml(codeBlock.join('\n'))}</code></pre>`);
+            codeBlock = [];
+        }
+    };
+
+    for (const rawLine of lines) {
+        const line = rawLine.trimEnd();
+        if (!line.trim()) {
+            flushParagraph();
+            flushList();
+            continue;
+        }
+
+        if (line.startsWith('```')) {
+            flushParagraph();
+            flushList();
+            if (inCode) {
+                flushCode();
+                inCode = false;
+            } else {
+                inCode = true;
+            }
+            continue;
+        }
+
+        if (inCode) {
+            codeBlock.push(rawLine);
+            continue;
+        }
+
+        const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+        if (headingMatch) {
+            flushParagraph();
+            flushList();
+            const level = Math.min(headingMatch[1].length, 6);
+            blocks.push(`<h${level}>${convertMarkdownInline(headingMatch[2])}</h${level}>`);
+            continue;
+        }
+
+        if (/^[-*]\s+/.test(line)) {
+            flushParagraph();
+            listItems.push(line.replace(/^[-*]\s+/, '').trim());
+            continue;
+        }
+
+        if (/^>\s+/.test(line)) {
+            flushParagraph();
+            flushList();
+            blocks.push(`<blockquote>${convertMarkdownInline(line.replace(/^>\s+/, ''))}</blockquote>`);
+            continue;
+        }
+
+        paragraph.push(line);
+    }
+
+    flushParagraph();
+    flushList();
+    flushCode();
+    return blocks.join('') || '<p>No content available.</p>';
+}
+
+async function openMemoryNode(node) {
+    if (!memoryNoteViewer || !node || !node.markdown_id) return;
+    memoryNoteViewer.classList.remove('hidden');
+    memoryNoteViewer.innerHTML = `
+        <div class="memory-note-header">
+            <div>
+                <div class="memory-note-kicker">MARKDOWN NODE</div>
+                <h3>${escapeHtml(node.label || 'Document')}</h3>
+            </div>
+            <button class="hud-btn small" onclick="closeMemoryNote()">Close</button>
+        </div>
+        <div class="memory-note-body loading">Loading document…</div>
+    `;
+
+    try {
+        const response = await fetch(`/api/memory/markdown/${encodeURIComponent(node.markdown_id)}`);
+        if (!response.ok) throw new Error(`Markdown fetch failed (${response.status})`);
+        const documentData = await response.json();
+        const updated = documentData.updated_at ? new Date(documentData.updated_at).toLocaleString() : '';
+        memoryNoteViewer.innerHTML = `
+            <div class="memory-note-header">
+                <div>
+                    <div class="memory-note-kicker">MARKDOWN NODE</div>
+                    <h3>${escapeHtml(documentData.title || node.label || 'Document')}</h3>
+                    ${updated ? `<div class="memory-note-meta">Updated ${escapeHtml(updated)}</div>` : ''}
+                </div>
+                <button class="hud-btn small" onclick="closeMemoryNote()">Close</button>
+            </div>
+            <article class="memory-note-body">${renderMarkdownContent(documentData.content || '')}</article>
+        `;
+    } catch (error) {
+        console.warn('Could not load markdown note', error);
+        memoryNoteViewer.innerHTML = `
+            <div class="memory-note-header">
+                <div>
+                    <div class="memory-note-kicker">MARKDOWN NODE</div>
+                    <h3>${escapeHtml(node.label || 'Document')}</h3>
+                </div>
+                <button class="hud-btn small" onclick="closeMemoryNote()">Close</button>
+            </div>
+            <div class="memory-note-body error">Unable to load the document.</div>
+        `;
+    }
+}
+
+function closeMemoryNote() {
+    if (!memoryNoteViewer) return;
+    memoryNoteViewer.classList.add('hidden');
+    memoryNoteViewer.innerHTML = '';
 }
 
 function sendMsg() {
