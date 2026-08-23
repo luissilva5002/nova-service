@@ -1,0 +1,6 @@
+﻿core_store.log_message("user", user_text)
+    intent = await classify_intent_llm(user_text, llm_engine)
+    logger.info("Classified intent=%s for user_text=%r", intent, user_text)
+
+    if intent == "memory_write":
+        await memory_agent.proc

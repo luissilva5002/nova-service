@@ -136,3 +136,17 @@ DEFAULT_IGNORE_DIR_HINTS = [
 # Host project mount (read-only) - where Flutter/other project folders live
 # --------------------------------------------------------------------------
 HOST_PROJECTS_DIR = Path(os.getenv("NOVA_HOST_PROJECTS_DIR", "/app/host_projects"))
+
+# --------------------------------------------------------------------------
+# Intent Classifier - trained MiniLM-embedding + LogisticRegression model
+# (see classifier/train_intent_classifier.py). This is the PRIMARY intent
+# detection mechanism; the Qwen3 LLM classification pass is only used as
+# a fallback when this classifier's confidence is below threshold.
+# --------------------------------------------------------------------------
+CLASSIFIER_DIR = Path(os.getenv("NOVA_CLASSIFIER_DIR", BASE_DIR / "classifier"))
+INTENT_CLASSIFIER_PATH = Path(
+    os.getenv("NOVA_INTENT_CLASSIFIER_PATH", CLASSIFIER_DIR / "intent_classifier.joblib")
+)
+# Pick this from classifier/training_report.txt's threshold sweep - the
+# row where acc_on_kept looks solid without forcing too many turns to chat.
+INTENT_CONFIDENCE_THRESHOLD = float(os.getenv("NOVA_INTENT_CONFIDENCE_THRESHOLD", "0.6"))

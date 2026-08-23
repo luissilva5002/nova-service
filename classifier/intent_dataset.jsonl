@@ -1,0 +1,408 @@
+{"text": "play some jazz", "intent": "action_music"}
+{"text": "play the new Kendrick Lamar album", "intent": "action_music"}
+{"text": "pause the music", "intent": "action_music"}
+{"text": "skip this track", "intent": "action_music"}
+{"text": "resume playback", "intent": "action_music"}
+{"text": "put on something chill", "intent": "action_music"}
+{"text": "stop the song", "intent": "action_music"}
+{"text": "can you play my workout playlist", "intent": "action_music"}
+{"text": "turn the music off", "intent": "action_music"}
+{"text": "next song please", "intent": "action_music"}
+{"text": "play something upbeat", "intent": "action_music"}
+{"text": "shuffle my liked songs", "intent": "action_music"}
+{"text": "go back to the previous track", "intent": "action_music"}
+{"text": "queue up some lo-fi beats", "intent": "action_music"}
+{"text": "start playing music", "intent": "action_music"}
+{"text": "play some rock music", "intent": "action_music"}
+{"text": "turn on some background music", "intent": "action_music"}
+{"text": "can you play Bohemian Rhapsody", "intent": "action_music"}
+{"text": "start my morning playlist", "intent": "action_music"}
+{"text": "play the top 40 chart", "intent": "action_music"}
+{"text": "lower the volume a bit", "intent": "action_music"}
+{"text": "raise the volume", "intent": "action_music"}
+{"text": "mute the music", "intent": "action_music"}
+{"text": "unmute the speakers", "intent": "action_music"}
+{"text": "play something relaxing", "intent": "action_music"}
+{"text": "put on some classical music", "intent": "action_music"}
+{"text": "I want to hear some jazz", "intent": "action_music"}
+{"text": "skip to the next song", "intent": "action_music"}
+{"text": "go to the previous song", "intent": "action_music"}
+{"text": "replay this track", "intent": "action_music"}
+{"text": "loop this song", "intent": "action_music"}
+{"text": "play my favorite playlist", "intent": "action_music"}
+{"text": "shuffle the queue", "intent": "action_music"}
+{"text": "play something for studying", "intent": "action_music"}
+{"text": "put on my running playlist", "intent": "action_music"}
+{"text": "can you pause that", "intent": "action_music"}
+{"text": "resume the song", "intent": "action_music"}
+{"text": "stop playing music", "intent": "action_music"}
+{"text": "play the album Currents by Tame Impala", "intent": "action_music"}
+{"text": "queue the next three songs", "intent": "action_music"}
+{"text": "play a random song", "intent": "action_music"}
+{"text": "turn up the music", "intent": "action_music"}
+{"text": "play some acoustic covers", "intent": "action_music"}
+{"text": "play white noise for sleeping", "intent": "action_music"}
+{"text": "can you play some Portuguese fado", "intent": "action_music"}
+{"text": "put on the radio", "intent": "action_music"}
+{"text": "play my liked songs", "intent": "action_music"}
+{"text": "start the party playlist", "intent": "action_music"}
+{"text": "play something energetic", "intent": "action_music"}
+{"text": "can you skip this one", "intent": "action_music"}
+{"text": "I don't like this song, skip it", "intent": "action_music"}
+{"text": "play the soundtrack from Interstellar", "intent": "action_music"}
+{"text": "turn the volume down to 20 percent", "intent": "action_music"}
+{"text": "play music from the 90s", "intent": "action_music"}
+{"text": "can you play some lo-fi hip hop", "intent": "action_music"}
+{"text": "play something to wake me up", "intent": "action_music"}
+{"text": "can you crank up the volume", "intent": "action_music"}
+{"text": "play the next track in my queue", "intent": "action_music"}
+{"text": "put some music on in the background", "intent": "action_music"}
+{"text": "resume where I left off", "intent": "action_music"}
+{"text": "play my chill vibes playlist", "intent": "action_music"}
+{"text": "can you play death metal", "intent": "action_music"}
+{"text": "start dancing music", "intent": "action_music"}
+{"text": "play a song by Daft Punk", "intent": "action_music"}
+{"text": "turn off the music please", "intent": "action_music"}
+
+{"text": "what's on my calendar today", "intent": "action_calendar"}
+{"text": "schedule a meeting with John tomorrow at 3pm", "intent": "action_calendar"}
+{"text": "add a dentist appointment for Friday", "intent": "action_calendar"}
+{"text": "cancel my 2 o'clock meeting", "intent": "action_calendar"}
+{"text": "remind me about the standup at 9am", "intent": "action_calendar"}
+{"text": "do I have anything scheduled this weekend", "intent": "action_calendar"}
+{"text": "move my meeting with Sarah to next week", "intent": "action_calendar"}
+{"text": "book a call with the client on Monday", "intent": "action_calendar"}
+{"text": "what time is my next meeting", "intent": "action_calendar"}
+{"text": "delete the reminder for tomorrow morning", "intent": "action_calendar"}
+{"text": "set up a recurring meeting every Tuesday", "intent": "action_calendar"}
+{"text": "am I free at 4pm today", "intent": "action_calendar"}
+{"text": "create an event for the team lunch", "intent": "action_calendar"}
+{"text": "what do I have going on this week", "intent": "action_calendar"}
+{"text": "add a reminder to call mom tomorrow", "intent": "action_calendar"}
+{"text": "schedule a dentist appointment next Tuesday", "intent": "action_calendar"}
+{"text": "what's my schedule for tomorrow", "intent": "action_calendar"}
+{"text": "cancel my meeting with the team", "intent": "action_calendar"}
+{"text": "reschedule my 10am meeting to 2pm", "intent": "action_calendar"}
+{"text": "add a birthday reminder for next month", "intent": "action_calendar"}
+{"text": "do I have any meetings today", "intent": "action_calendar"}
+{"text": "set a reminder for the gym at 6pm", "intent": "action_calendar"}
+{"text": "create a calendar event for the conference", "intent": "action_calendar"}
+{"text": "what's happening on my calendar next week", "intent": "action_calendar"}
+{"text": "delete the meeting on Friday", "intent": "action_calendar"}
+{"text": "add an all-day event for the holiday", "intent": "action_calendar"}
+{"text": "when is my next appointment", "intent": "action_calendar"}
+{"text": "block off time for deep work tomorrow", "intent": "action_calendar"}
+{"text": "set up a meeting with the marketing team", "intent": "action_calendar"}
+{"text": "remind me to submit the report by 5pm", "intent": "action_calendar"}
+{"text": "what do I have scheduled this afternoon", "intent": "action_calendar"}
+{"text": "move the client call to next Thursday", "intent": "action_calendar"}
+{"text": "add a recurring reminder every morning", "intent": "action_calendar"}
+{"text": "check if I'm free tomorrow at noon", "intent": "action_calendar"}
+{"text": "create an event for my flight departure", "intent": "action_calendar"}
+{"text": "what time does my meeting start", "intent": "action_calendar"}
+{"text": "add a note to the calendar about the deadline", "intent": "action_calendar"}
+{"text": "cancel all my meetings today", "intent": "action_calendar"}
+{"text": "schedule a follow-up call for next week", "intent": "action_calendar"}
+{"text": "set a reminder 30 minutes before the meeting", "intent": "action_calendar"}
+{"text": "what's on the agenda for this week", "intent": "action_calendar"}
+{"text": "add an event for the doctor visit", "intent": "action_calendar"}
+{"text": "when is my next appointment with the dentist", "intent": "action_calendar"}
+{"text": "reschedule the interview to Monday", "intent": "action_calendar"}
+{"text": "put a reminder in for renewing my passport", "intent": "action_calendar"}
+{"text": "add my sister's wedding to the calendar", "intent": "action_calendar"}
+{"text": "what meetings do I have back to back", "intent": "action_calendar"}
+{"text": "is my calendar free this weekend", "intent": "action_calendar"}
+{"text": "create a recurring event every other week", "intent": "action_calendar"}
+{"text": "delete all reminders for today", "intent": "action_calendar"}
+{"text": "set an event for the product launch", "intent": "action_calendar"}
+{"text": "add a reminder to pay rent on the first", "intent": "action_calendar"}
+{"text": "check my availability for next Wednesday", "intent": "action_calendar"}
+{"text": "schedule time to review the PCB design", "intent": "action_calendar"}
+{"text": "add an event titled team retro", "intent": "action_calendar"}
+{"text": "what time is the standup meeting", "intent": "action_calendar"}
+{"text": "remind me about the appointment in an hour", "intent": "action_calendar"}
+{"text": "add a calendar entry for the exam", "intent": "action_calendar"}
+{"text": "when do I need to leave for my meeting", "intent": "action_calendar"}
+{"text": "create an event for the workshop", "intent": "action_calendar"}
+{"text": "cancel the reminder about the gym", "intent": "action_calendar"}
+{"text": "schedule a call with the supplier", "intent": "action_calendar"}
+{"text": "add a meeting invite for the whole team", "intent": "action_calendar"}
+{"text": "what's my first meeting tomorrow", "intent": "action_calendar"}
+{"text": "set a reminder for the project deadline", "intent": "action_calendar"}
+
+{"text": "search the codebase for the auth function", "intent": "action_code"}
+{"text": "read the file main.py", "intent": "action_code"}
+{"text": "show me the contents of config.py", "intent": "action_code"}
+{"text": "search for TODO comments in the project", "intent": "action_code"}
+{"text": "find where the database connection is set up", "intent": "action_code"}
+{"text": "open the file handler.py", "intent": "action_code"}
+{"text": "search the repo for the login function", "intent": "action_code"}
+{"text": "look for usages of the API key", "intent": "action_code"}
+{"text": "read the requirements.txt file", "intent": "action_code"}
+{"text": "search the codebase for error handling", "intent": "action_code"}
+{"text": "show me the contents of the Dockerfile", "intent": "action_code"}
+{"text": "find the function that processes payments", "intent": "action_code"}
+{"text": "search for the word deprecated in the code", "intent": "action_code"}
+{"text": "read the README file", "intent": "action_code"}
+{"text": "look through the source code for bugs", "intent": "action_code"}
+{"text": "search the project for unused imports", "intent": "action_code"}
+{"text": "find where the intent classifier is loaded", "intent": "action_code"}
+{"text": "read the vault_store.py file", "intent": "action_code"}
+{"text": "search the repository for the tool router", "intent": "action_code"}
+{"text": "show me the main.py file", "intent": "action_code"}
+{"text": "find all references to the database schema", "intent": "action_code"}
+{"text": "search the codebase for the memory agent", "intent": "action_code"}
+{"text": "read the file that handles audio playback", "intent": "action_code"}
+{"text": "search for the class definition of LLMEngine", "intent": "action_code"}
+{"text": "find where the tools are registered", "intent": "action_code"}
+{"text": "search the repo for calendar integration code", "intent": "action_code"}
+{"text": "read the intent_router.py file", "intent": "action_code"}
+{"text": "show me the file structure of the project", "intent": "action_code"}
+{"text": "search the codebase for the websocket handler", "intent": "action_code"}
+{"text": "find the function that builds the system prompt", "intent": "action_code"}
+{"text": "read the docker-compose.yml file", "intent": "action_code"}
+{"text": "search for hardcoded passwords in the repo", "intent": "action_code"}
+{"text": "look for the file that defines the API routes", "intent": "action_code"}
+{"text": "search the project for SQL queries", "intent": "action_code"}
+{"text": "read the config file for the vault path", "intent": "action_code"}
+{"text": "find where the classifier threshold is set", "intent": "action_code"}
+{"text": "search the codebase for the youtube music skill", "intent": "action_code"}
+{"text": "read the tools.py file in the remember skill", "intent": "action_code"}
+{"text": "search for the function that transcribes audio", "intent": "action_code"}
+{"text": "find the file that handles OAuth", "intent": "action_code"}
+{"text": "search the repo for exception handling", "intent": "action_code"}
+{"text": "read the file where the tts engine is defined", "intent": "action_code"}
+{"text": "look through the code for the search_notes function", "intent": "action_code"}
+{"text": "search the codebase for calendar event creation", "intent": "action_code"}
+{"text": "find where session memory is stored", "intent": "action_code"}
+{"text": "read the flutter workspace handler", "intent": "action_code"}
+{"text": "search for the vault path configuration", "intent": "action_code"}
+{"text": "look for the class that wraps the sqlite database", "intent": "action_code"}
+{"text": "search the project for print statements", "intent": "action_code"}
+{"text": "read the file that defines the tool schemas", "intent": "action_code"}
+{"text": "find the function that filters tools by intent", "intent": "action_code"}
+{"text": "search the codebase for the confidence threshold", "intent": "action_code"}
+{"text": "read the code that classifies user intent", "intent": "action_code"}
+{"text": "search for where the embedding model is loaded", "intent": "action_code"}
+{"text": "find all the skill handler files", "intent": "action_code"}
+{"text": "read the base_skill.py file", "intent": "action_code"}
+{"text": "search the repo for the memory write logic", "intent": "action_code"}
+{"text": "look for the function that saves to the vault", "intent": "action_code"}
+{"text": "search the codebase for calendar API calls", "intent": "action_code"}
+{"text": "read the file for the ingestion pipeline", "intent": "action_code"}
+{"text": "find where the project ignore rules are set", "intent": "action_code"}
+{"text": "search for the function that builds the memory graph", "intent": "action_code"}
+{"text": "read the code for the wikilink pattern", "intent": "action_code"}
+{"text": "search the repo for markdown parsing logic", "intent": "action_code"}
+{"text": "find the file that handles the open_url action", "intent": "action_code"}
+
+{"text": "remember that the nRF52832 has 512KB flash", "intent": "memory_write"}
+{"text": "remember that I prefer dark mode", "intent": "memory_write"}
+{"text": "save this fact: the Smasher uses a 3.7V LiPo battery", "intent": "memory_write"}
+{"text": "note that my name is Luis", "intent": "memory_write"}
+{"text": "make a memory that I study at FEUP", "intent": "memory_write"}
+{"text": "keep in mind that I like hands-on learning", "intent": "memory_write"}
+{"text": "store this in memory: the IMU is the LSM6DS3TR", "intent": "memory_write"}
+{"text": "write down that my favorite artist is Tame Impala", "intent": "memory_write"}
+{"text": "create a memory about my active project being NOVA", "intent": "memory_write"}
+{"text": "save to memory that I work best in the mornings", "intent": "memory_write"}
+{"text": "remember this: the enclosure is 3D printed in PETG", "intent": "memory_write"}
+{"text": "note for later that the meeting notes are in the shared folder", "intent": "memory_write"}
+{"text": "remember that I'm allergic to peanuts", "intent": "memory_write"}
+{"text": "save this: my favorite color is blue", "intent": "memory_write"}
+{"text": "note that I graduated in 2024", "intent": "memory_write"}
+{"text": "keep in mind I prefer concise answers", "intent": "memory_write"}
+{"text": "remember my birthday is in March", "intent": "memory_write"}
+{"text": "write down that I use VS Code as my editor", "intent": "memory_write"}
+{"text": "save to memory that I live in Porto", "intent": "memory_write"}
+{"text": "remember that the battery capacity is 500mAh", "intent": "memory_write"}
+{"text": "note that my supervisor's name is Ana", "intent": "memory_write"}
+{"text": "make a memory of my thesis topic", "intent": "memory_write"}
+{"text": "remember that I code in Python and Dart", "intent": "memory_write"}
+{"text": "store this fact: the enclosure weighs 45 grams", "intent": "memory_write"}
+{"text": "save this preference: I like dark themes", "intent": "memory_write"}
+{"text": "remember I'm working on the smasher project", "intent": "memory_write"}
+{"text": "note that the PCB is 40mm by 30mm", "intent": "memory_write"}
+{"text": "keep in mind that I study computer engineering", "intent": "memory_write"}
+{"text": "remember that my email is on file", "intent": "memory_write"}
+{"text": "write this down: the antenna is a chip antenna", "intent": "memory_write"}
+{"text": "save the fact that I prefer async communication", "intent": "memory_write"}
+{"text": "remember my favorite framework is flutter", "intent": "memory_write"}
+{"text": "note that the project deadline is in June", "intent": "memory_write"}
+{"text": "remember that I use a Ryzen 3 CPU", "intent": "memory_write"}
+{"text": "save this: the piper voice I use is lessac", "intent": "memory_write"}
+{"text": "keep this in mind: I dislike long meetings", "intent": "memory_write"}
+{"text": "remember that our team meets on Mondays", "intent": "memory_write"}
+{"text": "note for later that I switched to Qwen3", "intent": "memory_write"}
+{"text": "save to memory my GitHub username", "intent": "memory_write"}
+{"text": "remember that the sensor is an LSM6DS3TR", "intent": "memory_write"}
+{"text": "write down my preferred coding style", "intent": "memory_write"}
+{"text": "remember that I'm learning about embedded systems", "intent": "memory_write"}
+{"text": "note that the microcontroller is the nRF52832", "intent": "memory_write"}
+{"text": "save this fact about my study schedule", "intent": "memory_write"}
+{"text": "remember I take notes in Obsidian", "intent": "memory_write"}
+{"text": "keep in mind that I want detailed explanations", "intent": "memory_write"}
+{"text": "remember that my thesis advisor is Prof. Silva", "intent": "memory_write"}
+{"text": "note that I prefer metric units", "intent": "memory_write"}
+{"text": "save to memory that the battery is 3.7 volts", "intent": "memory_write"}
+{"text": "remember my favorite programming language", "intent": "memory_write"}
+{"text": "write this down for later reference", "intent": "memory_write"}
+{"text": "remember that I work part time", "intent": "memory_write"}
+{"text": "note that my project uses ChromaDB", "intent": "memory_write"}
+{"text": "save this preference about communication style", "intent": "memory_write"}
+{"text": "keep in mind I'm based in Portugal", "intent": "memory_write"}
+{"text": "remember the enclosure material is PETG", "intent": "memory_write"}
+{"text": "note that I prefer voice replies to be short", "intent": "memory_write"}
+{"text": "save to memory that I have two cats", "intent": "memory_write"}
+{"text": "remember I'm a night owl", "intent": "memory_write"}
+{"text": "write down that the flash size is 512KB", "intent": "memory_write"}
+{"text": "note that I want reminders before deadlines", "intent": "memory_write"}
+{"text": "remember my favorite band is Tame Impala", "intent": "memory_write"}
+{"text": "save this: I prefer metric measurements", "intent": "memory_write"}
+{"text": "keep in mind that I like step by step explanations", "intent": "memory_write"}
+{"text": "remember that today's meeting went well", "intent": "memory_write"}
+{"text": "note that I finished the enclosure design", "intent": "memory_write"}
+{"text": "save to memory that the IMU model changed", "intent": "memory_write"}
+{"text": "remember I switched my email address", "intent": "memory_write"}
+
+{"text": "check your memory for the PCB file", "intent": "memory_recall"}
+{"text": "what MCU do we use in the Smasher", "intent": "memory_recall"}
+{"text": "look into those files for me", "intent": "memory_recall"}
+{"text": "access it on your memory", "intent": "memory_recall"}
+{"text": "the record that you have on it", "intent": "memory_recall"}
+{"text": "analyze them on your memory", "intent": "memory_recall"}
+{"text": "what do you know about my current project", "intent": "memory_recall"}
+{"text": "tell me something about myself based on what you know", "intent": "memory_recall"}
+{"text": "what's my favorite artist", "intent": "memory_recall"}
+{"text": "what am I working on right now", "intent": "memory_recall"}
+{"text": "do you remember what I told you about the battery", "intent": "memory_recall"}
+{"text": "what's saved in your notes about the enclosure", "intent": "memory_recall"}
+{"text": "pull up what you have on the smasher project", "intent": "memory_recall"}
+{"text": "recall what I said about my study preferences", "intent": "memory_recall"}
+{"text": "what school do I go to", "intent": "memory_recall"}
+{"text": "check the record you have on the PCB", "intent": "memory_recall"}
+{"text": "what have I already written in the files about this", "intent": "memory_recall"}
+{"text": "based on what you know about me, what should I learn next", "intent": "memory_recall"}
+{"text": "who am I", "intent": "memory_recall"}
+{"text": "what's my full name", "intent": "memory_recall"}
+{"text": "what do you remember about my project", "intent": "memory_recall"}
+{"text": "what's the battery capacity you have on file", "intent": "memory_recall"}
+{"text": "do you know my favorite color", "intent": "memory_recall"}
+{"text": "what have I told you about the enclosure", "intent": "memory_recall"}
+{"text": "what's stored in your memory about me", "intent": "memory_recall"}
+{"text": "based on your notes what am I studying", "intent": "memory_recall"}
+{"text": "what do you know about the PCB design", "intent": "memory_recall"}
+{"text": "tell me what you remember about my preferences", "intent": "memory_recall"}
+{"text": "what's my study schedule according to your notes", "intent": "memory_recall"}
+{"text": "do you know where I study", "intent": "memory_recall"}
+{"text": "what have you saved about the smasher project", "intent": "memory_recall"}
+{"text": "recall what I said about the antenna", "intent": "memory_recall"}
+{"text": "what do your notes say about the battery", "intent": "memory_recall"}
+{"text": "what's my thesis topic", "intent": "memory_recall"}
+{"text": "do you remember my supervisor's name", "intent": "memory_recall"}
+{"text": "what framework do I use according to your memory", "intent": "memory_recall"}
+{"text": "based on what's saved, what's my deadline", "intent": "memory_recall"}
+{"text": "what do you know about my coding preferences", "intent": "memory_recall"}
+{"text": "check what you have on the enclosure material", "intent": "memory_recall"}
+{"text": "what's my preferred communication style", "intent": "memory_recall"}
+{"text": "do you know my github username", "intent": "memory_recall"}
+{"text": "what have I saved about my thesis advisor", "intent": "memory_recall"}
+{"text": "recall the microcontroller we're using", "intent": "memory_recall"}
+{"text": "what's in your notes about the IMU", "intent": "memory_recall"}
+{"text": "based on memory, what editor do I use", "intent": "memory_recall"}
+{"text": "what do you remember about my birthday", "intent": "memory_recall"}
+{"text": "do you know what city I live in", "intent": "memory_recall"}
+{"text": "what's my favorite programming language according to you", "intent": "memory_recall"}
+{"text": "check your files for my email", "intent": "memory_recall"}
+{"text": "what do you have saved about my allergies", "intent": "memory_recall"}
+{"text": "recall what I told you about the antenna type", "intent": "memory_recall"}
+{"text": "what's my project deadline based on your memory", "intent": "memory_recall"}
+{"text": "do you remember what CPU I'm using", "intent": "memory_recall"}
+{"text": "what have you got on file about the flash size", "intent": "memory_recall"}
+{"text": "based on your memory, what's my study routine", "intent": "memory_recall"}
+{"text": "what do you know about my thesis", "intent": "memory_recall"}
+{"text": "check what's saved about the battery voltage", "intent": "memory_recall"}
+{"text": "recall my preferences for voice replies", "intent": "memory_recall"}
+{"text": "what's my favorite band according to your notes", "intent": "memory_recall"}
+{"text": "do you know how many pets I have", "intent": "memory_recall"}
+{"text": "what do you remember about my sleep schedule", "intent": "memory_recall"}
+{"text": "based on what's stored, when is my deadline", "intent": "memory_recall"}
+{"text": "what's saved about my communication preferences", "intent": "memory_recall"}
+{"text": "recall what you know about the PCB dimensions", "intent": "memory_recall"}
+{"text": "what's my preferred measurement system", "intent": "memory_recall"}
+{"text": "do you have anything saved about my advisor", "intent": "memory_recall"}
+{"text": "what do your notes say about my coding style", "intent": "memory_recall"}
+{"text": "check your memory for my study preferences", "intent": "memory_recall"}
+{"text": "what have I told you about the sensor", "intent": "memory_recall"}
+{"text": "based on your records, what's my active project", "intent": "memory_recall"}
+
+{"text": "hey nova", "intent": "chat"}
+{"text": "how are you", "intent": "chat"}
+{"text": "what's up", "intent": "chat"}
+{"text": "good morning", "intent": "chat"}
+{"text": "explain how transformers work", "intent": "chat"}
+{"text": "what's the capital of Portugal", "intent": "chat"}
+{"text": "tell me a joke", "intent": "chat"}
+{"text": "what do you think about AI safety", "intent": "chat"}
+{"text": "how does photosynthesis work", "intent": "chat"}
+{"text": "what's the weather like today", "intent": "chat"}
+{"text": "I was thinking about my old files today", "intent": "chat"}
+{"text": "my memory of that trip is kind of fuzzy", "intent": "chat"}
+{"text": "I need to save some money this month", "intent": "chat"}
+{"text": "I like to save my energy for the weekend", "intent": "chat"}
+{"text": "that song reminds me of summer", "intent": "chat"}
+{"text": "can you help me think through a decision", "intent": "chat"}
+{"text": "what's a good recipe for pasta", "intent": "chat"}
+{"text": "do you have any hobbies", "intent": "chat"}
+{"text": "what's the meaning of life", "intent": "chat"}
+{"text": "I'm just testing if you're working", "intent": "chat"}
+{"text": "thanks for the help earlier", "intent": "chat"}
+{"text": "can you explain what an MCU is in general", "intent": "chat"}
+{"text": "what's the difference between RAM and ROM", "intent": "chat"}
+{"text": "I recorded a new song idea, want to hear about it", "intent": "chat"}
+{"text": "tell me about the history of Rome", "intent": "chat"}
+{"text": "what's your favorite color", "intent": "chat"}
+{"text": "can you write me a poem", "intent": "chat"}
+{"text": "what's 2 plus 2", "intent": "chat"}
+{"text": "how do airplanes fly", "intent": "chat"}
+{"text": "what's a good book to read", "intent": "chat"}
+{"text": "do you dream", "intent": "chat"}
+{"text": "what's your opinion on cats versus dogs", "intent": "chat"}
+{"text": "can you tell me a fun fact", "intent": "chat"}
+{"text": "what's the tallest mountain in the world", "intent": "chat"}
+{"text": "how do I make coffee", "intent": "chat"}
+{"text": "what's the speed of light", "intent": "chat"}
+{"text": "can you help me brainstorm ideas", "intent": "chat"}
+{"text": "what's a healthy breakfast", "intent": "chat"}
+{"text": "do you get tired", "intent": "chat"}
+{"text": "what's the difference between AI and machine learning", "intent": "chat"}
+{"text": "tell me something interesting", "intent": "chat"}
+{"text": "what's your favorite movie", "intent": "chat"}
+{"text": "how does the internet work", "intent": "chat"}
+{"text": "can you keep a secret", "intent": "chat"}
+{"text": "what's the best way to learn a language", "intent": "chat"}
+{"text": "how are you feeling today", "intent": "chat"}
+{"text": "what's new", "intent": "chat"}
+{"text": "do you like music", "intent": "chat"}
+{"text": "what's the weather forecast for tomorrow", "intent": "chat"}
+{"text": "can you tell me about black holes", "intent": "chat"}
+{"text": "what's a good workout routine", "intent": "chat"}
+{"text": "how do I stay motivated", "intent": "chat"}
+{"text": "what's your name", "intent": "chat"}
+{"text": "are you conscious", "intent": "chat"}
+{"text": "what's the best programming language", "intent": "chat"}
+{"text": "can you recommend a podcast", "intent": "chat"}
+{"text": "what time is it", "intent": "chat"}
+{"text": "how was your day", "intent": "chat"}
+{"text": "what's the meaning of NOVA", "intent": "chat"}
+{"text": "do you have feelings", "intent": "chat"}
+{"text": "what's a fun weekend activity", "intent": "chat"}
+{"text": "can you tell me a riddle", "intent": "chat"}
+{"text": "what's the population of Portugal", "intent": "chat"}
+{"text": "how do computers work", "intent": "chat"}
+{"text": "what's your favorite food", "intent": "chat"}
+{"text": "can we just chat for a bit", "intent": "chat"}
+{"text": "what's a good way to relax", "intent": "chat"}
+{"text": "I'm bored, entertain me", "intent": "chat"}
+{"text": "what do you think about the future of AI", "intent": "chat"}
+{"text": "how's the weather where you are", "intent": "chat"}

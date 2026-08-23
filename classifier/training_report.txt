@@ -1,0 +1,36 @@
+=== Classification report (held-out validation split) ===
+                 precision    recall  f1-score   support
+
+action_calendar       0.93      1.00      0.96        13
+    action_code       1.00      1.00      1.00        13
+   action_music       0.93      1.00      0.96        13
+           chat       0.73      0.79      0.76        14
+  memory_recall       0.91      0.71      0.80        14
+   memory_write       0.79      0.79      0.79        14
+
+       accuracy                           0.88        81
+      macro avg       0.88      0.88      0.88        81
+   weighted avg       0.88      0.88      0.87        81
+
+
+=== Wrong predictions (check these first - confidence should be LOW) ===
+conf=0.38  true=np.str_('chat')  pred=np.str_('action_calendar')  text="what's the weather forecast for tomorrow"
+conf=0.46  true=np.str_('memory_recall')  pred=np.str_('chat')  text="what's my favorite artist"
+conf=0.33  true=np.str_('memory_write')  pred=np.str_('chat')  text='keep in mind that I like step by step explanations'
+conf=0.45  true=np.str_('chat')  pred=np.str_('memory_write')  text='my memory of that trip is kind of fuzzy'
+conf=0.28  true=np.str_('chat')  pred=np.str_('action_music')  text='I recorded a new song idea, want to hear about it'
+conf=0.45  true=np.str_('memory_recall')  pred=np.str_('memory_write')  text="do you remember my supervisor's name"
+conf=0.35  true=np.str_('memory_write')  pred=np.str_('memory_recall')  text='save this fact about my study schedule'
+conf=0.52  true=np.str_('memory_write')  pred=np.str_('chat')  text='keep in mind that I want detailed explanations'
+conf=0.51  true=np.str_('memory_recall')  pred=np.str_('chat')  text="what's my favorite programming language according to you"
+conf=0.35  true=np.str_('memory_recall')  pred=np.str_('memory_write')  text='what MCU do we use in the Smasher'
+
+=== Confidence threshold sweep ===
+ threshold   kept  forced_to_chat  acc_on_kept
+       0.3     77               4        0.883
+       0.4     64              17        0.922
+       0.5     50              31        0.960
+       0.6     35              46        1.000
+       0.7     26              55        1.000
+       0.8     12              69        1.000
+       0.9      0              81          nan

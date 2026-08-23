@@ -1,29 +1,29 @@
 """
 nova/brain/intent_router.py
 
-LLM-based intent classification, run as an explicit first pass before any
-tool schema or memory context is assembled. Keyword/regex classification
-was replaced because lexical rules misfire unpredictably - e.g. "Hey" vs
-"Hey, <real request>" can't be reliably told apart by pattern alone, and
-short constrained classification is exactly the kind of task small local
-models handle well when it's isolated as its own turn.
+Intent detection pipeline, in priority order:
+  1. Trained classifier (nova/brain/intent_classifier.py) - MiniLM
+     embeddings -> LogisticRegression, cheap and CPU-only. Used whenever
+     it's available AND its confidence clears INTENT_CONFIDENCE_THRESHOLD.
+  2. LLM fallback (classify_intent_llm, this module) - a dedicated Qwen3
+     call, used ONLY when the trained classifier is unavailable or
+     under-confident. This keeps the (slower) generative model out of
+     the hot path for the vast majority of turns.
+  3. Regex override (apply_memory_reference_override) - always runs
+     last, regardless of which path produced the intent. It's a narrow,
+     free safety net that only upgrades 'chat' to 'memory_recall' when
+     the user explicitly references NOVA's own memory/files/notes -
+     catching phrasings neither the classifier nor the LLM caught.
 
-Two-pass design:
-  Pass 1 (this module): classify_intent_llm() - asks the brain ONE
-    question: "which single category does this turn belong to?" - no
-    tools, minimal tokens, nothing else happens in this call. The
-    model's attention is entirely on classification, not on also trying
-    to decide what to do about it.
-  Pass 2 (nova/main.py's run_pipeline): once the intent is known, a
-    SEPARATE second LLM call actually does the work, with only that
-    category's tools/context exposed.
-
-A lightweight regex fallback exists ONLY as a safety net for when the
-classification call fails outright (model not loaded, empty/garbled
-output) - it is never the primary mechanism.
+Once an intent is resolved here, everything downstream (tool-schema
+filtering, vault-context gating, and the actual Qwen3 response
+generation) is unchanged.
 """
 import logging
 import re
+
+from nova.brain.intent_classifier import intent_classifier
+from nova.config import INTENT_CONFIDENCE_THRESHOLD
 
 logger = logging.getLogger("nova.intent_router")
 
@@ -74,8 +74,8 @@ _TOOL_NAME_FILTERS = {
     "chat": lambda name: False,
 }
 
-# Safety-net only - used when the classification LLM call itself fails
-# (model not loaded, empty output). Never the primary classification path.
+# Used only when BOTH the trained classifier and the LLM fallback fail
+# outright (model not loaded, empty/garbled output, exception).
 _FALLBACK_MUSIC = re.compile(r"\b(play|pause|resume|skip|song|track|music|playlist)\b", re.I)
 _FALLBACK_CALENDAR = re.compile(r"\b(calendar|event|meeting|appointment|schedule|remind me|reminder|agenda)\b", re.I)
 _FALLBACK_CODE = re.compile(r"\b(codebase|source code|read file|search code|repository|repo)\b", re.I)
@@ -86,17 +86,30 @@ _SMALL_TALK_PATTERNS = [
     r"^\s*(how are you|what's up|whats up|how's it going)\s*\??\s*$",
 ]
 
+_MEMORY_REFERENCE_OVERRIDE = re.compile(
+    r"\b(your memory|in memory|check your (?:memory|notes|files)|"
+    r"access (?:it|that|this) (?:on|in|from) your memory|"
+    r"look (?:into|at) (?:those|the|your) files|"
+    r"(?:the )?record(?:s)? (?:that )?you have|"
+    r"already written in the files|"
+    r"analyze (?:them|that|this) (?:on|in) your memory|"
+    r"what you (?:have|saved|stored) (?:on|about))\b",
+    re.I,
+)
+
 
 def is_small_talk(user_text: str) -> bool:
-    """Kept as a small helper for _select_relevant_facts/_answer_from_memory
-    in main.py - NOT used for primary intent classification anymore."""
+    """Small helper used elsewhere (e.g. main.py's _select_relevant_facts) -
+    NOT part of primary intent classification anymore."""
     text = user_text.strip().lower()
     if len(text.split()) > 6:
         return False
     return any(re.match(p, text) for p in _SMALL_TALK_PATTERNS)
 
 
-def _fallback_classify(user_text: str) -> str:
+def _regex_fallback_classify(user_text: str) -> str:
+    """Last-resort classifier, used only if BOTH the trained classifier
+    and the LLM fallback are unavailable/fail."""
     if _FALLBACK_WRITE.search(user_text):
         return "memory_write"
     if _FALLBACK_MUSIC.search(user_text):
@@ -112,10 +125,9 @@ def _fallback_classify(user_text: str) -> str:
 
 async def classify_intent_llm(user_text: str, llm_engine) -> str:
     """
-    Pass 1: a dedicated LLM call whose only job is picking one category.
-    No tools, no memory context - isolating this from the actual work
-    (Pass 2) means the model isn't trying to classify and act in the
-    same breath, which is what made the regex approach unreliable.
+    Dedicated Qwen3 classification call - used ONLY as a fallback when
+    the trained classifier is unavailable or under-confident, not as
+    the primary mechanism anymore.
     """
     text = (user_text or "").strip()
     if not text:
@@ -125,12 +137,13 @@ async def classify_intent_llm(user_text: str, llm_engine) -> str:
         raw = await llm_engine.generate_raw(
             system_prompt=CLASSIFICATION_SYSTEM_PROMPT,
             user_prompt=text,
-            max_tokens=12,
+            max_tokens=16,
         )
     except Exception:
-        logger.exception("Intent classification LLM call failed; using fallback classifier.")
-        return _fallback_classify(text)
+        logger.exception("LLM intent classification call failed; using regex fallback.")
+        return _regex_fallback_classify(text)
 
+    logger.info("LLM classifier raw output: %r", raw)
     cleaned = re.sub(r"[^a-z_]", "", raw.strip().lower())
     if cleaned in VALID_INTENTS:
         return cleaned
@@ -139,8 +152,70 @@ async def classify_intent_llm(user_text: str, llm_engine) -> str:
         if intent in raw.lower():
             return intent
 
-    logger.warning("Intent classifier returned unrecognized output %r; using fallback classifier.", raw)
-    return _fallback_classify(text)
+    logger.warning("LLM classifier returned unrecognized output %r; using regex fallback.", raw)
+    return _regex_fallback_classify(text)
+
+
+def apply_memory_reference_override(user_text: str, classified_intent: str) -> str:
+    """
+    Narrow safety net: only upgrades an already-classified 'chat' result
+    to 'memory_recall' when the user explicitly tells NOVA to check its
+    own memory/files/notes. Never overrides action/write intents from
+    either classification path. Always runs, regardless of which
+    mechanism (trained classifier or LLM) produced the intent.
+    """
+    if classified_intent != "chat":
+        return classified_intent
+    if _MEMORY_REFERENCE_OVERRIDE.search(user_text):
+        logger.info("Memory-reference override: upgrading chat -> memory_recall for %r", user_text)
+        return "memory_recall"
+    return classified_intent
+
+
+async def classify_intent(user_text: str, llm_engine) -> dict:
+    """
+    The single entry point main.py should call. Returns a dict with the
+    resolved intent plus diagnostic metadata for logging:
+      {"intent": str, "source": "classifier"|"llm"|"regex_fallback",
+       "confidence": float|None, "all_scores": dict|None}
+
+    Resolution order:
+      1. Trained classifier, if available and confidence >= threshold.
+      2. Qwen3 LLM classification, if the trained classifier declined.
+      3. Regex-only fallback, if the LLM call itself also fails.
+      4. Memory-reference override applied on top of whichever won.
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return {"intent": "chat", "source": "empty", "confidence": None, "all_scores": None}
+
+    result = intent_classifier.classify(text)
+    if result is not None:
+        logger.info(
+            "Trained classifier: intent=%s confidence=%.3f all_scores=%s",
+            result["intent"], result["confidence"], result["all_scores"],
+        )
+        if result["confidence"] >= INTENT_CONFIDENCE_THRESHOLD and result["intent"] in VALID_INTENTS:
+            intent = apply_memory_reference_override(text, result["intent"])
+            return {
+                "intent": intent,
+                "source": "classifier",
+                "confidence": result["confidence"],
+                "all_scores": result["all_scores"],
+            }
+        logger.info(
+            "Trained classifier confidence %.3f below threshold %.2f - falling back to LLM classification.",
+            result["confidence"], INTENT_CONFIDENCE_THRESHOLD,
+        )
+
+    llm_intent = await classify_intent_llm(text, llm_engine)
+    intent = apply_memory_reference_override(text, llm_intent)
+    return {
+        "intent": intent,
+        "source": "llm" if result is None or result["confidence"] < INTENT_CONFIDENCE_THRESHOLD else "classifier",
+        "confidence": result["confidence"] if result else None,
+        "all_scores": result["all_scores"] if result else None,
+    }
 
 
 def filter_tools_for_intent(all_tools: list, intent: str) -> list:

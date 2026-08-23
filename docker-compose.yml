@@ -19,7 +19,9 @@ services:
       # Mount local projects (read-only) so NOVA can inspect/ingest them,
       # e.g. your Flutter app source trees.
       - ${NOVA_HOST_PROJECTS_PATH:-./host_projects}:/app/host_projects:ro
-     
+      
+      - ./models/sentence_transformers_cache:/root/.cache/torch/sentence_transformers
+      
       - ./persistent_memory:/app/persistent_memory
     env_file:
       - .env
