@@ -1,36 +1,36 @@
 === Classification report (held-out validation split) ===
                  precision    recall  f1-score   support
 
-action_calendar       0.93      1.00      0.96        13
-    action_code       1.00      1.00      1.00        13
-   action_music       0.93      1.00      0.96        13
-           chat       0.73      0.79      0.76        14
-  memory_recall       0.91      0.71      0.80        14
-   memory_write       0.79      0.79      0.79        14
+action_calendar       0.87      1.00      0.93        13
+   action_music       0.82      1.00      0.90        14
+           chat       0.86      0.75      0.80        16
+  memory_recall       0.93      0.87      0.90        15
+   memory_write       0.77      0.67      0.71        15
 
-       accuracy                           0.88        81
-      macro avg       0.88      0.88      0.88        81
-   weighted avg       0.88      0.88      0.87        81
+       accuracy                           0.85        73
+      macro avg       0.85      0.86      0.85        73
+   weighted avg       0.85      0.85      0.84        73
 
 
 === Wrong predictions (check these first - confidence should be LOW) ===
-conf=0.38  true=np.str_('chat')  pred=np.str_('action_calendar')  text="what's the weather forecast for tomorrow"
-conf=0.46  true=np.str_('memory_recall')  pred=np.str_('chat')  text="what's my favorite artist"
-conf=0.33  true=np.str_('memory_write')  pred=np.str_('chat')  text='keep in mind that I like step by step explanations'
-conf=0.45  true=np.str_('chat')  pred=np.str_('memory_write')  text='my memory of that trip is kind of fuzzy'
-conf=0.28  true=np.str_('chat')  pred=np.str_('action_music')  text='I recorded a new song idea, want to hear about it'
-conf=0.45  true=np.str_('memory_recall')  pred=np.str_('memory_write')  text="do you remember my supervisor's name"
-conf=0.35  true=np.str_('memory_write')  pred=np.str_('memory_recall')  text='save this fact about my study schedule'
-conf=0.52  true=np.str_('memory_write')  pred=np.str_('chat')  text='keep in mind that I want detailed explanations'
-conf=0.51  true=np.str_('memory_recall')  pred=np.str_('chat')  text="what's my favorite programming language according to you"
-conf=0.35  true=np.str_('memory_recall')  pred=np.str_('memory_write')  text='what MCU do we use in the Smasher'
+conf=0.52  true=np.str_('memory_write')  pred=np.str_('action_calendar')  text='keep this in mind: I dislike long meetings'
+conf=0.29  true=np.str_('memory_write')  pred=np.str_('action_music')  text='save this: the piper voice I use is lessac'
+conf=0.34  true=np.str_('memory_write')  pred=np.str_('chat')  text='save this: my favorite color is blue'
+conf=0.40  true=np.str_('memory_write')  pred=np.str_('memory_recall')  text='write down my preferred coding style'
+conf=0.34  true=np.str_('chat')  pred=np.str_('memory_write')  text="what's the difference between RAM and ROM"
+conf=0.44  true=np.str_('chat')  pred=np.str_('action_music')  text='that song reminds me of summer'
+conf=0.47  true=np.str_('memory_recall')  pred=np.str_('chat')  text='who am I'
+conf=0.37  true=np.str_('chat')  pred=np.str_('memory_write')  text='I need to save some money this month'
+conf=0.41  true=np.str_('chat')  pred=np.str_('action_music')  text="I've been learning to play guitar"
+conf=0.80  true=np.str_('memory_write')  pred=np.str_('action_calendar')  text='note that I want reminders before deadlines'
+conf=0.45  true=np.str_('memory_recall')  pred=np.str_('memory_write')  text='recall what I said about the antenna'
 
 === Confidence threshold sweep ===
  threshold   kept  forced_to_chat  acc_on_kept
-       0.3     77               4        0.883
-       0.4     64              17        0.922
-       0.5     50              31        0.960
-       0.6     35              46        1.000
-       0.7     26              55        1.000
-       0.8     12              69        1.000
-       0.9      0              81          nan
+       0.3     70               3        0.857
+       0.4     60              13        0.900
+       0.5     45              28        0.956
+       0.6     29              44        0.966
+       0.7     22              51        0.955
+       0.8     10              63        1.000
+       0.9      1              72        1.000

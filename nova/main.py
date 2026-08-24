@@ -378,7 +378,7 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
 
     The intent classification (nova/brain/intent_router.py) is the key
     fix here: it decides BEFORE anything else runs whether this turn is
-    an action (music/calendar/code), a memory write, a memory recall, or
+    an action (music/calendar), a memory write, a memory recall, or
     plain chat - and only that category's tools and vault context are
     ever exposed to the model. This prevents e.g. a music command from
     accidentally surfacing unrelated knowledge notes or being offered
@@ -435,8 +435,10 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
     # Build memory_context ONLY as relevant to this intent - action turns
     # get nothing (they don't need it and it only adds noise), memory_recall
     # gets a targeted vault search, chat gets session context + small
-    # preferences only (no knowledge search).
-    relevant_facts = _select_relevant_facts(user_text, facts) if intent != "action_music" and intent != "action_calendar" and intent != "action_code" else {}
+    # preferences only (no knowledge search) PLUS explicit anti-fabrication
+    # guidance, since "chat" now also covers turns the classifier wasn't
+    # confident enough to route anywhere else (source="low_confidence").
+    relevant_facts = _select_relevant_facts(user_text, facts) if intent not in ("action_music", "action_calendar") else {}
 
     if wants_vault_context(intent):
         vault_context = vault_store.get_context_snippet(query=user_text)
@@ -457,6 +459,13 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
                 "chat_context_summary": session_summary,
                 "recent_chat_turns": session_history,
                 "relevant_profile_fields": relevant_facts,
+                "guidance": (
+                    "No saved notes were loaded for this message. Do NOT claim "
+                    "you reviewed files, memory, or records you were not given. "
+                    "If the user references something you should already know, "
+                    "say you don't have that loaded right now rather than "
+                    "inventing details."
+                ),
             },
             ensure_ascii=False,
         )

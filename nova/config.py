@@ -140,8 +140,7 @@ HOST_PROJECTS_DIR = Path(os.getenv("NOVA_HOST_PROJECTS_DIR", "/app/host_projects
 # --------------------------------------------------------------------------
 # Intent Classifier - trained MiniLM-embedding + LogisticRegression model
 # (see classifier/train_intent_classifier.py). This is the PRIMARY intent
-# detection mechanism; the Qwen3 LLM classification pass is only used as
-# a fallback when this classifier's confidence is below threshold.
+# detection mechanism.
 # --------------------------------------------------------------------------
 CLASSIFIER_DIR = Path(os.getenv("NOVA_CLASSIFIER_DIR", BASE_DIR / "classifier"))
 INTENT_CLASSIFIER_PATH = Path(
@@ -149,4 +148,18 @@ INTENT_CLASSIFIER_PATH = Path(
 )
 # Pick this from classifier/training_report.txt's threshold sweep - the
 # row where acc_on_kept looks solid without forcing too many turns to chat.
-INTENT_CONFIDENCE_THRESHOLD = float(os.getenv("NOVA_INTENT_CONFIDENCE_THRESHOLD", "0.6"))
+# 0.5 chosen from the 2026-08 400-sample run: 0.960 acc_on_kept while
+# keeping 50/81 (62%) of validation turns instead of only 35/81 at 0.6.
+# Re-sweep and adjust after retraining on the updated dataset.
+INTENT_CONFIDENCE_THRESHOLD = float(os.getenv("NOVA_INTENT_CONFIDENCE_THRESHOLD", "0.5"))
+# Whether to fall back to a dedicated Qwen3 classification call when the
+# trained classifier is under-confident. DEFAULT OFF (2026-08 integration
+# test): on real STT-noisy audio, low-confidence turns from the trained
+# classifier landed the LLM fallback on the exact same misclassification
+# it was built to replace (novel phrasing -> "chat"), adding ~4s latency
+# per turn for no accuracy gain. Re-enable via env var once the trained
+# classifier's own accuracy has improved enough that the fallback is
+# rarely invoked, or if you want to re-evaluate it on a larger dataset.
+INTENT_LLM_FALLBACK_ENABLED = os.getenv("NOVA_INTENT_LLM_FALLBACK_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)

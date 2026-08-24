@@ -6,9 +6,17 @@ Intent detection pipeline, in priority order:
      embeddings -> LogisticRegression, cheap and CPU-only. Used whenever
      it's available AND its confidence clears INTENT_CONFIDENCE_THRESHOLD.
   2. LLM fallback (classify_intent_llm, this module) - a dedicated Qwen3
-     call, used ONLY when the trained classifier is unavailable or
-     under-confident. This keeps the (slower) generative model out of
-     the hot path for the vast majority of turns.
+     call. GATED BEHIND config.INTENT_LLM_FALLBACK_ENABLED (default OFF
+     as of 2026-08). Integration testing showed this fallback landing on
+     the exact "novel phrasing -> chat" misclassification the trained
+     classifier was built to replace, adding ~4s latency for no accuracy
+     gain - a genuine action_music request under threshold got silently
+     swallowed into chat by this same LLM path. When disabled, low-
+     confidence turns resolve straight to "chat" instead (source=
+     "low_confidence"), matching main.py's anti-fabrication guidance for
+     that branch. Re-enable via NOVA_INTENT_LLM_FALLBACK_ENABLED=true if
+     you want to re-evaluate it once the trained classifier is more
+     accurate (so the fallback is rarely invoked at all).
   3. Regex override (apply_memory_reference_override) - always runs
      last, regardless of which path produced the intent. It's a narrow,
      free safety net that only upgrades 'chat' to 'memory_recall' when
@@ -18,19 +26,25 @@ Intent detection pipeline, in priority order:
 Once an intent is resolved here, everything downstream (tool-schema
 filtering, vault-context gating, and the actual Qwen3 response
 generation) is unchanged.
+
+action_code was removed (2026-08) - no skill in nova/skills/ is backed
+by it (only flutter_workspace, google_calendar, remember,
+youtube_music exist), so it was a dead category with no tool to route
+to. If you're seeing it reappear in a trained classifier's class list,
+check that classifier/intent_dataset.jsonl doesn't still have
+action_code rows in it.
 """
 import logging
 import re
 
 from nova.brain.intent_classifier import intent_classifier
-from nova.config import INTENT_CONFIDENCE_THRESHOLD
+from nova.config import INTENT_CONFIDENCE_THRESHOLD, INTENT_LLM_FALLBACK_ENABLED
 
 logger = logging.getLogger("nova.intent_router")
 
 VALID_INTENTS = {
     "action_music",
     "action_calendar",
-    "action_code",
     "memory_write",
     "memory_recall",
     "chat",
@@ -44,8 +58,6 @@ CLASSIFICATION_SYSTEM_PROMPT = (
     "music/song/playlist playback right now.\n"
     "action_calendar - the user wants to create, view, update, or delete a "
     "calendar event, meeting, or reminder.\n"
-    "action_code - the user wants to search or read source code / files in "
-    "a project workspace.\n"
     "memory_write - the user is explicitly asking you to remember, save, "
     "note, or store a fact for later.\n"
     "memory_recall - the user is asking you to recall, look up, or answer "
@@ -68,17 +80,16 @@ CLASSIFICATION_SYSTEM_PROMPT = (
 _TOOL_NAME_FILTERS = {
     "action_music": lambda name: name.startswith("ytm_"),
     "action_calendar": lambda name: name.startswith("gc_"),
-    "action_code": lambda name: name in ("search_codebase", "read_file"),
     "memory_write": lambda name: name in ("update_user_preference", "update_user_knowledge"),
     "memory_recall": lambda name: name == "recall_note",
     "chat": lambda name: False,
 }
 
 # Used only when BOTH the trained classifier and the LLM fallback fail
-# outright (model not loaded, empty/garbled output, exception).
+# outright (model not loaded, empty/garbled output, exception) - or, with
+# the LLM fallback disabled, when the trained classifier itself errors.
 _FALLBACK_MUSIC = re.compile(r"\b(play|pause|resume|skip|song|track|music|playlist)\b", re.I)
 _FALLBACK_CALENDAR = re.compile(r"\b(calendar|event|meeting|appointment|schedule|remind me|reminder|agenda)\b", re.I)
-_FALLBACK_CODE = re.compile(r"\b(codebase|source code|read file|search code|repository|repo)\b", re.I)
 _FALLBACK_WRITE = re.compile(r"\b(remember|note that|save this|save to memory|store this in memory)\b", re.I)
 
 _SMALL_TALK_PATTERNS = [
@@ -108,16 +119,14 @@ def is_small_talk(user_text: str) -> bool:
 
 
 def _regex_fallback_classify(user_text: str) -> str:
-    """Last-resort classifier, used only if BOTH the trained classifier
-    and the LLM fallback are unavailable/fail."""
+    """Last-resort classifier, used only if the trained classifier AND
+    (when enabled) the LLM fallback are both unavailable/fail."""
     if _FALLBACK_WRITE.search(user_text):
         return "memory_write"
     if _FALLBACK_MUSIC.search(user_text):
         return "action_music"
     if _FALLBACK_CALENDAR.search(user_text):
         return "action_calendar"
-    if _FALLBACK_CODE.search(user_text):
-        return "action_code"
     if user_text.strip().endswith("?"):
         return "memory_recall"
     return "chat"
@@ -125,9 +134,9 @@ def _regex_fallback_classify(user_text: str) -> str:
 
 async def classify_intent_llm(user_text: str, llm_engine) -> str:
     """
-    Dedicated Qwen3 classification call - used ONLY as a fallback when
-    the trained classifier is unavailable or under-confident, not as
-    the primary mechanism anymore.
+    Dedicated Qwen3 classification call. Only invoked from classify_intent()
+    below when INTENT_LLM_FALLBACK_ENABLED is true - see module docstring
+    for why this defaults to off.
     """
     text = (user_text or "").strip()
     if not text:
@@ -162,7 +171,7 @@ def apply_memory_reference_override(user_text: str, classified_intent: str) -> s
     to 'memory_recall' when the user explicitly tells NOVA to check its
     own memory/files/notes. Never overrides action/write intents from
     either classification path. Always runs, regardless of which
-    mechanism (trained classifier or LLM) produced the intent.
+    mechanism produced the intent.
     """
     if classified_intent != "chat":
         return classified_intent
@@ -176,14 +185,18 @@ async def classify_intent(user_text: str, llm_engine) -> dict:
     """
     The single entry point main.py should call. Returns a dict with the
     resolved intent plus diagnostic metadata for logging:
-      {"intent": str, "source": "classifier"|"llm"|"regex_fallback",
+      {"intent": str, "source": "classifier"|"llm"|"low_confidence"|"empty",
        "confidence": float|None, "all_scores": dict|None}
 
     Resolution order:
       1. Trained classifier, if available and confidence >= threshold.
-      2. Qwen3 LLM classification, if the trained classifier declined.
-      3. Regex-only fallback, if the LLM call itself also fails.
-      4. Memory-reference override applied on top of whichever won.
+      2. If under threshold: Qwen3 LLM classification IF
+         INTENT_LLM_FALLBACK_ENABLED, otherwise resolve straight to
+         "chat" (source="low_confidence") - no memory/vault context is
+         exposed for that turn either way (see main.py's chat branch),
+         so this is always the safe default regardless of which path
+         is active.
+      3. Memory-reference override applied on top of whichever won.
     """
     text = (user_text or "").strip()
     if not text:
@@ -204,15 +217,28 @@ async def classify_intent(user_text: str, llm_engine) -> dict:
                 "all_scores": result["all_scores"],
             }
         logger.info(
-            "Trained classifier confidence %.3f below threshold %.2f - falling back to LLM classification.",
+            "Trained classifier confidence %.3f below threshold %.2f - %s.",
             result["confidence"], INTENT_CONFIDENCE_THRESHOLD,
+            "falling back to LLM classification" if INTENT_LLM_FALLBACK_ENABLED else "resolving to chat (LLM fallback disabled)",
         )
 
-    llm_intent = await classify_intent_llm(text, llm_engine)
-    intent = apply_memory_reference_override(text, llm_intent)
+    if INTENT_LLM_FALLBACK_ENABLED:
+        llm_intent = await classify_intent_llm(text, llm_engine)
+        intent = apply_memory_reference_override(text, llm_intent)
+        return {
+            "intent": intent,
+            "source": "llm" if result is None or result["confidence"] < INTENT_CONFIDENCE_THRESHOLD else "classifier",
+            "confidence": result["confidence"] if result else None,
+            "all_scores": result["all_scores"] if result else None,
+        }
+
+    # LLM fallback disabled: low-confidence (or unavailable classifier)
+    # resolves straight to "chat", still passing through the regex
+    # override so an explicit memory-reference phrase can still upgrade it.
+    intent = apply_memory_reference_override(text, "chat")
     return {
         "intent": intent,
-        "source": "llm" if result is None or result["confidence"] < INTENT_CONFIDENCE_THRESHOLD else "classifier",
+        "source": "low_confidence" if result is not None else "empty",
         "confidence": result["confidence"] if result else None,
         "all_scores": result["all_scores"] if result else None,
     }
