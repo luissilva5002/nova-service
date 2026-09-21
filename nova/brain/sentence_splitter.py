@@ -23,6 +23,13 @@ def split_sentences(text: str) -> list[str]:
         end = match.end()
         result.append(text[start:end].strip())
         start = end
-    if text[start:].strip():
-        result.append(text[start:].strip())
+    remainder = text[start:].strip()
+    while len(remainder) > 200:
+        cut = remainder.rfind(" ", 0, 200)
+        if cut < 1:
+            cut = 200
+        result.append(remainder[:cut].strip())
+        remainder = remainder[cut:].lstrip()
+    if remainder:
+        result.append(remainder)
     return result

@@ -162,6 +162,10 @@ class LLMEngine:
             "total_elapsed_seconds": round(total_elapsed, 3),
             "tokens_per_second": round(decode_rate or completion_tokens / elapsed_seconds, 2),
         }
+        cache_details = usage.get("prompt_tokens_details", {})
+        metrics["cache_hit_tokens"] = int(
+            cache_details.get("cached_tokens", usage.get("cache_hit_tokens", 0)) or 0
+        )
         if streaming:
             metrics["ttft_seconds"] = round(elapsed_seconds, 3)
             metrics["decode_tokens_per_second"] = metrics["tokens_per_second"]
@@ -352,7 +356,8 @@ class LLMEngine:
                     break
                 if isinstance(item, Exception):
                     raise item
-                prompt_tokens = int(item.get("usage", {}).get("prompt_tokens", prompt_tokens))
+                usage = item.get("usage", {})
+                prompt_tokens = int(usage.get("prompt_tokens", prompt_tokens))
                 delta = item.get("choices", [{}])[0].get("delta", {}).get("content", "") or ""
                 if delta:
                     first_token_at = first_token_at or time.perf_counter()
@@ -365,6 +370,7 @@ class LLMEngine:
                 "completion_tokens": completion_tokens, "prompt_tokens": prompt_tokens,
                 "elapsed_seconds": round(elapsed, 3), "total_elapsed_seconds": round(elapsed, 3),
                 "tokens_per_second": round(completion_tokens / elapsed, 2),
+                "cache_hit_tokens": 0,
                 "ttft_seconds": round((first_token_at or time.perf_counter()) - started_at, 3),
                 "decode_tokens_per_second": round(completion_tokens / elapsed, 2),
             }
