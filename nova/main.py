@@ -658,6 +658,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     full_text = ""
                     pending = ""
                     metrics = {}
+                    audio_seq = 0
                     async for event in llm_engine.stream_chat(
                         user_text, memory_context=stream_context, history=history, intent="chat"
                     ):
@@ -677,10 +678,12 @@ async def websocket_endpoint(websocket: WebSocket):
                                         audio_parts.append(chunk)
                                     if audio_parts:
                                         await websocket.send_text(json.dumps({
-                                            "type": "audio",
+                                            "type": "audio_chunk",
+                                            "seq": audio_seq,
+                                            "sample_rate": tts_engine.sample_rate(),
                                             "audio_b64": base64.b64encode(b"".join(audio_parts)).decode(),
-                                            "final": False,
                                         }))
+                                        audio_seq += 1
                             await websocket.send_text(json.dumps({"type": "text_delta", "text": delta}))
                         else:
                             metrics = event.get("metrics", {})
@@ -693,11 +696,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     final_audio = []
                     async for chunk in tts_engine.synthesize_stream(pending):
                         final_audio.append(chunk)
-                    await websocket.send_text(json.dumps({
-                        "type": "audio",
-                        "audio_b64": base64.b64encode(b"".join(final_audio)).decode(),
-                        "final": True,
-                    }))
+                    if final_audio:
+                        await websocket.send_text(json.dumps({
+                            "type": "audio_chunk", "seq": audio_seq,
+                            "sample_rate": tts_engine.sample_rate(),
+                            "audio_b64": base64.b64encode(b"".join(final_audio)).decode(),
+                        }))
+                    await websocket.send_text(json.dumps({"type": "audio_done"}))
                     continue
 
             reply_text, audio_bytes, generation_metrics, client_action = await run_pipeline(user_text, session_id=session_id)

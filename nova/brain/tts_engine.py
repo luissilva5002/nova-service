@@ -10,6 +10,7 @@ before the full response has finished generating (see architecture doc
 import logging
 import re
 import asyncio
+import json
 from typing import AsyncIterator
 
 from nova.config import PIPER_VOICE_MODEL_PATH, PIPER_VOICE_CONFIG_PATH
@@ -65,6 +66,13 @@ class TTSEngine:
             audio_chunks = await asyncio.to_thread(lambda: list(self._voice.synthesize(sentence)))
             for audio_chunk in audio_chunks:
                 yield audio_chunk.audio_int16_bytes
+
+    def sample_rate(self) -> int:
+        try:
+            config = json.loads(PIPER_VOICE_CONFIG_PATH.read_text(encoding="utf-8"))
+            return int(config.get("audio", {}).get("sample_rate", 22050))
+        except (OSError, ValueError, TypeError):
+            return 22050
 
     def list_available_voices(self) -> list:
         """Helper for the web UI voice-picker (page 5: 'preset library of voices')."""
