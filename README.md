@@ -72,6 +72,20 @@ models, it just echoes input instead of doing real inference).
 Open the dashboard: **http://localhost:8000**
 WebSocket endpoint (used by the Flutter app too): **ws://<server-ip>:8000/ws/chat**
 
+## Performance tuning
+
+The CPU-oriented defaults use four llama.cpp threads, a 512-token batch, a
+4096-token context, and a 512 MB prompt KV cache. These can be adjusted with
+`NOVA_LLM_THREADS`, `NOVA_LLM_THREADS_BATCH`, `NOVA_LLM_BATCH`,
+`NOVA_LLM_CTX`, `NOVA_LLM_FLASH_ATTN`, `NOVA_LLM_MLOCK`,
+`NOVA_LLM_KV_CACHE_TYPE`, `NOVA_LLM_CACHE_MB`, `NOVA_LLM_TEMP_TOOLS`,
+`NOVA_LLM_MAX_TOKENS_CHAT`, `NOVA_LLM_MAX_TOKENS_TOOL`, and
+`NOVA_LLM_CONFIRMATIONS`; see `.env.example` for defaults. Streaming is
+opt-in per WebSocket text message with `"stream": true`.
+
+After upgrading the host from 8 GB to 12 GB RAM, raise `NOVA_MEM_LIMIT` to
+approximately `9g` or `10g` if the host has enough headroom.
+
 ## 5. Everyday commands
 
 | Action | Command |

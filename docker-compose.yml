@@ -31,4 +31,6 @@ services:
     deploy:
       resources:
         limits:
-          memory: 6.0G             # cap RAM so the host OS never crashes
+          memory: ${NOVA_MEM_LIMIT:-6g} # cap RAM so the host OS never crashes
+    ulimits:
+      memlock: ${NOVA_LLM_MLOCK:+-1}
