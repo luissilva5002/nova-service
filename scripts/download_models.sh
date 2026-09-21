@@ -9,7 +9,7 @@
 set -e
 
 MODELS_DIR="$(dirname "$0")/../models"
-mkdir -p "$MODELS_DIR/brain" "$MODELS_DIR/whisper" "$MODELS_DIR/piper"
+mkdir -p "$MODELS_DIR/brain" "$MODELS_DIR/whisper" "$MODELS_DIR/piper" "$MODELS_DIR/minilm" "$MODELS_DIR/hf_cache"
 
 echo "==> The Brain: Qwen 2.5 3B Instruct (Q4_K_M GGUF, ~2.2GB)"
 curl -L -o "$MODELS_DIR/brain/qwen2.5-3b-instruct-q4_k_m.gguf" \
@@ -24,6 +24,9 @@ curl -L -o "$MODELS_DIR/piper/en_US-lessac-medium.onnx" \
   "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
 curl -L -o "$MODELS_DIR/piper/en_US-lessac-medium.onnx.json" \
   "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
+
+echo "==> MiniLM and faster-whisper assets should be prefetched into models/minilm and models/whisper."
+echo "    Use the project's pinned model download tooling or copy complete local model directories there."
 
 echo "==> Done. Models placed under $MODELS_DIR"
 echo "    Swap qwen2.5-3b-instruct-q4_k_m.gguf for a Llama 3.2 3B GGUF if you"

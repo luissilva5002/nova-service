@@ -26,8 +26,13 @@ services:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
-      - OMP_NUM_THREADS=4         # utilize all 4 cores of a Ryzen 3
+      - OMP_NUM_THREADS=${NOVA_THREADS:-4} # utilize all 4 cores of a Ryzen 3
       - NOVA_HOST_PROJECTS_DIR=/app/host_projects
+      - NOVA_OFFLINE=${NOVA_OFFLINE:-1}
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - ANONYMIZED_TELEMETRY=False
     deploy:
       resources:
         limits:
@@ -36,3 +41,5 @@ services:
       memlock:
         soft: -1
         hard: -1
+    cap_add:
+      - IPC_LOCK

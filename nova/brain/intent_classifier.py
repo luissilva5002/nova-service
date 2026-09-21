@@ -17,7 +17,7 @@ that case.
 import logging
 from typing import Optional
 
-from nova.config import INTENT_CLASSIFIER_PATH
+from nova.config import INTENT_CLASSIFIER_PATH, MINILM_MODEL_DIR
 
 logger = logging.getLogger("nova.intent_classifier")
 
@@ -59,7 +59,10 @@ class IntentClassifier:
 
         try:
             bundle = joblib.load(INTENT_CLASSIFIER_PATH)
-            self._embedder = SentenceTransformer(bundle["embedding_model_name"])
+            local_model = MINILM_MODEL_DIR if MINILM_MODEL_DIR.exists() else bundle["embedding_model_name"]
+            self._embedder = SentenceTransformer(
+                str(local_model), device="cpu", local_files_only=MINILM_MODEL_DIR.exists()
+            )
             self._clf = bundle["classifier"]
             self._classes = list(bundle.get("classes", getattr(self._clf, "classes_", [])))
             self._available = True

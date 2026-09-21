@@ -7,12 +7,20 @@ one place (or via environment variables / .env when running in Docker).
 import os
 from pathlib import Path
 
+# Keep model libraries from attempting network access during module imports.
+NOVA_OFFLINE = os.getenv("NOVA_OFFLINE", "1").strip().lower() in ("1", "true", "yes", "on")
+if NOVA_OFFLINE:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 # --------------------------------------------------------------------------
 # Base paths
 # --------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent  # /app inside the container
 
 MODELS_DIR = Path(os.getenv("NOVA_MODELS_DIR", BASE_DIR / "models"))
+MINILM_MODEL_DIR = Path(os.getenv("NOVA_MINILM_MODEL_DIR", MODELS_DIR / "minilm"))
 DATA_DIR = Path(os.getenv("NOVA_DATA_DIR", BASE_DIR / "data"))
 WEB_UI_DIR = Path(os.getenv("NOVA_WEB_UI_DIR", BASE_DIR / "web_ui"))
 
@@ -73,6 +81,8 @@ LLM_TEMP_TOOLS = float(os.getenv("NOVA_LLM_TEMP_TOOLS", "0.1"))
 LLM_MAX_TOKENS_CHAT = int(os.getenv("NOVA_LLM_MAX_TOKENS_CHAT", "128"))
 LLM_MAX_TOKENS_TOOL = int(os.getenv("NOVA_LLM_MAX_TOKENS_TOOL", "96"))
 LLM_CONFIRMATIONS = os.getenv("NOVA_LLM_CONFIRMATIONS", "false").strip().lower() in ("1", "true", "yes", "on")
+LLM_HISTORY_TURNS = int(os.getenv("NOVA_HISTORY_TURNS", "6"))
+PREWARM_MODELS = os.getenv("NOVA_PREWARM_MODELS", "false").strip().lower() in ("1", "true", "yes", "on")
 LLM_GPU_LAYERS = int(os.getenv("NOVA_LLM_GPU_LAYERS", "0"))  # 0 = CPU only (Ryzen 3 target)
 
 # System prompt persona - Tier 1 static memory (KV-cached, ~200 tokens target)
@@ -93,6 +103,7 @@ NOVA_PERSONA_PROMPT = os.getenv(
 WHISPER_MODEL_CACHE_DIR = Path(
     os.getenv("NOVA_WHISPER_CACHE_DIR", MODELS_DIR / "whisper" / "faster_whisper_cache")
 )
+WHISPER_MODEL_DIR = Path(os.getenv("NOVA_WHISPER_MODEL_DIR", MODELS_DIR / "whisper"))
 WHISPER_FILLER_PROMPT = (
     "Clean transcript without filler words, ums, or hesitations."
 )

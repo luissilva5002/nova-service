@@ -38,6 +38,8 @@ from nova.config import (
     LLM_TEMP_TOOLS,
     LLM_MAX_TOKENS_CHAT,
     LLM_MAX_TOKENS_TOOL,
+    LLM_HISTORY_TURNS,
+    PREWARM_MODELS,
     LLM_GPU_LAYERS,
     NOVA_PERSONA_PROMPT,
 )
@@ -190,6 +192,7 @@ class LLMEngine:
             self._loaded = True
             return
 
+        load_started = time.perf_counter()
         logger.info("Loading brain model from %s ...", model_path)
         kwargs = dict(
             model_path=str(model_path), n_ctx=LLM_CONTEXT_SIZE, n_threads=LLM_THREADS,
@@ -219,7 +222,8 @@ class LLMEngine:
                 logger.warning("llama-cpp-python cache API unavailable; continuing without RAM cache.")
         self._configure_qwen3_non_thinking_mode()
         self._loaded = True
-        logger.info("Brain model loaded (ctx=%s, threads=%s).", LLM_CONTEXT_SIZE, LLM_THREADS)
+        logger.info("Brain model loaded (ctx=%s, threads=%s, load_seconds=%.3f).",
+                    LLM_CONTEXT_SIZE, LLM_THREADS, time.perf_counter() - load_started)
 
     # ------------------------------------------------------------------
     # Tool-calling generation - used by the main pipeline in main.py
@@ -398,7 +402,7 @@ class LLMEngine:
     @classmethod
     def _build_messages(cls, user_text, memory_context, tool_schemas, history, intent):
         messages = [{"role": "system", "content": NOVA_PERSONA_PROMPT}]
-        for turn in history or []:
+        for turn in (history or [])[-LLM_HISTORY_TURNS * 2:]:
             if turn.get("role") in {"user", "assistant"}:
                 messages.append({"role": turn["role"], "content": turn.get("content", "")})
         context = cls._current_date_context(intent == "action_calendar")

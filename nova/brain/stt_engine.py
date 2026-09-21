@@ -19,7 +19,7 @@ import re
 import subprocess
 import wave
 
-from nova.config import WHISPER_MODEL_CACHE_DIR, WHISPER_FILLER_PROMPT
+from nova.config import WHISPER_MODEL_CACHE_DIR, WHISPER_MODEL_DIR, WHISPER_FILLER_PROMPT, NOVA_OFFLINE
 
 logger = logging.getLogger("nova.stt_engine")
 
@@ -62,11 +62,15 @@ class STTEngine:
         )
         try:
             # int8 compute type keeps this fast and light on a Ryzen 3 CPU.
+            model_source = str(WHISPER_MODEL_DIR) if WHISPER_MODEL_DIR.exists() else WHISPER_MODEL_SIZE
+            if NOVA_OFFLINE and not WHISPER_MODEL_DIR.exists():
+                raise FileNotFoundError(f"Offline STT model directory is missing: {WHISPER_MODEL_DIR}")
             self._model = WhisperModel(
-                WHISPER_MODEL_SIZE,
+                model_source,
                 device="cpu",
                 compute_type="int8",
                 download_root=str(WHISPER_MODEL_CACHE_DIR),
+                local_files_only=NOVA_OFFLINE,
             )
         except Exception:
             logger.exception("Failed to load faster-whisper model - STT engine running in STUB mode.")

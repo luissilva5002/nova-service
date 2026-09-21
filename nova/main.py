@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 
-from nova.config import WEB_UI_DIR, HOST_PROJECTS_DIR, LLM_CONFIRMATIONS
+from nova.config import WEB_UI_DIR, HOST_PROJECTS_DIR, LLM_CONFIRMATIONS, NOVA_OFFLINE, MINILM_MODEL_DIR, WHISPER_MODEL_DIR
 from nova.brain.llm_engine import llm_engine
 from nova.brain.stt_engine import stt_engine
 from nova.brain.tts_engine import tts_engine
@@ -60,6 +60,7 @@ if WEB_UI_DIR.exists():
 @app.on_event("startup")
 async def on_startup():
     logger.info("NOVA booting...")
+    logger.info("offline=%s minilm=%s whisper=%s", NOVA_OFFLINE, MINILM_MODEL_DIR, WHISPER_MODEL_DIR)
     llm_engine.load()
     stt_engine.load()
     tts_engine.load()

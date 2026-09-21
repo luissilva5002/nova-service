@@ -14,7 +14,7 @@ embedding model / chromadb dependency is fully set up.
 from pathlib import Path
 from typing import Optional
 
-from nova.config import VECTOR_STORE_DIR, VECTOR_STORE_COLLECTION, RAG_TOP_K
+from nova.config import VECTOR_STORE_DIR, VECTOR_STORE_COLLECTION, RAG_TOP_K, MINILM_MODEL_DIR
 
 try:
     import chromadb
@@ -22,6 +22,18 @@ try:
     _CHROMA_AVAILABLE = True
 except ImportError:  # pragma: no cover - allows the server to boot without the dep installed yet
     _CHROMA_AVAILABLE = False
+
+
+class _LocalEmbeddingFunction:
+    def __init__(self):
+        from sentence_transformers import SentenceTransformer
+        self._model = SentenceTransformer(str(MINILM_MODEL_DIR), device="cpu", local_files_only=True)
+
+    def __call__(self, input):
+        return self._model.encode(input, normalize_embeddings=True).tolist()
+
+    def name(self):
+        return "local-minilm"
 
 
 class VectorStore:
@@ -33,7 +45,11 @@ class VectorStore:
         self._collection = None
         if _CHROMA_AVAILABLE:
             self._client = chromadb.PersistentClient(path=str(self.persist_dir))
-            self._collection = self._client.get_or_create_collection(self.collection_name)
+            embedding_function = _LocalEmbeddingFunction() if MINILM_MODEL_DIR.exists() else None
+            self._collection = self._client.get_or_create_collection(
+                self.collection_name, embedding_function=embedding_function,
+                metadata={"telemetry": "disabled"},
+            )
 
     @property
     def available(self) -> bool:
