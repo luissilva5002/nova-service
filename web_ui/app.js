@@ -16,6 +16,9 @@ let speakTimeout;
 let audioFallbackTimeout;
 let thinkingStartedAt = 0;
 let memoryGraphFocus = null;
+let liveNovaMessage = null;
+let audioContext = null;
+let nextAudioStart = 0;
 const MIN_THINKING_MS = 700; // spinner stays visible at least this long, even on instant replies
 
 const SESSION_STORAGE_KEY = 'nova_session_id';
@@ -61,8 +64,16 @@ ws.onmessage = (event) => {
         return;
     }
 
-    if (payload.type === 'text') {
-        appendMessage('NOVA', payload.text, 'nova');
+    if (payload.type === 'text_delta') {
+        if (!liveNovaMessage) liveNovaMessage = appendMessage('NOVA', '', 'nova');
+        liveNovaMessage.innerText += payload.text || '';
+    } else if (payload.type === 'text') {
+        if (liveNovaMessage) {
+            liveNovaMessage.innerText = `NOVA: ${payload.text || ''}`;
+            liveNovaMessage = null;
+        } else {
+            appendMessage('NOVA', payload.text, 'nova');
+        }
         // Stay in 'thinking' - audio hasn't started yet, TTS is still
         // synthesizing. If no audio message follows shortly (e.g. TTS
         // stub mode / disabled, or an open_url action with no TTS),
@@ -81,6 +92,8 @@ ws.onmessage = (event) => {
         // this to an installed app via universal/app links, falling back
         // to the browser automatically if no app claims the link.
         setTimeout(() => { window.location.href = payload.url; }, 300);
+    } else if (payload.type === 'audio_chunk' && payload.audio_b64) {
+        playAudioChunk(payload.audio_b64, payload.sample_rate || 22050);
     } else if (payload.type === 'audio' && payload.audio_b64) {
         clearTimeout(audioFallbackTimeout); // audio arrived, cancel the fallback
         playAudioBase64(payload.audio_b64);
@@ -422,7 +435,7 @@ function sendMsg() {
     const input = document.getElementById('userInput');
     if (!input.value) return;
     appendMessage('You', input.value, 'user');
-    ws.send(JSON.stringify({ type: 'text', text: input.value }));
+    ws.send(JSON.stringify({ type: 'text', text: input.value, stream: true }));
     input.value = '';
     // Safety net only - the real exit from 'thinking' happens when audio
     // actually starts playing (see playAudioBase64), not here.
@@ -432,7 +445,9 @@ function sendMsg() {
 function showLlmSpeed(metrics) {
     const speed = Number(metrics.tokens_per_second || 0);
     const tokenCount = Number(metrics.completion_tokens || 0);
-    document.getElementById('statTokensPerSecond').innerText = tokenCount > 0 ? `${speed.toFixed(1)} tok/s` : '0.0 tok/s';
+    const ttft = Number(metrics.ttft_seconds || 0);
+    document.getElementById('statTokensPerSecond').innerText =
+        tokenCount > 0 ? `${speed.toFixed(1)} tok/s (TTFT ${ttft.toFixed(2)}s)` : '0.0 tok/s';
 }
 
 function appendMessage(sender, text, className) {
@@ -441,6 +456,23 @@ function appendMessage(sender, text, className) {
     msgDiv.innerText = `${sender}: ${text}`;
     chatBox.appendChild(msgDiv);
     chatBox.scrollTop = chatBox.scrollHeight;
+    return msgDiv;
+}
+
+function playAudioChunk(b64, sampleRate) {
+    audioContext = audioContext || new (window.AudioContext || window.webkitAudioContext)();
+    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const samples = new Int16Array(bytes.buffer);
+    const buffer = audioContext.createBuffer(1, samples.length, sampleRate);
+    const channel = buffer.getChannelData(0);
+    for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
+    const source = audioContext.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioContext.destination);
+    nextAudioStart = Math.max(nextAudioStart, audioContext.currentTime);
+    source.start(nextAudioStart);
+    nextAudioStart += buffer.duration;
+    setUiState('nova');
 }
 
 function playAudioBase64(b64) {
