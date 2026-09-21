@@ -20,7 +20,6 @@ import time
 import gc
 import re
 import threading
-import queue
 from typing import Optional, AsyncIterator
 
 from nova.config import (
@@ -343,7 +342,8 @@ class LLMEngine:
             yield {"type": "done", "metrics": {"completion_tokens": 0, "prompt_tokens": 0, "elapsed_seconds": 0.0, "total_elapsed_seconds": 0.0, "tokens_per_second": 0.0}}
             return
         messages = self._build_messages(user_text, memory_context, [], history, intent)
-        values: queue.Queue = queue.Queue()
+        values: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
         started_at = time.perf_counter()
 
         def produce() -> None:
@@ -352,11 +352,11 @@ class LLMEngine:
                     messages=messages, max_tokens=LLM_MAX_TOKENS_CHAT, temperature=0.4, stream=True
                 )
                 for item in completion:
-                    values.put(item)
+                    loop.call_soon_threadsafe(values.put_nowait, item)
             except Exception as exc:
-                values.put(exc)
+                loop.call_soon_threadsafe(values.put_nowait, exc)
             finally:
-                values.put(None)
+                loop.call_soon_threadsafe(values.put_nowait, None)
 
         async with self._lock:
             worker = threading.Thread(target=produce, daemon=True)
@@ -365,7 +365,7 @@ class LLMEngine:
             first_token_at = None
             prompt_tokens = 0
             while True:
-                item = await asyncio.to_thread(values.get)
+                item = await values.get()
                 if item is None:
                     break
                 if isinstance(item, Exception):
