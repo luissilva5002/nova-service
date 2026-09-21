@@ -19,6 +19,8 @@ import logging
 import time
 import gc
 import re
+import threading
+import queue
 from typing import Optional, AsyncIterator
 
 from nova.config import (
@@ -301,6 +303,63 @@ class LLMEngine:
         logger.info("LLM prompt_tokens=%s", completion.get("usage", {}).get("prompt_tokens", 0))
         text = self._without_thinking(completion["choices"][0]["message"].get("content", ""))
         return text, self._generation_metrics(completion, started_at, text)
+
+    async def stream_chat(
+        self, user_text: str, memory_context: str = "", history: Optional[list[dict]] = None,
+        intent: str = "chat",
+    ) -> AsyncIterator[dict]:
+        """Stream chat deltas while serializing access to the single model."""
+        self.load()
+        if self._llm is None:
+            yield {"type": "text_delta", "text": f"[stub-brain] You said: {user_text}"}
+            yield {"type": "done", "metrics": {"completion_tokens": 0, "prompt_tokens": 0, "elapsed_seconds": 0.0, "total_elapsed_seconds": 0.0, "tokens_per_second": 0.0}}
+            return
+        messages = self._build_messages(user_text, memory_context, [], history, intent)
+        values: queue.Queue = queue.Queue()
+        started_at = time.perf_counter()
+
+        def produce() -> None:
+            try:
+                completion = self._llm.create_chat_completion(
+                    messages=messages, max_tokens=LLM_MAX_TOKENS_CHAT, temperature=0.4, stream=True
+                )
+                for item in completion:
+                    values.put(item)
+            except Exception as exc:
+                values.put(exc)
+            finally:
+                values.put(None)
+
+        async with self._lock:
+            worker = threading.Thread(target=produce, daemon=True)
+            worker.start()
+            pieces = []
+            first_token_at = None
+            prompt_tokens = 0
+            while True:
+                item = await asyncio.to_thread(values.get)
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                prompt_tokens = int(item.get("usage", {}).get("prompt_tokens", prompt_tokens))
+                delta = item.get("choices", [{}])[0].get("delta", {}).get("content", "") or ""
+                if delta:
+                    first_token_at = first_token_at or time.perf_counter()
+                    pieces.append(delta)
+                    yield {"type": "text_delta", "text": self._without_thinking(delta)}
+            output = "".join(pieces)
+            elapsed = max(time.perf_counter() - started_at, 0.001)
+            completion_tokens = len(self._llm.tokenize(output.encode(), add_bos=False)) if output else 0
+            metrics = {
+                "completion_tokens": completion_tokens, "prompt_tokens": prompt_tokens,
+                "elapsed_seconds": round(elapsed, 3), "total_elapsed_seconds": round(elapsed, 3),
+                "tokens_per_second": round(completion_tokens / elapsed, 2),
+                "ttft_seconds": round((first_token_at or time.perf_counter()) - started_at, 3),
+                "decode_tokens_per_second": round(completion_tokens / elapsed, 2),
+            }
+            logger.info("LLM prompt_tokens=%s", metrics["prompt_tokens"])
+            yield {"type": "done", "text": self._without_thinking(output), "metrics": metrics}
 
     @staticmethod
     def _current_date_context(include_lookup: bool = False) -> str:
