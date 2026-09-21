@@ -9,6 +9,7 @@ before the full response has finished generating (see architecture doc
 """
 import logging
 import re
+import asyncio
 from typing import AsyncIterator
 
 from nova.config import PIPER_VOICE_MODEL_PATH, PIPER_VOICE_CONFIG_PATH
@@ -61,7 +62,8 @@ class TTSEngine:
         for sentence in _SENTENCE_SPLIT.split(text.strip()):
             if not sentence:
                 continue
-            for audio_chunk in self._voice.synthesize(sentence):
+            audio_chunks = await asyncio.to_thread(lambda: list(self._voice.synthesize(sentence)))
+            for audio_chunk in audio_chunks:
                 yield audio_chunk.audio_int16_bytes
 
     def list_available_voices(self) -> list:

@@ -10,6 +10,7 @@ Execution -> TTS -> Audio Out. Exposes:
   WS   /ws/chat             Bi-directional streaming pipe (text + audio)
 """
 import base64
+import asyncio
 import json
 import logging
 import re
@@ -626,7 +627,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 audio_buffer.extend(base64.b64decode(message.get("audio_b64", "")))
                 if not message.get("final"):
                     continue  # keep buffering until the client signals end-of-utterance
-                user_text = stt_engine.transcribe_media(bytes(audio_buffer))
+                user_text = await asyncio.to_thread(stt_engine.transcribe_media, bytes(audio_buffer))
                 logger.info("Transcribed user text: %r", user_text)
                 audio_buffer.clear()
             else:
