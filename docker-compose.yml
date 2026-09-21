@@ -33,4 +33,6 @@ services:
         limits:
           memory: ${NOVA_MEM_LIMIT:-6g} # cap RAM so the host OS never crashes
     ulimits:
-      memlock: ${NOVA_LLM_MLOCK:+-1}
+      memlock:
+        soft: -1
+        hard: -1
