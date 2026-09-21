@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 
-from nova.config import WEB_UI_DIR, HOST_PROJECTS_DIR
+from nova.config import WEB_UI_DIR, HOST_PROJECTS_DIR, LLM_CONFIRMATIONS
 from nova.brain.llm_engine import llm_engine
 from nova.brain.stt_engine import stt_engine
 from nova.brain.tts_engine import tts_engine
@@ -546,7 +546,10 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
                         user_prompt_for_llm = tool_result.get("message") if tool_result.get("message") else json.dumps(tool_result)
                         reply_text = str(user_prompt_for_llm)
                         generation_metrics = decision.get("metrics", {})
-                    if tool_result.get("type") in {"audio", "open_url"}:
+                    if tool_result.get("type") in {"audio", "open_url"} and not LLM_CONFIRMATIONS:
+                        reply_text = str(user_prompt_for_llm).strip()
+                        generation_metrics = decision.get("metrics", {})
+                    if tool_result.get("type") in {"audio", "open_url"} and LLM_CONFIRMATIONS:
                         # Response Feedback Loop: ask the brain to confirm / describe the action
                         reply_text, generation_metrics = await llm_engine.generate_raw_with_metrics(
                             system_prompt="Confirm this action result to the user in one natural spoken sentence. If the action produced audio, also say that playback has started.",
@@ -573,6 +576,8 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
     append_turn(session_id, "user", user_text)
     append_turn(session_id, "assistant", reply_text)
     core_store.log_message("nova", reply_text)
+    if intent == "memory_write":
+        asyncio.create_task(memory_agent.process_turn(user_text))
 
     # If the tool produced audio bytes, prefer them over TTS.
     if audio_bytes:
