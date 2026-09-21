@@ -13,6 +13,7 @@ import asyncio
 from typing import AsyncIterator
 
 from nova.config import PIPER_VOICE_MODEL_PATH, PIPER_VOICE_CONFIG_PATH
+from nova.brain.sentence_splitter import split_sentences
 
 logger = logging.getLogger("nova.tts_engine")
 
@@ -22,7 +23,6 @@ try:
 except ImportError:  # pragma: no cover
     _PIPER_AVAILABLE = False
 
-_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
 
 class TTSEngine:
@@ -59,7 +59,7 @@ class TTSEngine:
         if self._voice is None:
             return  # STUB mode: no audio to yield.
 
-        for sentence in _SENTENCE_SPLIT.split(text.strip()):
+        for sentence in split_sentences(text):
             if not sentence:
                 continue
             audio_chunks = await asyncio.to_thread(lambda: list(self._voice.synthesize(sentence)))

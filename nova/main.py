@@ -26,6 +26,7 @@ from nova.config import WEB_UI_DIR, HOST_PROJECTS_DIR, LLM_CONFIRMATIONS
 from nova.brain.llm_engine import llm_engine
 from nova.brain.stt_engine import stt_engine
 from nova.brain.tts_engine import tts_engine
+from nova.brain.sentence_splitter import split_sentences
 from nova.brain.tool_router import tool_router
 from nova.brain.intent_router import classify_intent, filter_tools_for_intent, wants_vault_context, is_small_talk
 from nova.memory.core_store import core_store
@@ -643,6 +644,60 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if not user_text.strip():
                 continue
+
+            if message.get("stream") is True:
+                stream_classification = await classify_intent(user_text, llm_engine)
+                if stream_classification["intent"] == "chat":
+                    history = get_context(session_id, limit=12)
+                    facts = vault_store.get_profile_fields()
+                    stream_context = json.dumps({
+                        "chat_context_summary": get_session_summary(session_id),
+                        "relevant_profile_fields": _select_relevant_facts(user_text, facts),
+                    }, ensure_ascii=False)
+                    full_text = ""
+                    pending = ""
+                    metrics = {}
+                    async for event in llm_engine.stream_chat(
+                        user_text, memory_context=stream_context, history=history, intent="chat"
+                    ):
+                        if event["type"] == "text_delta":
+                            delta = event["text"]
+                            full_text += delta
+                            pending += delta
+                            complete = split_sentences(pending)
+                            if complete:
+                                trailing_complete = bool(re.search(r"[.!?]+\s*$", pending))
+                                spoken_parts = complete if trailing_complete else complete[:-1]
+                                if spoken_parts:
+                                    spoken = " ".join(spoken_parts)
+                                    pending = "" if trailing_complete else complete[-1]
+                                    audio_parts = []
+                                    async for chunk in tts_engine.synthesize_stream(spoken):
+                                        audio_parts.append(chunk)
+                                    if audio_parts:
+                                        await websocket.send_text(json.dumps({
+                                            "type": "audio",
+                                            "audio_b64": base64.b64encode(b"".join(audio_parts)).decode(),
+                                            "final": False,
+                                        }))
+                            await websocket.send_text(json.dumps({"type": "text_delta", "text": delta}))
+                        else:
+                            metrics = event.get("metrics", {})
+                            full_text = event.get("text", full_text)
+                    append_turn(session_id, "user", user_text)
+                    append_turn(session_id, "assistant", full_text)
+                    core_store.log_message("nova", full_text)
+                    await websocket.send_text(json.dumps({"type": "text", "text": full_text}))
+                    await websocket.send_text(json.dumps({"type": "metrics", "llm": metrics}))
+                    final_audio = []
+                    async for chunk in tts_engine.synthesize_stream(pending):
+                        final_audio.append(chunk)
+                    await websocket.send_text(json.dumps({
+                        "type": "audio",
+                        "audio_b64": base64.b64encode(b"".join(final_audio)).decode(),
+                        "final": True,
+                    }))
+                    continue
 
             reply_text, audio_bytes, generation_metrics, client_action = await run_pipeline(user_text, session_id=session_id)
 
