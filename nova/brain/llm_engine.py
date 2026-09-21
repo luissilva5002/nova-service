@@ -196,6 +196,9 @@ class LLMEngine:
             self._loaded = True
             return
 
+        if PREWARM_MODELS:
+            threading.Thread(target=self._prewarm_file, args=(model_path,), daemon=True).start()
+
         load_started = time.perf_counter()
         logger.info("Loading brain model from %s ...", model_path)
         kwargs = dict(
@@ -228,6 +231,17 @@ class LLMEngine:
         self._loaded = True
         logger.info("Brain model loaded (ctx=%s, threads=%s, load_seconds=%.3f).",
                     LLM_CONTEXT_SIZE, LLM_THREADS, time.perf_counter() - load_started)
+
+    @staticmethod
+    def _prewarm_file(model_path) -> None:
+        started = time.perf_counter()
+        try:
+            with open(model_path, "rb") as model_file:
+                while model_file.read(8 * 1024 * 1024):
+                    pass
+            logger.info("Prewarmed model page cache in %.3f seconds.", time.perf_counter() - started)
+        except OSError:
+            logger.exception("Could not prewarm model page cache.")
 
     # ------------------------------------------------------------------
     # Tool-calling generation - used by the main pipeline in main.py
