@@ -407,9 +407,6 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
         intent, classification["source"], classification["confidence"], user_text,
     )
 
-    if intent == "memory_write":
-        await memory_agent.process_turn(user_text)
-
     session_history = get_context(session_id, limit=12)
     session_summary = get_session_summary(session_id)
     facts = vault_store.get_profile_fields()
@@ -445,7 +442,6 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
         memory_context = json.dumps(
             {
                 "chat_context_summary": session_summary,
-                "recent_chat_turns": session_history,
                 "relevant_profile_fields": relevant_facts,
                 "preferences": vault_context["preferences"],
                 "relevant_knowledge": vault_context["relevant_knowledge"],
@@ -457,7 +453,6 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
         memory_context = json.dumps(
             {
                 "chat_context_summary": session_summary,
-                "recent_chat_turns": session_history,
                 "relevant_profile_fields": relevant_facts,
                 "guidance": (
                     "No saved notes were loaded for this message. Do NOT claim "
@@ -486,6 +481,8 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
         user_text=user_text,
         tool_schemas=filtered_tool_schemas,
         memory_context=memory_context,
+        history=session_history,
+        intent=intent,
     )
     # Debug: log the LLM decision so we can trace tool_call vs text paths
     logger.info("LLM decision: %s", json.dumps(decision) if isinstance(decision, dict) else str(decision))

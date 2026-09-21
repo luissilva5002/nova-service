@@ -13,12 +13,13 @@ doc "Anatomy of NOVA's Single-Brain System") - whisper.cpp and Piper
 are non-LLM "organs", not separate brains.
 """
 import datetime
+import asyncio
 import json
 import logging
 import time
 import gc
 import re
-from typing import Optional
+from typing import Optional, AsyncIterator
 
 from nova.config import (
     LLM_MODEL_PATH,
@@ -26,6 +27,15 @@ from nova.config import (
     LLM_DEFAULT_MODEL_ID,
     LLM_CONTEXT_SIZE,
     LLM_THREADS,
+    LLM_THREADS_BATCH,
+    LLM_BATCH,
+    LLM_FLASH_ATTN,
+    LLM_MLOCK,
+    LLM_KV_CACHE_TYPE,
+    LLM_CACHE_MB,
+    LLM_TEMP_TOOLS,
+    LLM_MAX_TOKENS_CHAT,
+    LLM_MAX_TOKENS_TOOL,
     LLM_GPU_LAYERS,
     NOVA_PERSONA_PROMPT,
 )
@@ -45,6 +55,7 @@ class LLMEngine:
         self._llm: Optional["Llama"] = None
         self._loaded = False
         self._active_model_id = LLM_DEFAULT_MODEL_ID
+        self._lock = asyncio.Lock()
 
     def list_models(self) -> list[dict]:
         return [
@@ -68,6 +79,8 @@ class LLMEngine:
 
         previous_model_id = self._active_model_id
         logger.info("Switching brain model to %s ...", LLM_MODELS[model_id]["label"])
+        if self._llm is not None and hasattr(self._llm, "close"):
+            self._llm.close()
         self._llm = None
         self._loaded = False
         gc.collect()
@@ -92,7 +105,7 @@ class LLMEngine:
         arguments per request, so wrap the selected model's chat handler once
         at load time. This prevents reasoning tokens from being generated.
         """
-        if self._llm is None or not self._active_model_id.startswith("qwen3-"):
+        if self._llm is None or not re.match(r"^qwen3(\.\d+)?-", self._active_model_id):
             return
         try:
             from llama_cpp import llama_chat_format
@@ -132,10 +145,16 @@ class LLMEngine:
                 completion_tokens = len(self._llm.tokenize(output_text.encode("utf-8"), add_bos=False))
             except Exception:  # pragma: no cover - metrics must never break a reply
                 logger.debug("Could not tokenize generated output for metrics.", exc_info=True)
+        prompt_tokens = int(usage.get("prompt_tokens", 0))
+        total_elapsed = elapsed_seconds
+        decode_elapsed = float(usage.get("completion_time", 0) or 0)
+        decode_rate = completion_tokens / decode_elapsed if decode_elapsed > 0 else 0.0
         return {
             "completion_tokens": completion_tokens,
             "elapsed_seconds": round(elapsed_seconds, 3),
-            "tokens_per_second": round(completion_tokens / elapsed_seconds, 2),
+            "prompt_tokens": prompt_tokens,
+            "total_elapsed_seconds": round(total_elapsed, 3),
+            "tokens_per_second": round(decode_rate or completion_tokens / elapsed_seconds, 2),
         }
 
     def load(self) -> None:
@@ -164,13 +183,32 @@ class LLMEngine:
             return
 
         logger.info("Loading brain model from %s ...", model_path)
-        self._llm = Llama(
-            model_path=str(model_path),
-            n_ctx=LLM_CONTEXT_SIZE,
-            n_threads=LLM_THREADS,
-            n_gpu_layers=LLM_GPU_LAYERS,
-            verbose=False,
+        kwargs = dict(
+            model_path=str(model_path), n_ctx=LLM_CONTEXT_SIZE, n_threads=LLM_THREADS,
+            n_threads_batch=LLM_THREADS_BATCH, n_batch=LLM_BATCH,
+            n_gpu_layers=LLM_GPU_LAYERS, use_mlock=LLM_MLOCK, verbose=False,
         )
+        if LLM_FLASH_ATTN:
+            kwargs["flash_attn"] = True
+            if LLM_KV_CACHE_TYPE:
+                kwargs["type_k"] = LLM_KV_CACHE_TYPE
+                kwargs["type_v"] = LLM_KV_CACHE_TYPE
+        try:
+            self._llm = Llama(**kwargs)
+        except TypeError:
+            kwargs.pop("flash_attn", None)
+            kwargs.pop("type_k", None)
+            kwargs.pop("type_v", None)
+            self._llm = Llama(**kwargs)
+            logger.warning("llama-cpp-python does not support flash attention/KV cache options.")
+        if re.match(r"^qwen3(\.\d+)?-", self._active_model_id) and self._llm.chat_handler is None:
+            logger.warning("Qwen3 model loaded without explicit thinking disable support.")
+        if hasattr(self._llm, "set_cache"):
+            try:
+                from llama_cpp import LlamaRAMCache
+                self._llm.set_cache(LlamaRAMCache(capacity_bytes=LLM_CACHE_MB * 1024 * 1024))
+            except (ImportError, TypeError, AttributeError):
+                logger.warning("llama-cpp-python cache API unavailable; continuing without RAM cache.")
         self._configure_qwen3_non_thinking_mode()
         self._loaded = True
         logger.info("Brain model loaded (ctx=%s, threads=%s).", LLM_CONTEXT_SIZE, LLM_THREADS)
@@ -183,7 +221,9 @@ class LLMEngine:
         user_text: str,
         tool_schemas: list,
         memory_context: str = "",
-        max_tokens: int = 256,
+        max_tokens: Optional[int] = None,
+        history: Optional[list[dict]] = None,
+        intent: str = "chat",
     ) -> dict:
         """
         Returns either:
@@ -191,23 +231,25 @@ class LLMEngine:
           {"type": "text", "content": "..."}
         """
         self.load()
-        system_prompt = self._build_system_prompt(memory_context, tool_schemas)
+        max_tokens = max_tokens or (LLM_MAX_TOKENS_TOOL if tool_schemas else LLM_MAX_TOKENS_CHAT)
+        messages = self._build_messages(user_text, memory_context, tool_schemas, history, intent)
 
         if self._llm is None:
             # STUB mode (no model loaded yet) - echo back so the pipeline is testable end-to-end.
             return {"type": "text", "content": f"[stub-brain] You said: {user_text}"}
 
         started_at = time.perf_counter()
-        completion = self._llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            tools=tool_schemas,
-            tool_choice="auto",
-            max_tokens=max_tokens,
-            temperature=0.4,
-        )
+        kwargs = {"messages": messages, "max_tokens": max_tokens,
+                  "temperature": LLM_TEMP_TOOLS if tool_schemas else 0.4}
+        if tool_schemas:
+            kwargs["tools"] = tool_schemas
+            kwargs["tool_choice"] = (
+                {"type": "function", "function": {"name": tool_schemas[0]["function"]["name"]}}
+                if len(tool_schemas) == 1 else "auto"
+            )
+        async with self._lock:
+            completion = await asyncio.to_thread(self._llm.create_chat_completion, **kwargs)
+        logger.info("LLM prompt_tokens=%s", completion.get("usage", {}).get("prompt_tokens", 0))
         choice = completion["choices"][0]["message"]
         metrics = self._generation_metrics(
             completion,
@@ -250,19 +292,18 @@ class LLMEngine:
         if self._llm is None:
             return "{}", {"completion_tokens": 0, "elapsed_seconds": 0.0, "tokens_per_second": 0.0}
         started_at = time.perf_counter()
-        completion = self._llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=max_tokens,
-            temperature=0.2,
-        )
+        async with self._lock:
+            completion = await asyncio.to_thread(
+                self._llm.create_chat_completion,
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                max_tokens=max_tokens, temperature=0.2,
+            )
+        logger.info("LLM prompt_tokens=%s", completion.get("usage", {}).get("prompt_tokens", 0))
         text = self._without_thinking(completion["choices"][0]["message"].get("content", ""))
         return text, self._generation_metrics(completion, started_at, text)
 
     @staticmethod
-    def _current_date_context() -> str:
+    def _current_date_context(include_lookup: bool = False) -> str:
         """
         Returns the current date plus a lookup table of the next 14 days'
         dates and weekday names. Small local models (e.g. Qwen3-1.7B) can
@@ -271,7 +312,9 @@ class LLMEngine:
         pre-computed instead of asking them to derive it.
         """
         now = datetime.datetime.now().astimezone()
-        lines = [now.strftime("Current date and time: %A, %Y-%m-%d %H:%M %z")]
+        lines = [now.strftime("Current date: %A, %Y-%m-%d %Z")]
+        if not include_lookup:
+            return lines[0]
         lines.append("Upcoming dates (use these directly - do not calculate offsets yourself):")
         for offset in range(14):
             day = now + datetime.timedelta(days=offset)
@@ -281,11 +324,22 @@ class LLMEngine:
 
 
     @staticmethod
-    def _build_system_prompt(memory_context: str, tool_schemas: list) -> str:
-        parts = [NOVA_PERSONA_PROMPT, LLMEngine._current_date_context()]
+    def _build_system_prompt(memory_context: str = "", tool_schemas: list | None = None) -> str:
+        parts = [NOVA_PERSONA_PROMPT]
         if memory_context:
             parts.append(f"Known user context: {memory_context}")
         return "\n\n".join(parts)
+
+    @classmethod
+    def _build_messages(cls, user_text, memory_context, tool_schemas, history, intent):
+        messages = [{"role": "system", "content": NOVA_PERSONA_PROMPT}]
+        for turn in history or []:
+            if turn.get("role") in {"user", "assistant"}:
+                messages.append({"role": turn["role"], "content": turn.get("content", "")})
+        context = cls._current_date_context(intent == "action_calendar")
+        if memory_context:
+            context += f"\n\nKnown user context: {memory_context}"
+        return messages + [{"role": "user", "content": f"[Context]\n{context}\n[/Context]\n\n{user_text}"}]
 
 
 llm_engine = LLMEngine()
