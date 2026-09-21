@@ -86,6 +86,11 @@ opt-in per WebSocket text message with `"stream": true`.
 After upgrading the host from 8 GB to 12 GB RAM, raise `NOVA_MEM_LIMIT` to
 approximately `9g` or `10g` if the host has enough headroom.
 
+NOVA defaults to offline Hugging Face mode. Prefetch complete local model
+directories into `models/minilm`, `models/whisper`, and `models/hf_cache`.
+Google Calendar, YouTube Music, and the port 8080 OAuth callback are the
+components that legitimately require internet access.
+
 ## 5. Everyday commands
 
 | Action | Command |
