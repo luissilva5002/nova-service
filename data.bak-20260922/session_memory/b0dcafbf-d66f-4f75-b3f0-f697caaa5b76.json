@@ -1,0 +1,28 @@
+{
+  "session_id": "b0dcafbf-d66f-4f75-b3f0-f697caaa5b76",
+  "history": [
+    {
+      "role": "user",
+      "content": "Save a new project memory for NG Sports that is my startup and a box inside for the Smasher. NG is a company I am starting focused on bringing sports performance analytics to all players. The first product is the Smasher that is a smart tennis dampener",
+      "timestamp": "2026-08-22T22:10:42.840328+00:00"
+    },
+    {
+      "role": "assistant",
+      "content": "You study at Faculdade de Engenharia da Universidade do Porto (FEUP).",
+      "timestamp": "2026-08-22T22:10:42.888305+00:00"
+    },
+    {
+      "role": "user",
+      "content": "d",
+      "timestamp": "2026-08-22T22:11:44.725067+00:00"
+    },
+    {
+      "role": "assistant",
+      "content": "You mentioned \"d\" - could you please clarify what you're referring to? I'd be happy to help if you have any questions or need assistance with something specific.",
+      "timestamp": "2026-08-22T22:11:44.773161+00:00"
+    }
+  ],
+  "summary": "name: starting focused on bringing sports perfo; d",
+  "created_at": "2026-08-22T22:10:42.840289+00:00",
+  "updated_at": "2026-08-22T22:11:44.773172+00:00"
+}

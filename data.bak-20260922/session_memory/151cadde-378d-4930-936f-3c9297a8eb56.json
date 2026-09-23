@@ -1,0 +1,18 @@
+{
+  "session_id": "151cadde-378d-4930-936f-3c9297a8eb56",
+  "history": [
+    {
+      "role": "user",
+      "content": "I am really happy with your last answer. It was really good and it showed thought behind it, not just random, fact-fetching. So well done.",
+      "timestamp": "2026-08-23T00:59:23.053015+00:00"
+    },
+    {
+      "role": "assistant",
+      "content": "Thank you so much! I'm really glad to hear that. I try to make each response thoughtful and relevant. Let me know if there's anything else I can help with! 🎉",
+      "timestamp": "2026-08-23T00:59:23.073610+00:00"
+    }
+  ],
+  "summary": "name: really happy with your last answer",
+  "created_at": "2026-08-23T00:59:23.052995+00:00",
+  "updated_at": "2026-08-23T00:59:23.073615+00:00"
+}

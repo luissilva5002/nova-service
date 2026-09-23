@@ -1,0 +1,18 @@
+{
+  "session_id": "08435094-94f8-45f2-840d-b5cb8876107a",
+  "history": [
+    {
+      "role": "user",
+      "content": "Hine over, how are you doing today?",
+      "timestamp": "2026-09-22T08:57:25.243865+00:00"
+    },
+    {
+      "role": "assistant",
+      "content": "Hello! I'm doing great, thanks for asking. How about you?",
+      "timestamp": "2026-09-22T08:57:25.248274+00:00"
+    }
+  ],
+  "summary": "Hine over, how are you doing today?",
+  "created_at": "2026-09-22T08:57:25.243722+00:00",
+  "updated_at": "2026-09-22T08:57:25.248282+00:00"
+}

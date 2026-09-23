@@ -1,0 +1,18 @@
+{
+  "session_id": "a45992a7-b099-427b-bbb3-29b09e06e8fa",
+  "history": [
+    {
+      "role": "user",
+      "content": "hi nova how are you",
+      "timestamp": "2026-08-24T22:54:15.995120+00:00"
+    },
+    {
+      "role": "assistant",
+      "content": "Hi there! I'm Nova, and I'm doing great. How can I help you today? 😊",
+      "timestamp": "2026-08-24T22:54:15.998106+00:00"
+    }
+  ],
+  "summary": "hi nova how are you",
+  "created_at": "2026-08-24T22:54:15.995066+00:00",
+  "updated_at": "2026-08-24T22:54:15.998114+00:00"
+}

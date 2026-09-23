@@ -1,0 +1,18 @@
+{
+  "session_id": "edde64eb-081d-423e-99b6-1013c7247bb6",
+  "history": [
+    {
+      "role": "user",
+      "content": "Hi Nova, can you schedule an event for tomorrow the whole day called Holidays?",
+      "timestamp": "2026-08-25T20:09:23.875256+00:00"
+    },
+    {
+      "role": "assistant",
+      "content": "Sorry, 'gc_create_event' failed: I couldn't complete that calendar task.",
+      "timestamp": "2026-08-25T20:09:23.875837+00:00"
+    }
+  ],
+  "summary": "Hi Nova, can you schedule an event for tomorrow the whole day called Holidays?",
+  "created_at": "2026-08-25T20:09:23.875229+00:00",
+  "updated_at": "2026-08-25T20:09:23.875846+00:00"
+}

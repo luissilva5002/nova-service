@@ -1,0 +1,18 @@
+{
+  "session_id": "6fa36944-fc8d-488e-bec0-da756fda65d0",
+  "history": [
+    {
+      "role": "user",
+      "content": "Hey Nova, how are you doing today?",
+      "timestamp": "2026-08-23T00:17:13.022044+00:00"
+    },
+    {
+      "role": "assistant",
+      "content": "# NG Sports  NG Sports is a sports technology startup developing smart hardware and software for tennis players.",
+      "timestamp": "2026-08-23T00:17:13.043704+00:00"
+    }
+  ],
+  "summary": "Hey Nova, how are you doing today?",
+  "created_at": "2026-08-23T00:17:13.022020+00:00",
+  "updated_at": "2026-08-23T00:17:13.043710+00:00"
+}

@@ -1,0 +1,28 @@
+{
+  "session_id": "69e5f0b9-6b57-4785-9ca1-4bb2181da490",
+  "history": [
+    {
+      "role": "user",
+      "content": "Can you play in the end by linking park?",
+      "timestamp": "2026-08-23T17:46:38.412770+00:00"
+    },
+    {
+      "role": "assistant",
+      "content": "I'm not sure what you mean by \"linking park.\" Could you please clarify what you're asking for? Are you looking for a song or a track that's associated with a park, or something else?",
+      "timestamp": "2026-08-23T17:46:38.449047+00:00"
+    },
+    {
+      "role": "user",
+      "content": "Play the song in the end by Linking Park.",
+      "timestamp": "2026-08-23T17:47:06.917824+00:00"
+    },
+    {
+      "role": "assistant",
+      "content": "Playing \"Opening In the End\" by Linkin Park on your device.",
+      "timestamp": "2026-08-23T17:47:06.956596+00:00"
+    }
+  ],
+  "summary": "Play the song in the end by Linking Park.",
+  "created_at": "2026-08-23T17:46:38.412743+00:00",
+  "updated_at": "2026-08-23T17:47:06.956602+00:00"
+}

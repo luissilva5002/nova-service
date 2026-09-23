@@ -1,0 +1,18 @@
+{
+  "session_id": "a0b5f4e8-570a-4b4b-9c2e-c2dc7ba7a2a2",
+  "history": [
+    {
+      "role": "user",
+      "content": "where do I study at?",
+      "timestamp": "2026-08-22T19:53:20.066900+00:00"
+    },
+    {
+      "role": "assistant",
+      "content": "I don't have access to your personal information, including where you study. Could you please provide more context or clarify your question?",
+      "timestamp": "2026-08-22T19:53:20.115494+00:00"
+    }
+  ],
+  "summary": "where do I study at?",
+  "created_at": "2026-08-22T19:53:20.066863+00:00",
+  "updated_at": "2026-08-22T19:53:20.115499+00:00"
+}
