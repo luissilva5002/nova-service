@@ -2,17 +2,13 @@
 nova/memory/vault_store.py
 
 PERSISTENT MEMORY storage engine: an Obsidian-compatible Markdown vault on
-disk, replacing the old SQLite entity-graph/flat-fact persistence for
-long-term memory. Two categories model a "digital twin" of durable
-knowledge about the user:
+disk, retaining filesystem storage only for local preferences:
 
   preferences/   non-tangible behavioral/procedural preferences
-  knowledge/     tangible facts, user profile, subject-matter notes
 
-This module is a pure file-I/O driver. OUT OF SCOPE: nova/memory/
-session_memory.py (short-term, per-session JSON) is untouched and remains
-the active conversational context store - this module never reads or
-writes session state.
+Knowledge notes and profile fields are accessed through the separate
+WebObsidian Agent API client. OUT OF SCOPE: nova/memory/session_memory.py
+(short-term, per-session JSON) remains untouched.
 """
 import logging
 import re
@@ -22,19 +18,24 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-import hashlib
 
 from nova.config import PERSISTENT_MEMORY_VAULT_DIR
+from nova.memory.knowledge_client import (
+    knowledge_path_for_box,
+    read_knowledge,
+    search_knowledge,
+    write_knowledge,
+)
+from nova.memory.query_utils import MEMORY_WRITE_QUERY, extract_memory_keywords
 
 logger = logging.getLogger("nova.vault_store")
 
 _lock = threading.RLock()
 
 PREFERENCES_DIR = PERSISTENT_MEMORY_VAULT_DIR / "preferences"
-KNOWLEDGE_DIR = PERSISTENT_MEMORY_VAULT_DIR / "knowledge"
 
-_WIKILINK_PATTERN = re.compile(r"\[\[([^\]#|]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
 _FRONTMATTER_PATTERN = re.compile(r"\A---\n(.*?)\n---\n?", re.S)
+_WIKILINK_PATTERN = re.compile(r"\[\[([^\]#|]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
 
 _RESERVED_FRONTMATTER_KEYS = {"title", "category", "created", "updated", "tags", "linked_notes"}
 
@@ -45,25 +46,12 @@ def _slugify(name: str) -> str:
 
 
 def _note_path(category: str, box: str, subcategory: Optional[str] = None) -> Path:
-    if category not in ("preferences", "knowledge", "user"):
+    if category != "preferences":
         raise ValueError(f"Unknown vault category: {category!r}")
-    if category == "preferences":
-        root = PREFERENCES_DIR
-    elif category == "knowledge":
-        root = KNOWLEDGE_DIR
-    else:
-        root = PERSISTENT_MEMORY_VAULT_DIR / "user"
     slug = _slugify(box)
     if subcategory:
-        return root / _slugify(subcategory) / f"{slug}.md"
-    return root / f"{slug}.md"
-
-
-def _paired_note_path(category: str, box: str) -> Path:
-    """Path of the note in the OTHER category with the same box name, used
-    for auto-linking (spec: paired preferences<->knowledge nodes)."""
-    other = "preferences" if category == "knowledge" else "knowledge"
-    return _note_path(other, box)
+        return PREFERENCES_DIR / _slugify(subcategory) / f"{slug}.md"
+    return PREFERENCES_DIR / f"{slug}.md"
 
 
 def _resolve_existing_note_path(path: Path) -> Path:
@@ -145,62 +133,17 @@ def _append_entry(body: str, content: str) -> str:
     return body + "\n## Updates\n" + entry
 
 
-def _link_notes(frontmatter: dict, linked_title: str) -> dict:
-    links = set(frontmatter.get("linked_notes", []) or [])
-    links.add(linked_title)
-    frontmatter["linked_notes"] = sorted(links)
-    return frontmatter
-
-
 def _write_note(path: Path, frontmatter: dict, body: str) -> None:
     frontmatter["updated"] = datetime.now(timezone.utc).isoformat()
     path.write_text(_render(frontmatter, body), encoding="utf-8")
-
-
-def _auto_link_pair(category: str, box: str, frontmatter: dict, body: str) -> str:
-    """If a paired note exists in the other category with the same box
-    name, insert bi-directional WikiLinks and update both notes'
-    linked_notes frontmatter (spec: 'Inter-Connectivity')."""
-    paired_path = _paired_note_path(category, box)
-    title = frontmatter.get("title", box)
-    if not paired_path.exists():
-        return body
-
-    paired_raw = _read_raw(paired_path) or ""
-    paired_fm, paired_body = _split_frontmatter(paired_raw)
-    paired_title = paired_fm.get("title", box)
-
-    if f"[[{paired_title}]]" not in body:
-        body = body.rstrip() + f"\n\nRelated: [[{paired_title}]]\n"
-    _link_notes(frontmatter, paired_title)
-
-    if f"[[{title}]]" not in paired_body:
-        paired_body = paired_body.rstrip() + f"\n\nRelated: [[{title}]]\n"
-    _link_notes(paired_fm, title)
-    _write_note(paired_path, paired_fm, paired_body)
-
-    return body
 
 
 def write_preference(box: str, content: str, tags: Optional[list[str]] = None) -> Path:
     with _lock:
         path, frontmatter, body = _ensure_note("preferences", box, tags=tags)
         body = _append_entry(body, content)
-        body = _auto_link_pair("preferences", box, frontmatter, body)
         _write_note(path, frontmatter, body)
         logger.info("vault_store: wrote preference box=%s", box)
-        return path
-
-
-def write_knowledge(
-    box: str, content: str, subcategory: Optional[str] = None, tags: Optional[list[str]] = None
-) -> Path:
-    with _lock:
-        path, frontmatter, body = _ensure_note("knowledge", box, subcategory=subcategory, tags=tags)
-        body = _append_entry(body, content)
-        body = _auto_link_pair("knowledge", box, frontmatter, body)
-        _write_note(path, frontmatter, body)
-        logger.info("vault_store: wrote knowledge box=%s subcategory=%s", box, subcategory)
         return path
 
 
@@ -220,8 +163,6 @@ def read_note_body(category: str, box: str, subcategory: Optional[str] = None) -
 def list_notes(category: str) -> list[dict]:
     if category == "preferences":
         root = PREFERENCES_DIR
-    elif category == "knowledge":
-        root = KNOWLEDGE_DIR
     elif category == "user":
         root = PERSISTENT_MEMORY_VAULT_DIR / "user"
     else:
@@ -254,35 +195,6 @@ def list_notes(category: str) -> list[dict]:
     return notes
 
 
-_MEMORY_STOPWORDS = {
-    "a", "an", "and", "are", "at", "be", "been", "being", "by", "can", "could",
-    "create", "do", "does", "did", "doing", "for", "from", "good", "hello", "hey",
-    "hi", "how", "i", "im", "in", "is", "it", "its", "just", "me", "memory",
-    "morning", "my", "nova", "of", "on", "or", "our", "please", "remember",
-    "save", "should", "so", "store", "sup", "that", "the", "their", "them",
-    "there", "these", "they", "this", "those", "to", "today", "up", "us", "was",
-    "we", "what", "when", "where", "who", "why", "will", "with", "would",
-    "write", "you", "your", "yours"
-}
-
-
-def _extract_memory_keywords(query: str) -> list[str]:
-    """Remove small-talk and filler tokens so a greeting like 'how are you' does
-    not trigger a memory lookup on unrelated knowledge."""
-    query = (query or "").strip().lower()
-    if not query:
-        return []
-    keywords = []
-    for token in re.split(r"\W+", query):
-        token = token.strip()
-        if len(token) <= 2:
-            continue
-        if token in _MEMORY_STOPWORDS:
-            continue
-        keywords.append(token)
-    return keywords
-
-
 def search_notes(query: str, category: Optional[str] = None, max_results: int = 5) -> list[dict]:
     """Keyword search across vault notes, using WORD-BOUNDARY matching only.
 
@@ -296,15 +208,15 @@ def search_notes(query: str, category: Optional[str] = None, max_results: int = 
     query = (query or "").strip()
     if not query:
         return []
-    if re.search(r"\b(?:remember|note that|save this|save to memory|create a memory|make a memory|store this in memory|write down)\b", query, re.I):
+    if MEMORY_WRITE_QUERY.search(query):
         return []
-    keywords = _extract_memory_keywords(query)
+    keywords = extract_memory_keywords(query)
     if not keywords:
         return []
 
     keyword_patterns = [re.compile(rf"\b{re.escape(kw)}\b", re.I) for kw in keywords]
 
-    categories = [category] if category in ("preferences", "knowledge", "user") else ["preferences", "knowledge", "user"]
+    categories = [category] if category == "preferences" else ["preferences"]
     ranked = []
     for cat in categories:
         for note in list_notes(cat):
@@ -352,11 +264,10 @@ def resolve_note_by_markdown_id(markdown_id: str) -> Optional[dict]:
     """Look up the note metadata for a markdown_id string."""
     if not markdown_id:
         return None
-    for category in ("preferences", "knowledge", "user"):
-        for note in list_notes(category):
-            path = Path(note["path"])
-            if _markdown_id_for_path(path) == markdown_id:
-                return {**note, "category": category}
+    for note in list_notes("preferences"):
+        path = Path(note["path"])
+        if _markdown_id_for_path(path) == markdown_id:
+            return {**note, "category": "preferences"}
     return None
 
 
@@ -379,30 +290,55 @@ def get_markdown_document(markdown_id: str) -> Optional[dict]:
 
 def get_profile_fields() -> dict:
     """Reads structured scalar facts (name, active_project, etc.) from
-    knowledge/user_profile.md's YAML frontmatter - the vault-backed
-    replacement for the old flat user_facts table."""
-    raw = read_note("knowledge", "user_profile")
-    if raw is None:
+    knowledge/user_profile.md's frontmatter in the WebObsidian vault."""
+    note = read_knowledge("knowledge/user_profile.md")
+    if note is None:
         return {}
-    frontmatter, _ = _split_frontmatter(raw)
+    frontmatter = note.get("frontmatter", {})
+    if not isinstance(frontmatter, dict):
+        return {}
     return {k: v for k, v in frontmatter.items() if k not in _RESERVED_FRONTMATTER_KEYS}
 
 
-def update_profile_fields(fields: dict) -> Path:
+def update_profile_fields(fields: dict) -> None:
     """Merges scalar fields (e.g. {'name': 'Luis', 'active_project': 'NOVA'})
-    into knowledge/user_profile.md's frontmatter for fast structured lookup."""
+    into knowledge/user_profile.md's WebObsidian frontmatter."""
     with _lock:
-        path, frontmatter, body = _ensure_note("knowledge", "user_profile")
+        path = knowledge_path_for_box("user_profile")
+        existing = read_knowledge(path)
+        if existing is None:
+            now = datetime.now(timezone.utc).isoformat()
+            frontmatter = {
+                "title": "User Profile",
+                "category": "knowledge",
+                "created": now,
+                "updated": now,
+                "tags": [],
+                "linked_notes": [],
+            }
+            body = "\n# User Profile\n"
+        else:
+            frontmatter = existing.get("frontmatter", {})
+            if not isinstance(frontmatter, dict):
+                frontmatter = {}
+            frontmatter = dict(frontmatter)
+            _, body = _split_frontmatter(existing["content"])
         for key, value in fields.items():
             if key in _RESERVED_FRONTMATTER_KEYS:
                 continue
             frontmatter[key] = value
-        _write_note(path, frontmatter, body)
+        frontmatter["updated"] = datetime.now(timezone.utc).isoformat()
+        frontmatter_text = yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).strip()
+        write_knowledge(path, f"---\n{frontmatter_text}\n---\n{body}")
         logger.info("vault_store: updated profile fields %s", list(fields.keys()))
-        return path
 
 
-def get_context_snippet(query: str = "", max_preference_chars: int = 800, max_knowledge_notes: int = 3) -> dict:
+def get_context_snippet(
+    query: str = "",
+    max_preference_chars: int = 800,
+    max_knowledge_notes: int = 3,
+    profile_fields: Optional[dict] = None,
+) -> dict:
     """Builds the compact context payload injected into the system prompt:
     all preference notes (meant to stay small per the architecture), plus
     targeted knowledge search results for the current query."""
@@ -415,23 +351,30 @@ def get_context_snippet(query: str = "", max_preference_chars: int = 800, max_kn
     if len(combined_preferences) > max_preference_chars:
         combined_preferences = combined_preferences[:max_preference_chars].rstrip() + "..."
 
-    knowledge_matches = search_notes(query, category="knowledge", max_results=max_knowledge_notes) if query else []
+    knowledge_matches = search_knowledge(query, max_results=max_knowledge_notes) if query else []
     full_context_blocks = []
     for match in knowledge_matches:
-        full_text = (match.get("full_text") or match.get("snippet") or "").strip()
+        raw = match.get("content")
+        if not isinstance(raw, str):
+            note_path = match.get("path")
+            note = read_knowledge(note_path) if isinstance(note_path, str) else None
+            raw = note.get("content", "") if note else ""
+        _, body = _split_frontmatter(raw)
+        full_text = (body or match.get("snippet") or "").strip()[:4000]
+        match["full_text"] = full_text
         if full_text:
-            full_context_blocks.append(f"### {match['title']}\n{full_text}")
+            full_context_blocks.append(f"### {match.get('title') or note_path}\n{full_text}")
 
     return {
-        "profile": get_profile_fields(),
+        "profile": profile_fields if profile_fields is not None else get_profile_fields(),
         "preferences": combined_preferences,
         "relevant_knowledge": knowledge_matches,
         "knowledge_context": "\n\n".join(full_context_blocks),
     }
 
 
-def get_memory_graph(max_nodes: int = 60) -> dict:
-    """Return a folder-aware graph of the memory vault.
+def get_preferences_graph(max_nodes: int = 60) -> dict:
+    """Return a folder-aware graph of local preference notes.
 
     The graph mixes two node kinds:
       - folder: a directory container
@@ -439,7 +382,8 @@ def get_memory_graph(max_nodes: int = 60) -> dict:
 
     Document nodes still include a stable markdown_id so clients can fetch the
     note content on demand, while folder nodes allow UI zooming into nested
-    memory containers.
+    preference containers. Knowledge graph and backlink data belongs to
+    WebObsidian.
     """
     import math
     from hashlib import sha1
@@ -475,13 +419,7 @@ def get_memory_graph(max_nodes: int = 60) -> dict:
             links.append({"source": parent_id, "target": folder_id, "label": "contains", "kind": "folder"})
         return folder_id
 
-    for category in ("user", "preferences", "knowledge"):
-        if category == "user":
-            root_dir = PERSISTENT_MEMORY_VAULT_DIR / "user"
-        elif category == "preferences":
-            root_dir = PREFERENCES_DIR
-        else:
-            root_dir = KNOWLEDGE_DIR
+    for category, root_dir in (("preferences", PREFERENCES_DIR),):
         if not root_dir.exists():
             continue
         category_root_id = _ensure_folder(category, ".", depth=0)
@@ -526,9 +464,8 @@ def get_memory_graph(max_nodes: int = 60) -> dict:
 
     visible = [n for n in nodes if n.get("kind") in {"folder", "document"}]
     if not visible:
-        return {"root": "user", "nodes": [], "links": []}
+        return {"root": "preferences", "nodes": [], "links": []}
 
-    folder_nodes = [n for n in visible if n["kind"] == "folder"]
     document_nodes = [n for n in visible if n["kind"] == "document"]
     count = len(visible)
 
@@ -562,4 +499,4 @@ def get_memory_graph(max_nodes: int = 60) -> dict:
         nodes = nodes[:max_nodes]
         links = [link for link in links if link["source"] in visible_ids and link["target"] in visible_ids]
 
-    return {"root": "user", "nodes": nodes, "links": links}
+    return {"root": "preferences", "nodes": nodes, "links": links}

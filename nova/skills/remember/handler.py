@@ -7,6 +7,7 @@ import logging
 import re
 
 from nova.memory import vault_store
+from nova.memory.knowledge_client import append_knowledge_entry, knowledge_path_for_box, search_knowledge
 from nova.skills.base_skill import BaseSkill
 from nova.skills.remember.tools import TOOLS
 
@@ -88,34 +89,27 @@ class RememberSkill(BaseSkill):
         tags = arguments.get("tags") if isinstance(arguments.get("tags"), list) else None
         compact = _compact_memory_fact(content)
         try:
-            vault_store.write_knowledge(box, compact, subcategory=subcategory, tags=tags)
+            append_knowledge_entry(knowledge_path_for_box(box, subcategory), compact, tags=tags)
             return "I'll be sure to remember that."
         except Exception as exc:  # pragma: no cover - best effort
             logger.exception("Failed to write knowledge note")
             return "I couldn't save that right now."
 
     def _recall(self, arguments: dict) -> str:
-        category = str(arguments.get("category") or "").strip()
-        box = arguments.get("box")
-        query = arguments.get("query")
+        query = str(arguments.get("query") or "").strip()
+        if not query:
+            return "Please provide a knowledge search query."
 
-        if category not in ("preferences", "knowledge"):
-            return "Please specify whether to look in preferences or knowledge."
-
-        if box:
-            body = vault_store.read_note_body(category, box)
-            if body is None:
-                return f"I don't have a '{box}' note in {category}."
-            return body[:600]
-
-        if query:
-            results = vault_store.search_notes(query, category=category)
-            if not results:
-                return f"I couldn't find anything matching '{query}' in {category}."
-            lines = [f"- {r['title']}: {r['snippet']}" for r in results]
-            return "Found:\n" + "\n".join(lines)
-
-        return "Please tell me a topic box name or a search query."
+        results = search_knowledge(query)
+        if not results:
+            return f"I couldn't find anything matching '{query}' in the knowledge vault."
+        sections = []
+        for result in results:
+            title = result.get("title") or result.get("path") or "Knowledge note"
+            content = result.get("content") or result.get("snippet", "")
+            if content:
+                sections.append(f"## {title}\n{content}")
+        return "Found:\n\n" + "\n\n".join(sections)
 
 
 skill = RememberSkill()

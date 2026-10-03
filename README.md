@@ -50,7 +50,28 @@ cp .env.example .env
 
 This is mounted **read-only** into the container at `/app/host_projects`.
 
-## 4. Build & run
+## 4. Configure persistent knowledge
+
+NOVA stores `persistent_memory/preferences/` locally. Knowledge notes are
+stored in WebObsidian and accessed at `http://webobsidian:8787` through its
+Agent API. Create an API key in WebObsidian **Settings → API Keys** with
+`read`, `write`, and `search` scopes, then set `AGENT_API_KEY` in Nova's
+`.env`. `AGENT_API_BASE_URL` can override the default API URL.
+
+After configuring the key, run the one-time import from the repository root:
+
+```bash
+AGENT_API_BASE_URL=http://localhost:8787/api/v1 python3 scripts/migrate_knowledge_to_vault.py
+```
+
+It reads `AGENT_API_KEY` from `.env` (or the process environment), uploads each
+local `.md` file under `persistent_memory/knowledge/` to the same `knowledge/`
+path in WebObsidian, and preserves the note text and frontmatter. It does not
+remove or archive local files; confirm the vault contents before archiving
+them yourself. When running the script inside `nova_core`, omit the
+`AGENT_API_BASE_URL` override to use the Docker-network URL.
+
+## 5. Build & run
 
 From the project root (same folder as `docker-compose.yml`):
 
@@ -91,7 +112,7 @@ directories into `models/minilm`, `models/whisper`, and `models/hf_cache`.
 Google Calendar, YouTube Music, and the port 8080 OAuth callback are the
 components that legitimately require internet access.
 
-## 5. Everyday commands
+## 6. Everyday commands
 
 | Action | Command |
 |---|---|
@@ -111,7 +132,7 @@ sudo systemctl enable docker
 `restart: unless-stopped` in `docker-compose.yml` then relaunches NOVA
 automatically whenever the Docker daemon starts.
 
-## 6. The Windows → Linux server workflow
+## 7. The Windows → Linux server workflow
 
 This is fully supported and is how you should develop:
 
@@ -133,7 +154,7 @@ entirely on `docker compose` commands, which handle this automatically
 for you (the Dockerfile/compose files don't care about your editor's
 line endings).
 
-## 7. Project layout
+## 8. Project layout
 
 ```
 nova_system/
@@ -169,7 +190,7 @@ nova_system/
 └── web_ui/                # dashboard: index.html, style.css, app.js
 ```
 
-## 8. Known gaps to close next (flagged honestly, not swept under the rug)
+## 9. Known gaps to close next (flagged honestly, not swept under the rug)
 
 - **Browser mic format:** `web_ui/app.js` records `audio/webm` (Opus) via
   `MediaRecorder`, but `nova/brain/stt_engine.py` expects raw PCM16 for

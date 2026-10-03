@@ -37,12 +37,12 @@
         <input type="text" id="userInput" class="hud-input" placeholder="Initiate command sequence..." onkeydown="if(event.key==='Enter') sendMsg()" />
         <button class="hud-btn" onclick="sendMsg()">Send</button>
         <button class="hud-btn" onclick="toggleDrawer()">Backlog</button>
-        <button class="hud-btn" onclick="toggleMemoryMap()">Memory Map</button>
+        <button class="hud-btn" onclick="toggleMemoryMap()">Preferences Map</button>
     </div>
 
     <div id="memoryMapPanel" class="memory-map-panel hidden">
         <div class="memory-map-header">
-            <span>// PERSISTENT MEMORY MAP</span>
+            <span>// LOCAL PREFERENCES MAP</span>
             <button class="hud-btn small" onclick="memoryGraphFocus = null; renderMemoryMap();">Root</button>
             <button class="hud-btn small" onclick="toggleMemoryMap()">Close</button>
         </div>

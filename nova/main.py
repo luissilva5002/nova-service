@@ -31,6 +31,12 @@ from nova.brain.tool_router import tool_router
 from nova.brain.intent_router import classify_intent, filter_tools_for_intent, wants_vault_context, is_small_talk
 from nova.memory.core_store import core_store
 from nova.memory import vault_store
+from nova.memory.knowledge_client import (
+    append_knowledge_entry,
+    knowledge_path_for_box,
+    read_knowledge,
+    search_knowledge,
+)
 from nova.memory.memory_agent import memory_agent
 from nova.memory.session_memory import (
     append_turn,
@@ -97,61 +103,15 @@ async def get_skills():
     return {"skills": tool_router.list_skills()}
 
 
-@app.get("/api/memory/graph")
-async def get_memory_graph():
-    """Export the persistent Obsidian-vault graph in a UI-friendly shape."""
-    return vault_store.get_memory_graph()
-
-
-@app.get('/api/memory/entity/{entity_id}')
-async def get_memory_entity(entity_id: str):
-    """Return full note details for a given graph node id.
-
-    The graph node ids are deterministic SHA1 hashes of the vault-relative
-    note path (see vault_store.get_memory_graph), so we compute the same id
-    and return structured info the client can display.
-    """
-    import hashlib
-    from pathlib import Path as _Path
-
-    for category in ("preferences", "knowledge"):
-        notes = vault_store.list_notes(category)
-        for note in notes:
-            try:
-                rel = _Path(note["path"]).relative_to(vault_store.PERSISTENT_MEMORY_VAULT_DIR)
-            except Exception:
-                rel = _Path(note["path"])
-            nid = hashlib.sha1(str(rel).encode("utf-8")).hexdigest()
-            if nid == entity_id:
-                raw = vault_store.read_note(category, note["box"], note["subcategory"])
-                frontmatter = {}
-                body = ""
-                if raw:
-                    try:
-                        fm, body = vault_store._split_frontmatter(raw)
-                        frontmatter = fm or {}
-                    except Exception:
-                        body = raw
-                excerpt = (body.strip().splitlines()[0] if body and body.strip() else "")[:800]
-                markdown_id = vault_store._markdown_id_for_path(_Path(note["path"]))
-                return {
-                    "id": nid,
-                    "markdown_id": markdown_id,
-                    "label": note.get("title") or note.get("box"),
-                    "type": category,
-                    "path": note.get("path"),
-                    "tags": frontmatter.get("tags", []),
-                    "frontmatter": {k: v for k, v in frontmatter.items() if k not in {"linked_notes"}},
-                    "linked_notes": frontmatter.get("linked_notes", []),
-                    "excerpt": excerpt,
-                    "body": body,
-                }
-    raise HTTPException(status_code=404, detail="Entity not found")
+@app.get("/api/memory/preferences/graph")
+async def get_preferences_graph():
+    """Export only the local preference graph; knowledge graphs belong to WebObsidian."""
+    return vault_store.get_preferences_graph()
 
 
 @app.get("/api/memory/markdown/{markdown_id}")
 async def get_memory_markdown(markdown_id: str):
-    """Return the markdown body and metadata for a graph node as a lightweight document payload."""
+    """Return local preference-note content for the preferences map."""
     doc = vault_store.get_markdown_document(markdown_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Markdown document not found")
@@ -261,9 +221,8 @@ def _answer_from_memory(user_text: str, facts: dict, session_history: list[dict]
     message, which meant a command like "play a song" could accidentally
     substring-match an unrelated vault note (e.g. "display"/"playback" in
     a hardware doc matching the word "play") and return that note's text
-    as NOVA's reply instead of ever calling the music tool. Gating this
-    behind intent classification, plus fixing vault_store.search_notes to
-    use word-boundary matching, closes that hole from both directions.
+    as NOVA's reply instead of ever calling the music tool. Intent gating
+    and query-keyword gating prevent unrelated turns from searching the vault.
     """
     lower = user_text.strip().lower()
 
@@ -292,7 +251,15 @@ def _answer_from_memory(user_text: str, facts: dict, session_history: list[dict]
         if artist:
             return f"Your favorite artist is {artist}."
 
-    matches = vault_store.search_notes(user_text, category="knowledge", max_results=5)
+    matches = search_knowledge(user_text, max_results=5)
+    for match in matches:
+        content = match.get("content")
+        if not isinstance(content, str):
+            path = match.get("path")
+            note = read_knowledge(path) if isinstance(path, str) else None
+            content = note.get("content") if note else ""
+        _, body = vault_store._split_frontmatter(content)
+        match["full_text"] = body.strip()[:4000]
     if matches:
         hardware_lookup = re.search(
             r"\b(?:what|which|what's|what is)\s+(?:mcu|microcontroller|chip|processor|imu|sensor|battery|antenna)\b|"
@@ -350,7 +317,7 @@ def _handle_session_commands(user_text: str, session_id: str) -> Optional[str]:
         if matched:
             fact = matched.group(1).strip().rstrip(".?! ")
             if fact:
-                vault_store.write_knowledge("project_notes", fact)
+                append_knowledge_entry(knowledge_path_for_box("project_notes"), fact)
                 return "I saved that as a project fact in my persistent memory."
 
     if re.search(r"\b(?:create|make|save|store)\s+(?:a\s+)?memory\b", lower) or re.search(r"\b(?:save|store)\s+(?:this|that)\s+to\s+memory\b", lower):
@@ -367,7 +334,7 @@ def _handle_session_commands(user_text: str, session_id: str) -> Optional[str]:
                     target_box = "user_profile"
                 elif re.search(r"\b(?:prefer|like|favorite|study|work|school|project)\b", fact, re.I):
                     target_box = "general_notes"
-                vault_store.write_knowledge(target_box, fact)
+                append_knowledge_entry(knowledge_path_for_box(target_box), fact)
                 return "I saved that memory in my persistent memory."
 
     return None
@@ -412,7 +379,7 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
 
     session_history = get_context(session_id, limit=12)
     session_summary = get_session_summary(session_id)
-    facts = vault_store.get_profile_fields()
+    facts = vault_store.get_profile_fields() if intent == "memory_recall" else {}
 
     # Memory-recall fast path: try a direct answer from profile facts /
     # vault search before involving the LLM at all. Only runs for the
@@ -441,7 +408,7 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
     relevant_facts = _select_relevant_facts(user_text, facts) if intent not in ("action_music", "action_calendar") else {}
 
     if wants_vault_context(intent):
-        vault_context = vault_store.get_context_snippet(query=user_text)
+        vault_context = vault_store.get_context_snippet(query=user_text, profile_fields=facts)
         memory_context = json.dumps(
             {
                 "chat_context_summary": session_summary,
@@ -650,10 +617,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 stream_classification = await classify_intent(user_text, llm_engine)
                 if stream_classification["intent"] == "chat":
                     history = get_context(session_id, limit=12)
-                    facts = vault_store.get_profile_fields()
                     stream_context = json.dumps({
                         "chat_context_summary": get_session_summary(session_id),
-                        "relevant_profile_fields": _select_relevant_facts(user_text, facts),
+                        "relevant_profile_fields": {},
                     }, ensure_ascii=False)
                     full_text = ""
                     pending = ""

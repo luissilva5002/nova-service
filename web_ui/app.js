@@ -155,14 +155,14 @@ async function toggleMemoryMap() {
 async function renderMemoryMap() {
     if (!memoryMapSvg) return;
     try {
-        const response = await fetch('/api/memory/graph');
-        if (!response.ok) throw new Error(`Memory graph fetch failed (${response.status})`);
+        const response = await fetch('/api/memory/preferences/graph');
+        if (!response.ok) throw new Error(`Preferences graph fetch failed (${response.status})`);
         const graph = await response.json();
         memoryGraphFocus = null;
         renderMemoryGraph(graph);
     } catch (error) {
         console.warn('Could not load memory map', error);
-        memoryMapSvg.innerHTML = '<text x="500" y="360" text-anchor="middle" fill="#e2e8f0" font-size="18">Memory map unavailable</text>';
+        memoryMapSvg.innerHTML = '<text x="500" y="360" text-anchor="middle" fill="#e2e8f0" font-size="18">Preferences map unavailable</text>';
     }
 }
 

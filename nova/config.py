@@ -132,13 +132,17 @@ VECTOR_STORE_COLLECTION = os.getenv("NOVA_VECTOR_COLLECTION", "nova_projects")
 RAG_TOP_K = int(os.getenv("NOVA_RAG_TOP_K", "2"))
 
 # --------------------------------------------------------------------------
-# Persistent Memory - Obsidian-compatible Markdown vault (long-term memory)
+# Local persistent preferences
 # --------------------------------------------------------------------------
-# Top-level (not nested under DATA_DIR) so it's easy to mount as its own
-# Docker volume and browse/edit directly with Obsidian on the host machine.
+# Preferences remain filesystem-backed in this mounted directory. Knowledge
+# notes are stored in WebObsidian and configured separately below.
 PERSISTENT_MEMORY_VAULT_DIR = Path(os.getenv("NOVA_VAULT_DIR", BASE_DIR / "persistent_memory"))
 (PERSISTENT_MEMORY_VAULT_DIR / "preferences").mkdir(parents=True, exist_ok=True)
-(PERSISTENT_MEMORY_VAULT_DIR / "knowledge").mkdir(parents=True, exist_ok=True)
+
+# Knowledge notes live in the self-hosted WebObsidian vault. Preferences
+# remain in the local persistent-memory directory.
+AGENT_API_BASE_URL = os.getenv("AGENT_API_BASE_URL", "http://webobsidian:8787/api/v1").rstrip("/")
+AGENT_API_KEY = os.getenv("AGENT_API_KEY", "").strip()
 
 # --------------------------------------------------------------------------
 # Ingestion (dynamic project ingestion / two-tier filtering)

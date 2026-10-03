@@ -48,15 +48,13 @@ TOOLS = [
     },
     {
         "name": "recall_note",
-        "description": "Search or read back a specific note from NOVA's persistent memory vault (preferences or knowledge) by topic box name.",
+        "description": "Search NOVA's WebObsidian knowledge vault for relevant notes using a natural-language query. Use this for saved facts, project details, technical notes, and patent status.",
         "parameters": {
             "type": "object",
             "properties": {
-                "category": {"type": "string", "enum": ["preferences", "knowledge"], "description": "Which vault category to look in."},
-                "box": {"type": "string", "description": "Topic box name to read directly, if known."},
-                "query": {"type": "string", "description": "Free-text search query, used if 'box' is not known/exact."},
+                "query": {"type": "string", "description": "Natural-language search query describing the knowledge to recall."},
             },
-            "required": ["category"],
+            "required": ["query"],
         },
     },
 ]

@@ -15,6 +15,7 @@ import re
 from typing import Optional
 
 from nova.memory import vault_store
+from nova.memory.knowledge_client import append_knowledge_entry, knowledge_path_for_box
 from nova.memory.core_store import core_store
 
 logger = logging.getLogger("nova.memory_agent")
@@ -172,9 +173,9 @@ class MemoryAgent:
                         if m:
                             vault_store.update_profile_fields({"name": m.group(1).strip()})
                         else:
-                            vault_store.write_knowledge(target_box, fact)
+                            append_knowledge_entry(knowledge_path_for_box(target_box), fact)
                     else:
-                        vault_store.write_knowledge(target_box, fact)
+                        append_knowledge_entry(knowledge_path_for_box(target_box), fact)
                     stored_anything = True
                     logger.info("memory_agent: stored structured profile fact target_box=%s fact=%s confidence=%s source=%s", target_box, fact, confidence, source_turn_hint)
                     continue
@@ -193,7 +194,7 @@ class MemoryAgent:
                 if "preference" in target_box.lower() or "preferences" in target_box.lower():
                     vault_store.write_preference(target_box, fact)
                 else:
-                    vault_store.write_knowledge(target_box, fact)
+                    append_knowledge_entry(knowledge_path_for_box(target_box), fact)
                 stored_anything = True
                 logger.info("memory_agent: stored structured fact target_box=%s fact=%s confidence=%s source=%s", target_box, fact, confidence, source_turn_hint)
 

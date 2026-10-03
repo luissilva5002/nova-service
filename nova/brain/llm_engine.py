@@ -59,6 +59,10 @@ class LLMEngine:
         self._loaded = False
         self._active_model_id = LLM_DEFAULT_MODEL_ID
         self._lock = asyncio.Lock()
+        self._kv_call_history: list[dict] = []
+        self._kv_active_call: Optional[dict] = None
+        self._kv_previous_tokens: list[int] = []
+        self._kv_last_tokens: list[int] = []
 
     def list_models(self) -> list[dict]:
         return [
@@ -227,9 +231,210 @@ class LLMEngine:
             except (ImportError, TypeError, AttributeError):
                 logger.warning("llama-cpp-python cache API unavailable; continuing without RAM cache.")
         self._configure_qwen3_non_thinking_mode()
+        self._install_kv_instrumentation()
         self._loaded = True
         logger.info("Brain model loaded (ctx=%s, threads=%s, load_seconds=%.3f).",
                     LLM_CONTEXT_SIZE, LLM_THREADS, time.perf_counter() - load_started)
+
+    def _install_kv_instrumentation(self) -> None:
+        if self._llm is None or getattr(self._llm, "_nova_kv_instrumented", False):
+            return
+
+        llama = self._llm
+        original_create_completion = llama._create_completion
+        original_create_chat_completion = llama.create_chat_completion
+        original_generate = llama.generate
+        original_eval = llama.eval
+        original_tokenize = llama.tokenize
+        self._kv_previous_tokens.clear()
+        self._kv_last_tokens.clear()
+
+        def message_for_token(prompt_text: str, prompt_tokens: list[int], token_index: int) -> str:
+            decoded_prefix = llama.detokenize(prompt_tokens[:token_index]).decode(
+                "utf-8", errors="ignore"
+            )
+            message_starts = list(
+                re.finditer(r"<\|im_start\|>(system|user|assistant|tool)\n", prompt_text)
+            )
+            user_count = sum(match.group(1) == "user" for match in message_starts)
+            users_seen = 0
+            visible_offset = 0
+            for index, match in enumerate(message_starts):
+                end = message_starts[index + 1].start() if index + 1 < len(message_starts) else len(prompt_text)
+                content = re.sub(r"<\|[^>]+\|>", "", prompt_text[match.end():end])
+                role = match.group(1)
+                label = "system"
+                if role == "user":
+                    users_seen += 1
+                    label = (
+                        "current user message"
+                        if users_seen == user_count
+                        else f"history turn {users_seen}"
+                    )
+                elif role in {"assistant", "tool"}:
+                    label = f"history turn {max(users_seen, 1)}"
+
+                schema = re.search(r"# Tools.*?</tools>", content, re.DOTALL)
+                if schema and visible_offset + schema.start() <= len(decoded_prefix) <= visible_offset + schema.end():
+                    return "tool schema"
+                if visible_offset <= len(decoded_prefix) < visible_offset + len(content):
+                    return label
+                visible_offset += len(content)
+            return "end of prompt" if len(decoded_prefix) >= visible_offset else "unmapped prompt text"
+
+        def measured_generate(tokens, *args, **kwargs):
+            call = self._kv_active_call
+            if call is None:
+                yield from original_generate(tokens, *args, **kwargs)
+                return
+
+            prompt_tokens = list(tokens)
+            call["prompt_token_ids"] = prompt_tokens
+            generated_tokens: list[int] = []
+            call["generated_token_ids"] = generated_tokens
+            prefill_seconds = 0.0
+            first_eval = True
+            generation_started = time.perf_counter()
+
+            def measured_eval(eval_tokens, *eval_args, **eval_kwargs):
+                nonlocal first_eval, prefill_seconds
+                started = time.perf_counter()
+                try:
+                    return original_eval(eval_tokens, *eval_args, **eval_kwargs)
+                finally:
+                    elapsed = time.perf_counter() - started
+                    if first_eval:
+                        prefill_seconds = elapsed
+                        first_eval = False
+
+            llama.eval = measured_eval
+            try:
+                for token in original_generate(tokens, *args, **kwargs):
+                    generated_tokens.append(int(token))
+                    yield token
+            finally:
+                del llama.eval
+                call["prefill_seconds"] = prefill_seconds
+                call["generation_seconds"] = time.perf_counter() - generation_started
+
+        def instrumented_create_completion(*args, **kwargs):
+            prompt = kwargs.get("prompt", args[0] if args else "")
+            call = self._kv_active_call or {
+                "prompt_text": prompt if isinstance(prompt, str) else "",
+                "prompt_token_ids": [],
+                "generated_token_ids": [],
+                "prefill_seconds": 0.0,
+                "generation_seconds": 0.0,
+            }
+            if isinstance(prompt, str):
+                call["prompt_text"] = prompt
+
+            def track_completion():
+                for completion in original_create_completion(*args, **kwargs):
+                    choice = completion.get("choices", [{}])[0]
+                    if choice.get("finish_reason") is not None:
+                        prompt_tokens = call["prompt_token_ids"]
+                        generated_tokens = call["generated_token_ids"]
+                        common = 0
+                        for old, new in zip(self._kv_previous_tokens, prompt_tokens):
+                            if old != new:
+                                break
+                            common += 1
+
+                        if self._kv_previous_tokens:
+                            first_diff = (
+                                common
+                                if common < len(self._kv_previous_tokens)
+                                or common < len(prompt_tokens)
+                                else None
+                            )
+                            first_diff_message = (
+                                message_for_token(call["prompt_text"], prompt_tokens, first_diff)
+                                if first_diff is not None and first_diff < len(prompt_tokens)
+                                else "end of prompt" if first_diff is not None else "no difference"
+                            )
+                        else:
+                            first_diff = None
+                            first_diff_message = "initial call"
+
+                        decode_seconds = max(
+                            call["generation_seconds"] - call["prefill_seconds"], 0.0
+                        )
+                        record = {
+                            "prompt_tokens": len(prompt_tokens),
+                            "reused_tokens": common,
+                            "evaluated_tokens": len(prompt_tokens) - common,
+                            "prefill_seconds": call["prefill_seconds"],
+                            "generated_tokens": len(generated_tokens),
+                            "decode_tokens_per_second": (
+                                len(generated_tokens) / decode_seconds if decode_seconds else 0.0
+                            ),
+                            "first_diff_token": first_diff,
+                            "first_diff_message": first_diff_message,
+                        }
+                        self._kv_call_history.append(record)
+                        logger.info(
+                            "KV prompt_tokens=%d reused=%d evaluated=%d prefill_s=%.3f "
+                            "generated_tokens=%d decode_tok_s=%.2f first_diff_token=%s "
+                            "first_diff_message=%s",
+                            record["prompt_tokens"],
+                            record["reused_tokens"],
+                            record["evaluated_tokens"],
+                            record["prefill_seconds"],
+                            record["generated_tokens"],
+                            record["decode_tokens_per_second"],
+                            record["first_diff_token"],
+                            record["first_diff_message"],
+                        )
+                        self._kv_previous_tokens[:] = prompt_tokens + generated_tokens
+                        self._kv_last_tokens[:] = self._kv_previous_tokens
+                    yield completion
+
+            return track_completion()
+
+        def instrumented_tokenize(text, *args, **kwargs):
+            tokens = original_tokenize(text, *args, **kwargs)
+            call = self._kv_active_call
+            if call is not None and not call["prompt_text"] and isinstance(text, bytes):
+                call["prompt_text"] = text.decode("utf-8", errors="ignore")
+            return tokens
+
+        def instrumented_chat_completion(*args, **kwargs):
+            previous_call = self._kv_active_call
+            call = {
+                "prompt_text": "",
+                "prompt_token_ids": [],
+                "generated_token_ids": [],
+                "prefill_seconds": 0.0,
+                "generation_seconds": 0.0,
+            }
+            self._kv_active_call = call
+            completed = False
+            try:
+                response = original_create_chat_completion(*args, **kwargs)
+                completed = True
+            finally:
+                if not completed:
+                    self._kv_active_call = previous_call
+
+            if kwargs.get("stream", False):
+                def track_stream():
+                    self._kv_active_call = call
+                    try:
+                        yield from response
+                    finally:
+                        self._kv_active_call = previous_call
+
+                return track_stream()
+
+            self._kv_active_call = previous_call
+            return response
+
+        llama.generate = measured_generate
+        llama._create_completion = instrumented_create_completion
+        llama.create_chat_completion = instrumented_chat_completion
+        llama.tokenize = instrumented_tokenize
+        llama._nova_kv_instrumented = True
 
     @staticmethod
     def _prewarm_file(model_path) -> None:
@@ -278,7 +483,6 @@ class LLMEngine:
             )
         async with self._lock:
             completion = await asyncio.to_thread(self._llm.create_chat_completion, **kwargs)
-        logger.info("LLM prompt_tokens=%s", completion.get("usage", {}).get("prompt_tokens", 0))
         choice = completion["choices"][0]["message"]
         metrics = self._generation_metrics(
             completion,
@@ -327,7 +531,6 @@ class LLMEngine:
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
                 max_tokens=max_tokens, temperature=0.2,
             )
-        logger.info("LLM prompt_tokens=%s", completion.get("usage", {}).get("prompt_tokens", 0))
         text = self._without_thinking(completion["choices"][0]["message"].get("content", ""))
         return text, self._generation_metrics(completion, started_at, text)
 
@@ -388,7 +591,6 @@ class LLMEngine:
                 "ttft_seconds": round((first_token_at or time.perf_counter()) - started_at, 3),
                 "decode_tokens_per_second": round(completion_tokens / elapsed, 2),
             }
-            logger.info("LLM prompt_tokens=%s", metrics["prompt_tokens"])
             yield {"type": "done", "text": self._without_thinking(output), "metrics": metrics}
 
     @staticmethod
