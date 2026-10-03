@@ -1,215 +1,192 @@
-# NOVA — Personal AI Assistant
+# NOVA AI
 
-Single-brain, local-first personal assistant: one 3B LLM (Qwen2.5-3B or
-Llama-3.2-3B) as the "brain", whisper.cpp as the "ears", Piper TTS as the
-"mouth", SQLite + ChromaDB as dual-layer memory, and a pluggable
-`skills/` directory for integrations (YouTube Music, Flutter workspace
-inspection, etc). Runs entirely in one Docker container, on Windows
-(via WSL2) or Linux, capped at ~6GB RAM for a Ryzen 3 / 8GB box.
+NOVA is a local-first personal assistant with a browser UI, a local GGUF
+language model, speech input/output, persistent memory, and optional skills.
+Docker Compose runs the service on Windows, macOS, or Linux; you do not need
+to install the Python application dependencies on your host.
 
-## 1. Prerequisites
+## Quick start from a clone
 
-- **Windows:** Docker Desktop with WSL2 backend enabled.
-- **Linux:** Docker Engine + Docker Compose plugin (`sudo apt install docker.io docker-compose-plugin`).
-- `bash`/Git-Bash or WSL on Windows, to run the model-download script.
-- ~3GB free disk for model weights (not included in this zip — see step 2).
+### 1. Install prerequisites
 
-## 2. Download the models
+- Git.
+- Docker Desktop on Windows/macOS, or Docker Engine and the Docker Compose
+  plugin on Linux. Start Docker before continuing.
+- An internet connection for the initial model downloads.
+- Several GB of free disk space for model files and caches. Docker also needs
+  enough memory for the container; the example limit is 6 GB.
 
-Models are **not** baked into the Docker image (keeps the image small and
-avoids re-downloading gigabytes every rebuild). They're host-mounted via
-`./models`. Run once:
+### 2. Clone the repository
 
-```bash
+Run these commands in PowerShell, Terminal, or a Linux shell:
+
+```text
+git clone https://github.com/luissilva5002/nova-service.git
+cd nova-service
+```
+
+### 3. Create the local environment file
+
+Copy the example file using the shell you are using:
+
+**Windows PowerShell**
+
+```powershell
+Copy-Item .env.example .env
+```
+**macOS, Linux, or WSL**
+
+```sh
+cp .env.example .env
+```
+
+The example selects the Qwen2.5-3B model downloaded in the next step and
+allows first-run downloads for the speech and intent-classifier models. Review
+`.env` before starting. It is ignored by Git and is the place for local paths
+and optional API keys; never commit it.
+
+### 4. Download the base model and voice files
+
+From the repository root, use the native script for your operating system:
+
+**Windows PowerShell**
+
+```powershell
+.\scripts\download_models.ps1
+```
+
+**macOS, Linux, or WSL**
+
+```sh
 bash scripts/download_models.sh
 ```
 
-This fetches into `models/`:
-- `brain/qwen2.5-3b-instruct-q4_k_m.gguf` (~2.2GB) — swap for a Llama 3.2 3B
-  GGUF if you prefer that brain (just update `NOVA_LLM_MODEL_PATH`)
-- `whisper/ggml-base.en.bin` (~150MB)
-- `piper/en_US-lessac-medium.onnx` + `.json` (~60MB) — browse more voices at
-  https://rhasspy.github.io/piper-samples/
+These scripts download Qwen2.5-3B, a legacy `whisper.cpp` model file, and the
+Piper voice into `models/`. NOVA currently uses `faster-whisper`, not the
+downloaded `whisper.cpp` file. The example `.env` points faster-whisper at a
+separate model directory and sets `NOVA_OFFLINE=0`, so the first container
+startup can fetch the compatible faster-whisper and intent-classifier
+artifacts. Keep network access enabled for that first startup. For a strictly
+offline install, prepare the complete model directories expected by the
+application first; the base downloader alone does not prepare them.
 
-If the download step fails on your network, download manually from the
-URLs in `scripts/download_models.sh` and place the files in the same
-paths — nothing else needs to change.
+### 5. Create Compose's shared network
 
-## 3. Configure your projects folder (optional, for the Flutter/codebase skill)
+The Compose file uses an external network named `nova-net` so NOVA can
+optionally connect to services such as WebObsidian. Create it once per Docker
+installation.
 
-Copy `.env.example` to `.env` and point `NOVA_HOST_PROJECTS_PATH` at the
-folder that contains the project folders you want NOVA to search/read
-(e.g. your Flutter apps):
+**PowerShell**
 
-```bash
-cp .env.example .env
-# then edit .env, e.g.:
-# NOVA_HOST_PROJECTS_PATH=C:/Users/Luis/dev        (Windows)
-# NOVA_HOST_PROJECTS_PATH=/home/luis/dev           (Linux)
+```powershell
+docker network inspect nova-net *> $null
+if ($LASTEXITCODE -ne 0) { docker network create nova-net }
 ```
 
-This is mounted **read-only** into the container at `/app/host_projects`.
+**macOS/Linux/WSL**
 
-## 4. Configure persistent knowledge
-
-NOVA stores `persistent_memory/preferences/` locally. Knowledge notes are
-stored in WebObsidian and accessed at `http://webobsidian:8787` through its
-Agent API. Create an API key in WebObsidian **Settings → API Keys** with
-`read`, `write`, and `search` scopes, then set `AGENT_API_KEY` in Nova's
-`.env`. `AGENT_API_BASE_URL` can override the default API URL.
-
-After configuring the key, run the one-time import from the repository root:
-
-```bash
-AGENT_API_BASE_URL=http://localhost:8787/api/v1 python3 scripts/migrate_knowledge_to_vault.py
+```sh
+docker network inspect nova-net >/dev/null 2>&1 || docker network create nova-net
 ```
 
-It reads `AGENT_API_KEY` from `.env` (or the process environment), uploads each
-local `.md` file under `persistent_memory/knowledge/` to the same `knowledge/`
-path in WebObsidian, and preserves the note text and frontmatter. It does not
-remove or archive local files; confirm the vault contents before archiving
-them yourself. When running the script inside `nova_core`, omit the
-`AGENT_API_BASE_URL` override to use the Docker-network URL.
+### 6. Build and start NOVA
 
-## 5. Build & run
+From the repository root:
 
-From the project root (same folder as `docker-compose.yml`):
-
-```bash
-docker compose build
-docker compose up -d
+```text
+docker compose config -q
+docker compose up --build -d
+docker compose logs -f nova_server
 ```
 
-Check it booted correctly:
+Wait for the startup logs, then open **http://localhost:8000**. The API status
+endpoint is **http://localhost:8000/api/status**. Stop following logs with
+Ctrl+C; the container continues running.
 
-```bash
-docker compose logs -f
-```
+If the status reports a missing model or a component in stub mode, check
+`.env`, confirm the corresponding files exist under `models/`, and inspect
+`docker compose logs nova_server`.
 
-You should see NOVA log the models it loaded (or "STUB mode" warnings if
-a model file is missing — the server still boots and is testable without
-models, it just echoes input instead of doing real inference).
+## Configure your installation
 
-Open the dashboard: **http://localhost:8000**
-WebSocket endpoint (used by the Flutter app too): **ws://<server-ip>:8000/ws/chat**
+### Local projects (optional)
 
-## Performance tuning
+`NOVA_HOST_PROJECTS_PATH` in `.env` points to the directory containing project
+folders that the workspace skill may inspect. The directory is mounted
+read-only in the container.
 
-The CPU-oriented defaults use four llama.cpp threads, a 512-token batch, a
-4096-token context, and a 512 MB prompt KV cache. These can be adjusted with
-`NOVA_LLM_THREADS`, `NOVA_LLM_THREADS_BATCH`, `NOVA_LLM_BATCH`,
-`NOVA_LLM_CTX`, `NOVA_LLM_FLASH_ATTN`, `NOVA_LLM_MLOCK`,
-`NOVA_LLM_KV_CACHE_TYPE`, `NOVA_LLM_CACHE_MB`, `NOVA_LLM_TEMP_TOOLS`,
-`NOVA_LLM_MAX_TOKENS_CHAT`, `NOVA_LLM_MAX_TOKENS_TOOL`, and
-`NOVA_LLM_CONFIRMATIONS`; see `.env.example` for defaults. Streaming is
-opt-in per WebSocket text message with `"stream": true`.
+- Windows: use a Docker Desktop-visible path such as
+  `C:/Users/you/dev`.
+- macOS: use a path such as `/Users/you/dev`.
+- Linux: use a path such as `/home/you/dev`.
 
-After upgrading the host from 8 GB to 12 GB RAM, raise `NOVA_MEM_LIMIT` to
-approximately `9g` or `10g` if the host has enough headroom.
+The default `./host_projects` refers to the repository's own `host_projects`
+folder.
 
-NOVA defaults to offline Hugging Face mode. Prefetch complete local model
-directories into `models/minilm`, `models/whisper`, and `models/hf_cache`.
-Google Calendar, YouTube Music, and the port 8080 OAuth callback are the
-components that legitimately require internet access.
+### Models and offline operation
 
-## 6. Everyday commands
+`NOVA_LLM_MODEL` selects one of the model IDs in `nova/config.py`. The general
+model downloader provides `qwen2.5-3b`; choose another ID only after placing
+that model's GGUF under `models/brain/`. The app's code default is `qwen3-1.7b`,
+so the provided `.env.example` explicitly selects `qwen2.5-3b`.
+
+For offline operation, set `NOVA_OFFLINE=1` only after preparing the complete
+local faster-whisper and MiniLM model assets at the configured paths. The
+`.env.example` uses `NOVA_OFFLINE=0` for first-run downloads. The file
+`models/whisper/ggml-base.en.bin` downloaded by the base script is a
+whisper.cpp model and is not a substitute for faster-whisper's CTranslate2
+model directory.
+
+### Optional integrations
+
+- **WebObsidian memory:** set `AGENT_API_KEY` in `.env` using an API key with
+  read, write, and search scopes. The default API URL expects a service named
+  `webobsidian` on the shared Docker network; set `AGENT_API_BASE_URL` if it
+  is elsewhere. `scripts/migrate_knowledge_to_vault.py` can import existing
+  local Markdown notes when configured.
+- **Google Calendar:** follow the Google OAuth setup for your Google Cloud
+  credentials, then use `scripts/get_google_token.py` to save a token. Keep
+  credentials and token files local and out of Git.
+- **YouTube Music:** the skill is optional and may need account/device
+  configuration beyond the base setup.
+
+NOVA has no authentication on its HTTP or WebSocket endpoints. Keep port 8000
+on a trusted network; do not expose the service directly to the public
+internet.
+
+## Everyday commands
+
+Run from the repository root:
 
 | Action | Command |
 |---|---|
-| Build image | `docker compose build` |
-| Start in background (auto-restarts on reboot) | `docker compose up -d` |
-| Stream live logs | `docker compose logs -f` |
+| Check Compose configuration | `docker compose config -q` |
+| Start | `docker compose up -d` |
+| Follow logs | `docker compose logs -f nova_server` |
 | Stop | `docker compose down` |
-| Rebuild after code changes | `docker compose up -d --build` |
-| Open a shell inside the container | `docker compose exec nova_server bash` |
+| Rebuild and restart after code changes | `docker compose up --build -d` |
+| Open a shell in the service container | `docker compose exec nova_server bash` |
 
-Enable Docker to auto-start on Linux boot (only needed once):
+To update an existing clone, run `git pull` and then
+`docker compose up --build -d`. Model and persistent data directories are
+host-mounted and are not included in the Git repository.
 
-```bash
-sudo systemctl enable docker
+## Script index
+
+See [`scripts/README.md`](scripts/README.md) for a categorized list of
+download, startup, maintenance, diagnostic, and KV-cache scripts. Existing
+script paths are kept stable so commands and links do not need to change.
+
+## Repository layout
+
+```text
+nova/          Application code: API, engine, memory, skills, ingestion
+web_ui/        Browser user interface
+models/        Local model weights and caches (not committed)
+data/          Local databases and runtime data (not committed)
+persistent_memory/
+               Local notes and credentials (not committed)
+host_projects/ Optional read-only project mount
+scripts/       Setup and developer/maintenance scripts
+docs/          Protocol, diagnostics, and implementation notes
 ```
-
-`restart: unless-stopped` in `docker-compose.yml` then relaunches NOVA
-automatically whenever the Docker daemon starts.
-
-## 7. The Windows → Linux server workflow
-
-This is fully supported and is how you should develop:
-
-1. **Develop on Windows.** Run Docker Desktop (WSL2), build/test at
-   `http://localhost:8000`, iterate on the web UI and skills.
-2. **Transfer via USB.** Copy the whole `nova_system/` project folder
-   (including the now-downloaded `models/` folder — this saves you from
-   re-downloading gigabytes on the server) onto a USB drive.
-3. **Deploy on Linux.** Plug the USB into your server, copy the folder to
-   e.g. `/opt/nova` or `~/nova`, then:
-   ```bash
-   cd /opt/nova
-   docker compose up -d --build
-   ```
-
-**Line-ending gotcha:** if you create any shell scripts, save them with
-LF (Linux) line endings rather than CRLF (Windows), or just rely
-entirely on `docker compose` commands, which handle this automatically
-for you (the Dockerfile/compose files don't care about your editor's
-line endings).
-
-## 8. Project layout
-
-```
-nova_system/
-├── docker-compose.yml
-├── Dockerfile
-├── requirements.txt
-├── .env.example
-├── models/              # host-mounted GGUF/ONNX weights (gitignored)
-├── data/                # host-mounted SQLite + ChromaDB storage (gitignored)
-├── host_projects/        # host-mounted, read-only, your source projects
-├── scripts/
-│   └── download_models.sh
-├── nova/                 # backend brain & router
-│   ├── main.py            # FastAPI app, WebSocket pipeline
-│   ├── config.py
-│   ├── brain/
-│   │   ├── llm_engine.py    # llama.cpp bindings + tool calling
-│   │   ├── stt_engine.py    # whisper.cpp + filler-word stripping
-│   │   ├── tts_engine.py    # Piper streaming synthesis
-│   │   └── tool_router.py   # schema aggregation + skill dispatch
-│   ├── memory/
-│   │   ├── core_store.py    # SQLite: user facts, project profiles
-│   │   ├── vector_store.py  # ChromaDB: project/code embeddings
-│   │   └── memory_agent.py  # async background fact extraction
-│   ├── ingestion/
-│   │   ├── project_scanner.py  # directory tree builder
-│   │   ├── llm_filter.py       # LLM-classified ignore rules (cached)
-│   │   └── pipeline.py         # orchestrates scan -> filter -> embed
-│   └── skills/
-│       ├── base_skill.py
-│       ├── youtube_music/      # example skill: tools.py + handler.py
-│       └── flutter_workspace/  # example skill: codebase search/read
-└── web_ui/                # dashboard: index.html, style.css, app.js
-```
-
-## 9. Known gaps to close next (flagged honestly, not swept under the rug)
-
-- **Browser mic format:** `web_ui/app.js` records `audio/webm` (Opus) via
-  `MediaRecorder`, but `nova/brain/stt_engine.py` expects raw PCM16 for
-  whisper.cpp. You'll need an `ffmpeg`-based conversion step (webm → PCM16
-  mono 16kHz) in the WebSocket handler before transcription — `ffmpeg` is
-  already installed in the Docker image for this. This is a decode step,
-  not an architecture change.
-- **`ytm_play` / `ytm_skip` / etc. in `skills/youtube_music/handler.py`**
-  are stubs with `# TODO` markers — wire up `ytmusicapi` or your device
-  bridge of choice.
-- **Piper sample rate in `app.js`** is hardcoded to 22050Hz for the WAV
-  header on playback — confirm this matches whichever voice's `.onnx.json`
-  you actually use (the `sample_rate` field), or read it dynamically.
-- **No auth** on the WebSocket/REST endpoints yet — fine on a private LAN,
-  but add a token check before exposing port 8000 beyond your home network.
-- **llama-cpp-python tool-calling format** varies slightly by version;
-  `generate_with_tools()` targets the OpenAI-style `tools=[...]` API — pin
-  a known-good version in `requirements.txt` if you hit schema errors.
-
-This is a working skeleton end-to-end (it boots and serves the UI even
-without models present, via STUB mode), not a finished product — exactly
-where you wanted to start debugging and iterating.
