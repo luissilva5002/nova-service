@@ -1,0 +1,99 @@
+name: Platform smoke checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host-checks:
+    name: Host setup checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare local environment
+        shell: bash
+        run: cp .env.example .env
+
+      - name: Validate Compose configuration
+        shell: bash
+        run: docker compose config -q
+
+      - name: Check POSIX downloader syntax
+        shell: bash
+        run: |
+          bash -n scripts/download_models.sh
+          bash -n scripts/download_brain_models.sh
+          bash tests/test_download_models.sh
+
+      - name: Check PowerShell downloader syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $null = [scriptblock]::Create((Get-Content scripts/download_models.ps1 -Raw))
+
+  linux-image:
+    name: Linux image (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: nova:platform-smoke
+
+      - name: Verify application imports
+        run: >-
+          docker run --rm
+          --platform ${{ matrix.platform }}
+          --entrypoint python
+          -e NOVA_OFFLINE=1
+          nova:platform-smoke
+          -c "from nova.main import app; assert app.title == 'NOVA Core API'"
+
+      - name: Verify API starts without downloaded models
+        if: matrix.platform == 'linux/amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name nova-platform-smoke \
+            --publish 127.0.0.1:8000:8000 \
+            --memory 6g \
+            --env NOVA_OFFLINE=1 \
+            --env NOVA_LLM_MODEL=qwen2.5-3b \
+            nova:platform-smoke
+          cleanup() {
+            docker logs nova-platform-smoke || true
+            docker rm --force nova-platform-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          for attempt in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:8000/api/status; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "NOVA API did not become ready within 180 seconds." >&2
+          exit 1

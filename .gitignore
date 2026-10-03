@@ -9,6 +9,7 @@ venv/
 !/models/.gitkeep
 /data/*
 !/data/.gitkeep
+/data.bak-*/
 /host_projects/*
 !/host_projects/.gitkeep
 

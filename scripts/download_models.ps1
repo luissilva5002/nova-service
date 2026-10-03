@@ -20,6 +20,13 @@ function Download-Model {
     )
 
     $partialPath = "$Destination.$([guid]::NewGuid().ToString('N')).partial"
+
+    if ((Test-Path -LiteralPath $Destination -PathType Leaf) -and
+        (Get-Item -LiteralPath $Destination).Length -gt 0) {
+        Write-Host "Already present: $([System.IO.Path]::GetFileName($Destination))"
+        return
+    }
+
     Write-Host "Downloading $([System.IO.Path]::GetFileName($Destination))..."
 
     try {

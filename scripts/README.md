@@ -15,7 +15,9 @@ here by purpose; filenames and paths remain stable.
 
 The base model downloaders do not fetch complete faster-whisper or local
 MiniLM model directories. The starter `.env.example` allows their initial
-online download. See the root README before switching NOVA to offline mode.
+online download. Both downloaders skip non-empty files and leave the previous
+destination untouched if a download fails. See the root README before
+switching NOVA to offline mode.
 
 ## Maintenance and integrations
 

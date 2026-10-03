@@ -2,7 +2,12 @@
 # volume-mounted at runtime (see docker-compose.yml), never baked into the image.
 models/
 data/
+data.bak-*/
 host_projects/
+persistent_memory/
+.env
+.env.*
+google_calendar_token.json
 
 # Python
 __pycache__/

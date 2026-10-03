@@ -28,7 +28,7 @@ services:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
-      - OMP_NUM_THREADS=${NOVA_THREADS:-4} # utilize all 4 cores of a Ryzen 3
+      - OMP_NUM_THREADS=${NOVA_THREADS:-4}
       - NOVA_HOST_PROJECTS_DIR=/app/host_projects
       - NOVA_OFFLINE=${NOVA_OFFLINE:-1}
       - HF_HUB_OFFLINE=${NOVA_OFFLINE:-1}
@@ -38,7 +38,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: ${NOVA_MEM_LIMIT:-8g} # cap RAM so the host OS never crashes
+          memory: ${NOVA_MEM_LIMIT:-6g}
     ulimits:
       memlock:
         soft: -1

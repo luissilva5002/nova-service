@@ -13,8 +13,11 @@ to install the Python application dependencies on your host.
 - Docker Desktop on Windows/macOS, or Docker Engine and the Docker Compose
   plugin on Linux. Start Docker before continuing.
 - An internet connection for the initial model downloads.
-- Several GB of free disk space for model files and caches. Docker also needs
-  enough memory for the container; the example limit is 6 GB.
+- Several GB of free disk space for model files and caches. The default
+  container memory limit is 6 GB; larger models or workloads may need more.
+- NOVA currently runs as a **Linux container** on all host operating systems.
+  On Windows and macOS, install Docker Desktop and use Linux containers. Native
+  Windows containers are not supported.
 
 ### 2. Clone the repository
 
@@ -69,12 +72,15 @@ startup can fetch the compatible faster-whisper and intent-classifier
 artifacts. Keep network access enabled for that first startup. For a strictly
 offline install, prepare the complete model directories expected by the
 application first; the base downloader alone does not prepare them.
+Both downloaders skip existing non-empty files and only replace a destination
+after a successful, non-empty download.
 
 ### 5. Create Compose's shared network
 
 The Compose file uses an external network named `nova-net` so NOVA can
 optionally connect to services such as WebObsidian. Create it once per Docker
-installation.
+installation. This step is only needed when using Compose as documented; if
+you already have a `nova-net` Docker network, keep using it.
 
 **PowerShell**
 
@@ -150,9 +156,25 @@ model directory.
 - **YouTube Music:** the skill is optional and may need account/device
   configuration beyond the base setup.
 
-NOVA has no authentication on its HTTP or WebSocket endpoints. Keep port 8000
-on a trusted network; do not expose the service directly to the public
-internet.
+NOVA has no authentication on its HTTP or WebSocket endpoints. Keep ports
+8000 and 8080 on a trusted network; do not expose the service directly to the
+public internet.
+
+## Platform support
+
+The supported deployment path is Docker's Linux-container mode on Windows,
+macOS, and Linux. The container build does not force x86-only CPU instructions,
+so it can target both `linux/amd64` and `linux/arm64` (including Apple Silicon
+through Docker Desktop). On ARM Linux, use a 64-bit ARM64 Docker host. CPU-only
+inference is the default; performance depends on the host and model.
+
+The repository's GitHub Actions checks Compose configuration and downloader
+scripts on Windows, macOS, and Linux. It builds the Linux container for both
+supported architectures, checks application imports on each, and starts an
+API smoke test on `linux/amd64`. These checks cover the project's supported
+deployment path; they do not certify every OS release, Docker version, CPU, or
+optional integration. Report the host OS/architecture and Docker version with
+environment-specific problems.
 
 ## Everyday commands
 

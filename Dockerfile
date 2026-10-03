@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 # --- Install system dependencies & C++ build tools ---
-# build-essential/cmake/git: compile llama.cpp / whisper.cpp CPU kernels (AVX2/FMA)
+# Avoid forcing x86-only flags; the image can be built for amd64 and arm64.
 # ffmpeg: audio format conversion (e.g. webm/opus from browser mic -> PCM)
 # libsqlite3-dev: SQLite core memory store
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -17,9 +17,6 @@ WORKDIR /app
 
 # --- Upgrade pip and install core requirements ---
 COPY requirements.txt .
-# CMAKE_ARGS enables AVX2/FMA CPU optimizations when llama-cpp-python
-# and whisper-cpp-python compile their native extensions from source.
-ENV CMAKE_ARGS="-DGGML_AVX2=on -DGGML_FMA=on"
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
