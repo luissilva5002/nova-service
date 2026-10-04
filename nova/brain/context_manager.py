@@ -82,6 +82,14 @@ class _Turn:
     segments: list[list[int]]  # segments[0] is the user segment as shown to the model
 
 
+@dataclass
+class LoadReport:
+    turns_loaded: int
+    turns_dropped: int
+    messages_skipped: int
+    tokens: int
+
+
 class ContextManager:
     def __init__(
         self,
@@ -105,6 +113,7 @@ class ContextManager:
         self.template_note = ""  # why the fallback was used, if it was
         self._started = False
         self._turn: Optional[_Turn] = None
+        self._history_loaded = False
 
     # ---------- session ----------
 
@@ -170,6 +179,84 @@ class ContextManager:
 
     def abort_turn(self) -> None:
         self._turn = None
+
+    @property
+    def end_of_turn_id(self) -> int:
+        if not self._started:
+            raise RuntimeError("Call start_session() first.")
+        return self._suffix_ids[0]
+
+    def load_history(self, messages: list[dict], max_fraction: float = 0.5) -> LoadReport:
+        """Rebuild a fresh session's token history from persisted user/assistant text."""
+        self._require_started()
+        if self._turn is not None:
+            raise RuntimeError("Cannot load history while a turn is open.")
+        if self._history_loaded or self._history != self._system_ids:
+            raise RuntimeError("History can only be loaded once into a fresh session.")
+        if not 0.0 <= max_fraction <= 1.0:
+            raise ValueError("max_fraction must be between 0.0 and 1.0.")
+        if not messages:
+            self._history_loaded = True
+            return LoadReport(
+                turns_loaded=0,
+                turns_dropped=0,
+                messages_skipped=0,
+                tokens=0,
+            )
+
+        skipped = 0
+        turns: list[tuple[bool, list[int]]] = []
+        current_turn: Optional[list[int]] = None
+
+        for message in messages:
+            if not isinstance(message, dict):
+                skipped += 1
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            if role not in ("user", "assistant") or not isinstance(content, str) or not content.strip():
+                skipped += 1
+                continue
+
+            if role == "user":
+                current_turn = self._b.encode(self._user_segment(content))
+                turns.append((True, current_turn))
+            else:
+                assistant_segment = self._gen_ids + self._close(self._b.encode(content))
+                if current_turn is None:
+                    turns.append((False, assistant_segment))
+                else:
+                    current_turn.extend(assistant_segment)
+
+        budget = int(max_fraction * (self._n_ctx - self._gen_reserve))
+        kept_turns = list(turns)
+        turns_dropped = 0
+
+        def token_total(units: list[tuple[bool, list[int]]]) -> int:
+            return len(self._system_ids) + sum(len(ids) for _, ids in units)
+
+        while token_total(kept_turns) > budget and kept_turns:
+            is_user_turn, _ = kept_turns.pop(0)
+            if is_user_turn:
+                turns_dropped += 1
+            while kept_turns and not kept_turns[0][0]:
+                kept_turns.pop(0)
+
+        if token_total(kept_turns) > budget:
+            raise ContextOverflow(
+                f"System prompt {len(self._system_ids)} exceeds history budget {budget}."
+            )
+
+        self._history = list(self._system_ids)
+        for _, ids in kept_turns:
+            self._history.extend(ids)
+        self._history_loaded = True
+        return LoadReport(
+            turns_loaded=sum(1 for is_user_turn, _ in kept_turns if is_user_turn),
+            turns_dropped=turns_dropped,
+            messages_skipped=skipped,
+            tokens=len(self._history),
+        )
 
     # ---------- size ----------
 

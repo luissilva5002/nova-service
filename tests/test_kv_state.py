@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from nova.config import LLM_MODELS, NOVA_PERSONA_PROMPT
 from nova.brain import kv_state
 from nova.brain.kv_state import (
+    live_meta,
     load_snapshot_for,
     restore_snapshot,
     save_snapshot,
@@ -356,6 +357,56 @@ class KvStateTests(unittest.TestCase):
             f"T7: llama-cpp-python={self.version}, "
             f"n_tokens_after_reset={n_tokens_after_reset}, "
             f"recovery_generated={len(generated)}"
+        )
+
+    @unittest.skipUnless(
+        os.environ.get("KV_TEST_TWO_INSTANCES") == "1",
+        "Set KV_TEST_TWO_INSTANCES=1 to load the GGUF a second time.",
+    )
+    def test_t8_layout_mismatch_rejects_flash_attn_and_kv_types(self):
+        default_meta = live_meta(self.llama)
+        alternate_llama = llama_cpp.Llama(
+            model_path=str(MODEL_PATH),
+            n_ctx=1024,
+            flash_attn=True,
+            type_k=8,
+            type_v=8,
+            verbose=False,
+        )
+        try:
+            alternate_meta = live_meta(alternate_llama)
+            layout_keys = (
+                "flash_attn",
+                "type_k",
+                "type_v",
+                "rope_freq_base",
+                "rope_freq_scale",
+            )
+            print(
+                "T8 default layout: "
+                + ", ".join(f"{key}={default_meta[key]!r}" for key in layout_keys)
+            )
+            print(
+                "T8 alternate layout: "
+                + ", ".join(f"{key}={alternate_meta[key]!r}" for key in layout_keys)
+            )
+            for key in ("flash_attn", "type_k", "type_v"):
+                self.assertNotEqual(default_meta[key], alternate_meta[key], key)
+
+            self._seed_lane()
+            snap = save_snapshot(self.llama)
+
+            with self.assertRaises(ValueError) as raised:
+                restore_snapshot(alternate_llama, snap)
+            message = str(raised.exception)
+            for key in ("flash_attn", "type_k", "type_v"):
+                self.assertIn(key, message)
+        finally:
+            alternate_llama.close()
+
+        print(
+            f"T8: llama-cpp-python={self.version}, n_tokens={snap.n_tokens}, "
+            f"snapshot_bytes={snapshot_nbytes(snap)}"
         )
 
     @unittest.skipUnless(

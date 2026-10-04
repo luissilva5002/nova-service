@@ -24,6 +24,8 @@ _RESTORE_COMPATIBILITY_KEYS = (
     "flash_attn",
     "type_k",
     "type_v",
+    "rope_freq_base",
+    "rope_freq_scale",
 )
 
 
@@ -126,6 +128,16 @@ def _context_option(llama, name: str):
     return _stored_constructor_value(llama, name)
 
 
+def _flash_attn_value(llama):
+    flash_attn_type = _context_option(llama, "flash_attn_type")
+    if flash_attn_type is not None:
+        return int(flash_attn_type)
+    flash_attn = _context_option(llama, "flash_attn")
+    if flash_attn is not None:
+        return bool(flash_attn)
+    return None
+
+
 def live_meta(llama, extra: dict | None = None) -> dict:
     """Return model and context identity metadata for a live llama instance."""
     model_path = Path(llama.model_path)
@@ -140,9 +152,15 @@ def live_meta(llama, extra: dict | None = None) -> dict:
             "model_name": model_path.name,
             "model_size": model_size,
             "model_fingerprint": _model_fingerprint(model_path, model_size),
-            "flash_attn": _context_option(llama, "flash_attn"),
+            "flash_attn": _flash_attn_value(llama),
             "type_k": _context_option(llama, "type_k"),
             "type_v": _context_option(llama, "type_v"),
+            "rope_freq_base": (
+                float(value) if (value := _context_option(llama, "rope_freq_base")) is not None else None
+            ),
+            "rope_freq_scale": (
+                float(value) if (value := _context_option(llama, "rope_freq_scale")) is not None else None
+            ),
         }
     )
     return metadata
