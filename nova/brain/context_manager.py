@@ -143,15 +143,26 @@ class ContextManager:
 
     # ---------- turns ----------
 
-    def begin_turn(self, user_text: str, context_block: Optional[str] = None) -> list[int]:
+    def begin_turn(
+        self,
+        user_text: str,
+        context_block: Optional[str] = None,
+        context_position: str = "after",
+    ) -> list[int]:
         """Start a turn. Returns the full prompt ids for the first model call."""
         self._require_started()
         if self._turn is not None:
             raise RuntimeError("A turn is already open; commit_turn() or abort_turn() first.")
+        if context_position not in ("before", "after"):
+            raise ValueError("context_position must be 'before' or 'after'.")
         clean = self._b.encode(self._user_segment(user_text))
         shown = clean
         if context_block:
-            shown = self._b.encode(self._user_segment(f"{user_text}\n\n{context_block}"))
+            if context_position == "before":
+                shown_text = f"{context_block}\n\n{user_text}"
+            else:
+                shown_text = f"{user_text}\n\n{context_block}"
+            shown = self._b.encode(self._user_segment(shown_text))
         self._turn = _Turn(clean_user=clean, segments=[shown])
         return self._compose_or_abort()
 
@@ -176,6 +187,24 @@ class ContextManager:
             self._history += segment
         self._history += self._gen_ids + self._close(assistant_token_ids)
         self._turn = None
+
+    def append_external_turn(self, user_text: str, assistant_text: str) -> None:
+        """Append a user/assistant exchange that was answered outside the model."""
+        self._require_started()
+        if self._turn is not None:
+            raise RuntimeError("Cannot append an external turn while a turn is open.")
+        if not user_text.strip() or not assistant_text.strip():
+            raise ValueError("External user and assistant text must both be non-empty.")
+
+        user_ids = self._b.encode(self._user_segment(user_text))
+        assistant_ids = self._gen_ids + self._close(self._b.encode(assistant_text))
+        appended_ids = user_ids + assistant_ids
+        if len(self._history) + len(appended_ids) > self._n_ctx - self._gen_reserve:
+            raise ContextOverflow(
+                f"External turn would exceed history limit "
+                f"{self._n_ctx - self._gen_reserve}."
+            )
+        self._history += appended_ids
 
     def abort_turn(self) -> None:
         self._turn = None

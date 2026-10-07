@@ -123,9 +123,21 @@ class LaneManagerTests(unittest.TestCase):
             max_snapshot_bytes=max_snapshot_bytes,
         )
 
-    def generate_turn(self, manager, lane, user_text, count_eval=True):
+    def generate_turn(
+        self,
+        manager,
+        lane,
+        user_text,
+        count_eval=True,
+        context_block=None,
+        context_position="after",
+    ):
         with manager.use(lane):
-            prompt = lane.context.begin_turn(user_text)
+            prompt = lane.context.begin_turn(
+                user_text,
+                context_block=context_block,
+                context_position=context_position,
+            )
             result = None
             counter = EvalCounter(self.llama) if count_eval else None
             stream = self.generator.stream(
@@ -393,6 +405,82 @@ class LaneManagerTests(unittest.TestCase):
             with manager.use(lane):
                 pass
             self.assertEqual(manager.stats(), before)
+        self.print_stats(manager)
+
+    def _run_context_turns(self, position: str):
+        manager = self.make_manager()
+        lane = manager.chat_lane(f"context-{position}", CHAT_SPEC)
+        evaluations = []
+        context_block = "[Context]\nCurrent date: Sunday, 2026-10-04\n[/Context]"
+        for turn in range(1, 6):
+            _, evaluated = self.generate_turn(
+                manager,
+                lane,
+                f"Turn {turn}: tell me one concise detail about a park.",
+                context_block=context_block,
+                context_position=position,
+            )
+            evaluations.append(evaluated)
+            stats = manager.stats()
+            self.assertEqual(stats["cold_starts"], 1)
+            self.assertEqual(stats["swaps_in"], 0)
+            self.assertEqual(stats["swaps_out"], 0)
+        self.assertTrue(all(value < 150 for value in evaluations[1:]))
+        self.assertLessEqual(evaluations[4], evaluations[1] + 40)
+        self.print_stats(manager)
+        return manager, lane, evaluations
+
+    def test_t9_before_context_keeps_reusing_lane_prefix(self):
+        _, _, evaluations = self._run_context_turns("before")
+        self.assertEqual(len(evaluations), 5)
+
+    def test_t10_after_context_keeps_reusing_lane_prefix(self):
+        _, _, evaluations = self._run_context_turns("after")
+        self.assertEqual(len(evaluations), 5)
+
+    def test_t11_same_spec_chat_lanes_swap_and_restore(self):
+        manager = self.make_manager()
+        lane_a = manager.chat_lane("A-shared-spec", CHAT_SPEC)
+        lane_b = manager.chat_lane("B-shared-spec", CHAT_SPEC)
+        context_block = "[Context]\nCurrent date: Sunday, 2026-10-04\n[/Context]"
+
+        self.generate_turn(
+            manager,
+            lane_a,
+            "I am planning a quiet walk.",
+            context_block=context_block,
+            context_position="before",
+        )
+        self.generate_turn(manager, lane_b, "Tell me a short fact about the moon.")
+        self.assertGreaterEqual(manager.stats()["swaps_out"], 1)
+        self.assertGreaterEqual(manager.stats()["cold_starts"], 2)
+
+        _, evaluated = self.generate_turn(
+            manager,
+            lane_a,
+            "What should I bring?",
+            context_block=context_block,
+            context_position="before",
+        )
+        self.assertLess(evaluated, 150)
+        self.assertGreaterEqual(manager.stats()["swaps_in"], 1)
+        self.print_stats(manager)
+
+    def test_t12_shared_prefix_stops_inside_context_augmented_turn(self):
+        manager = self.make_manager()
+        lane = manager.chat_lane("shared-prefix", CHAT_SPEC)
+        self.generate_turn(
+            manager,
+            lane,
+            "I am planning a quiet walk.",
+            context_block="[Context]\nCurrent date: Sunday, 2026-10-04\n[/Context]",
+            context_position="after",
+        )
+
+        shared = lane.shared_prefix(self.llama)
+        self.assertGreaterEqual(shared, len(lane.context.system_ids))
+        self.assertLess(shared, self.llama.n_tokens)
+        self.assertTrue(lane.matches_llama(self.llama))
         self.print_stats(manager)
 
 

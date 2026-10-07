@@ -44,13 +44,16 @@ class Lane:
         if n_tokens <= 0:
             return False
         ids = self.context.history_ids if self.kind == "chat" else self.context.system_ids
+        return self.shared_prefix(llama) >= len(self.context.system_ids)
+
+    def shared_prefix(self, llama) -> int:
+        n_tokens = int(llama.n_tokens)
+        ids = self.context.history_ids if self.kind == "chat" else self.context.system_ids
         shared = min(n_tokens, len(ids))
-        if shared <= 0:
-            return False
-        return all(
-            int(llama.input_ids[index]) == ids[index]
-            for index in range(shared)
-        )
+        for index in range(shared):
+            if int(llama.input_ids[index]) != ids[index]:
+                return index
+        return shared
 
 
 class LaneManager:

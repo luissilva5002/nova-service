@@ -40,6 +40,8 @@ from nova.config import (
     LLM_HISTORY_TURNS,
     PREWARM_MODELS,
     LLM_GPU_LAYERS,
+    LLM_KV_LANES,
+    LLM_KV_LANES_MAX_SNAPSHOT_MB,
     NOVA_PERSONA_PROMPT,
 )
 
@@ -63,6 +65,19 @@ class LLMEngine:
         self._kv_active_call: Optional[dict] = None
         self._kv_previous_tokens: list[int] = []
         self._kv_last_tokens: list[int] = []
+        self._lanes = None
+        self._LaneEngine = None
+        self._LaneOverflow = None
+        self._GenerationParams = None
+
+    @property
+    def lanes_enabled(self) -> bool:
+        return self._lanes is not None
+
+    def lane_stats(self) -> dict:
+        if self._lanes is None:
+            return {"enabled": False}
+        return self._lanes.stats()
 
     def list_models(self) -> list[dict]:
         return [
@@ -89,6 +104,7 @@ class LLMEngine:
         if self._llm is not None and hasattr(self._llm, "close"):
             self._llm.close()
         self._llm = None
+        self._lanes = None
         self._loaded = False
         gc.collect()
         self._active_model_id = model_id
@@ -99,6 +115,7 @@ class LLMEngine:
         except Exception:
             logger.exception("Model switch failed; restoring %s.", LLM_MODELS[previous_model_id]["label"])
             self._llm = None
+            self._lanes = None
             self._loaded = False
             self._active_model_id = previous_model_id
             self.load()
@@ -232,9 +249,113 @@ class LLMEngine:
                 logger.warning("llama-cpp-python cache API unavailable; continuing without RAM cache.")
         self._configure_qwen3_non_thinking_mode()
         self._install_kv_instrumentation()
+        self._init_lanes()
         self._loaded = True
         logger.info("Brain model loaded (ctx=%s, threads=%s, load_seconds=%.3f).",
                     LLM_CONTEXT_SIZE, LLM_THREADS, time.perf_counter() - load_started)
+
+    def _init_lanes(self) -> None:
+        self._lanes = None
+        if not LLM_KV_LANES or self._llm is None:
+            return
+        try:
+            from nova.brain.generation import GenerationParams
+            from nova.brain.lane_engine import LaneEngine, LaneOverflow
+
+            self._LaneEngine = LaneEngine
+            self._LaneOverflow = LaneOverflow
+            self._GenerationParams = GenerationParams
+            if re.match(r"^qwen3(\.\d+)?-", self._active_model_id):
+                logger.warning(
+                    "KV lanes are disabled for Qwen3 models because lanes do not apply "
+                    "the Qwen3 non-thinking chat handler."
+                )
+                return
+            if hasattr(self._llm, "set_cache"):
+                self._llm.set_cache(None)
+            self._lanes = LaneEngine(
+                self._llm,
+                LLM_CONTEXT_SIZE,
+                NOVA_PERSONA_PROMPT,
+                gen_reserve=max(LLM_MAX_TOKENS_CHAT, LLM_MAX_TOKENS_TOOL) + 32,
+                max_snapshot_bytes=LLM_KV_LANES_MAX_SNAPSHOT_MB * 1024 * 1024,
+            )
+            logger.info(
+                "KV lanes enabled (max_snapshot_bytes=%d).",
+                LLM_KV_LANES_MAX_SNAPSHOT_MB * 1024 * 1024,
+            )
+        except Exception:
+            self._lanes = None
+            logger.exception("Could not initialize KV lanes; using the legacy generation path.")
+
+    def _run_llama(self, fn, **kwargs):
+        if self._lanes is None:
+            return fn(**kwargs)
+        with self._lanes.borrow():
+            return fn(**kwargs)
+
+    def _lane_context_block(self, memory_context: str) -> str:
+        context = self._current_date_context(False)
+        if memory_context:
+            context += f"\n\nKnown user context: {memory_context}"
+        return f"[Context]\n{context}\n[/Context]"
+
+    def _lane_chat_eligible(
+        self,
+        session_id: Optional[str],
+        intent: str,
+        tool_schemas: Optional[list] = None,
+    ) -> bool:
+        return bool(
+            self._lanes is not None
+            and session_id
+            and intent == "chat"
+            and not tool_schemas
+        )
+
+    def _log_lane_result(self, result) -> None:
+        metrics = result.metrics
+        logger.info(
+            "KV-LANE lane=%s prompt_tokens=%d reused=%d evaluated=%d "
+            "ttft_s=%.3f completion_tokens=%d",
+            metrics.get("lane", ""),
+            metrics.get("prompt_tokens", 0),
+            metrics.get("cache_hit_tokens", 0),
+            metrics.get("evaluated_tokens", 0),
+            metrics.get("ttft_seconds", 0.0),
+            metrics.get("completion_tokens", 0),
+        )
+
+    async def record_external_turn(
+        self,
+        session_id: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        if self._lanes is None:
+            return
+        async with self._lock:
+            try:
+                await asyncio.to_thread(
+                    self._lanes.record_external_turn,
+                    session_id,
+                    user_text,
+                    assistant_text,
+                )
+            except Exception:
+                logger.exception("Could not record external turn in KV lane %s.", session_id)
+
+    async def forget_lane(self, session_id: str) -> None:
+        if self._lanes is None:
+            return
+        async with self._lock:
+            try:
+                await asyncio.to_thread(self._lanes.forget, session_id)
+            except Exception:
+                logger.exception("Could not forget KV lane %s.", session_id)
+
+    def has_lane(self, session_id: str) -> bool:
+        return self._lanes is not None and self._lanes.has_lane(session_id)
 
     def _install_kv_instrumentation(self) -> None:
         if self._llm is None or getattr(self._llm, "_nova_kv_instrumented", False):
@@ -458,6 +579,7 @@ class LLMEngine:
         max_tokens: Optional[int] = None,
         history: Optional[list[dict]] = None,
         intent: str = "chat",
+        session_id: Optional[str] = None,
     ) -> dict:
         """
         Returns either:
@@ -472,6 +594,31 @@ class LLMEngine:
             # STUB mode (no model loaded yet) - echo back so the pipeline is testable end-to-end.
             return {"type": "text", "content": f"[stub-brain] You said: {user_text}"}
 
+        if self._lane_chat_eligible(session_id, intent, tool_schemas):
+            try:
+                async with self._lock:
+                    result = await asyncio.to_thread(
+                        self._lanes.chat,
+                        session_id,
+                        user_text,
+                        self._lane_context_block(memory_context),
+                        history or [],
+                        self._GenerationParams(max_tokens=max_tokens, temperature=0.4),
+                    )
+                self._log_lane_result(result)
+                return {
+                    "type": "text",
+                    "content": self._without_thinking(result.text),
+                    "metrics": result.metrics,
+                }
+            except Exception:
+                logger.exception("KV lane generation failed for session %s; using legacy path.", session_id)
+                async with self._lock:
+                    try:
+                        await asyncio.to_thread(self._lanes.forget, session_id)
+                    except Exception:
+                        logger.exception("Could not forget failed KV lane %s.", session_id)
+
         started_at = time.perf_counter()
         kwargs = {"messages": messages, "max_tokens": max_tokens,
                   "temperature": LLM_TEMP_TOOLS if tool_schemas else 0.4}
@@ -482,7 +629,11 @@ class LLMEngine:
                 if len(tool_schemas) == 1 else "auto"
             )
         async with self._lock:
-            completion = await asyncio.to_thread(self._llm.create_chat_completion, **kwargs)
+            completion = await asyncio.to_thread(
+                self._run_llama,
+                self._llm.create_chat_completion,
+                **kwargs,
+            )
         choice = completion["choices"][0]["message"]
         metrics = self._generation_metrics(
             completion,
@@ -527,6 +678,7 @@ class LLMEngine:
         started_at = time.perf_counter()
         async with self._lock:
             completion = await asyncio.to_thread(
+                self._run_llama,
                 self._llm.create_chat_completion,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
                 max_tokens=max_tokens, temperature=0.2,
@@ -536,7 +688,7 @@ class LLMEngine:
 
     async def stream_chat(
         self, user_text: str, memory_context: str = "", history: Optional[list[dict]] = None,
-        intent: str = "chat",
+        intent: str = "chat", session_id: Optional[str] = None,
     ) -> AsyncIterator[dict]:
         """Stream chat deltas while serializing access to the single model."""
         self.load()
@@ -544,6 +696,87 @@ class LLMEngine:
             yield {"type": "text_delta", "text": f"[stub-brain] You said: {user_text}"}
             yield {"type": "done", "metrics": {"completion_tokens": 0, "prompt_tokens": 0, "elapsed_seconds": 0.0, "total_elapsed_seconds": 0.0, "tokens_per_second": 0.0}}
             return
+
+        if self._lane_chat_eligible(session_id, intent):
+            values: asyncio.Queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+            stop = threading.Event()
+            worker: threading.Thread | None = None
+            emitted_delta = False
+            lane_error: BaseException | None = None
+            lane_result = None
+
+            def produce_lane() -> None:
+                try:
+                    for item in self._lanes.chat_stream(
+                        session_id,
+                        user_text,
+                        self._lane_context_block(memory_context),
+                        history or [],
+                        self._GenerationParams(
+                            max_tokens=LLM_MAX_TOKENS_CHAT,
+                            temperature=0.4,
+                        ),
+                        should_stop=stop.is_set,
+                    ):
+                        loop.call_soon_threadsafe(values.put_nowait, item)
+                except BaseException as exc:
+                    loop.call_soon_threadsafe(values.put_nowait, exc)
+                finally:
+                    loop.call_soon_threadsafe(values.put_nowait, None)
+
+            async with self._lock:
+                worker = threading.Thread(target=produce_lane, daemon=True)
+                worker.start()
+                try:
+                    while True:
+                        item = await values.get()
+                        if item is None:
+                            break
+                        if isinstance(item, BaseException):
+                            lane_error = item
+                            if emitted_delta:
+                                raise item
+                            break
+                        if isinstance(item, str):
+                            emitted_delta = True
+                            yield {"type": "text_delta", "text": item}
+                        else:
+                            lane_result = item
+                finally:
+                    stop.set()
+                    await asyncio.to_thread(worker.join)
+
+                if lane_error is None and lane_result is None:
+                    lane_error = RuntimeError(
+                        "KV lane stream ended without a ChatTurnResult."
+                    )
+                if lane_error is not None:
+                    logger.error(
+                        "KV lane stream failed for session %s.",
+                        session_id,
+                        exc_info=(
+                            type(lane_error),
+                            lane_error,
+                            lane_error.__traceback__,
+                        ),
+                    )
+                    if emitted_delta:
+                        raise lane_error
+                    try:
+                        await asyncio.to_thread(self._lanes.forget, session_id)
+                    except Exception:
+                        logger.exception("Could not forget failed KV lane %s.", session_id)
+
+            if lane_error is None:
+                self._log_lane_result(lane_result)
+                yield {
+                    "type": "done",
+                    "text": self._without_thinking(lane_result.text),
+                    "metrics": lane_result.metrics,
+                }
+                return
+
         messages = self._build_messages(user_text, memory_context, [], history, intent)
         values: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -551,11 +784,17 @@ class LLMEngine:
 
         def produce() -> None:
             try:
-                completion = self._llm.create_chat_completion(
-                    messages=messages, max_tokens=LLM_MAX_TOKENS_CHAT, temperature=0.4, stream=True
-                )
-                for item in completion:
-                    loop.call_soon_threadsafe(values.put_nowait, item)
+                def produce_completion() -> None:
+                    completion = self._llm.create_chat_completion(
+                        messages=messages,
+                        max_tokens=LLM_MAX_TOKENS_CHAT,
+                        temperature=0.4,
+                        stream=True,
+                    )
+                    for item in completion:
+                        loop.call_soon_threadsafe(values.put_nowait, item)
+
+                self._run_llama(produce_completion)
             except Exception as exc:
                 loop.call_soon_threadsafe(values.put_nowait, exc)
             finally:

@@ -84,6 +84,12 @@ LLM_CONFIRMATIONS = os.getenv("NOVA_LLM_CONFIRMATIONS", "false").strip().lower()
 LLM_HISTORY_TURNS = int(os.getenv("NOVA_HISTORY_TURNS", "6"))
 PREWARM_MODELS = os.getenv("NOVA_PREWARM_MODELS", "false").strip().lower() in ("1", "true", "yes", "on")
 LLM_GPU_LAYERS = int(os.getenv("NOVA_LLM_GPU_LAYERS", "0"))  # 0 = CPU only (Ryzen 3 target)
+LLM_KV_LANES = (
+    os.getenv("NOVA_KV_LANES", "false").strip().lower() in ("1", "true", "yes", "on")
+)
+LLM_KV_LANES_MAX_SNAPSHOT_MB = int(
+    os.getenv("NOVA_KV_LANES_MAX_SNAPSHOT_MB", "256")
+)
 
 # System prompt persona - Tier 1 static memory (KV-cached, ~200 tokens target)
 NOVA_PERSONA_PROMPT = os.getenv(
