@@ -91,6 +91,26 @@ LLM_KV_LANES_MAX_SNAPSHOT_MB = int(
     os.getenv("NOVA_KV_LANES_MAX_SNAPSHOT_MB", "256")
 )
 
+
+def _env_flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Action lanes (only effective when NOVA_KV_LANES is on): tool turns
+# (calendar, music, memory writes) run in a lane whose persona + tool-schema
+# prefix is prefilled once instead of on every turn.
+LLM_KV_ACTION_LANES = _env_flag("NOVA_KV_ACTION_LANES", "true")
+# Persist those prefix states to disk so a restart restores them in
+# milliseconds instead of re-running the prefill. A state is only reused when
+# the model, llama-cpp version, context settings and prompt tokens all match.
+LLM_KV_BASE_STATES = _env_flag("NOVA_KV_BASE_STATES", "true")
+KV_BASE_DIR = Path(os.getenv("NOVA_KV_BASE_DIR", DATA_DIR / "kv_base"))
+# Build or restore the action-lane prefixes in the background after startup.
+LLM_KV_PREWARM_ACTIONS = _env_flag("NOVA_KV_PREWARM_ACTIONS", "true")
+# Action turns are independent. This many most recent user/assistant exchanges
+# are shown to the model as plain text inside the [Context] block (0 = none).
+LLM_KV_ACTION_HISTORY_TURNS = int(os.getenv("NOVA_KV_ACTION_HISTORY_TURNS", "1"))
+
 # System prompt persona - Tier 1 static memory (KV-cached, ~200 tokens target)
 NOVA_PERSONA_PROMPT = os.getenv(
     "NOVA_PERSONA_PROMPT",
@@ -149,6 +169,24 @@ PERSISTENT_MEMORY_VAULT_DIR = Path(os.getenv("NOVA_VAULT_DIR", BASE_DIR / "persi
 # remain in the local persistent-memory directory.
 AGENT_API_BASE_URL = os.getenv("AGENT_API_BASE_URL", "http://webobsidian:8787/api/v1").rstrip("/")
 AGENT_API_KEY = os.getenv("AGENT_API_KEY", "").strip()
+
+# Knowledge vault switch (NOVA_VAULT_ENABLED):
+#   auto (default) - vault enabled only when AGENT_API_KEY is set. A machine
+#                    without a WebObsidian key (e.g. a test laptop) runs
+#                    without the vault; the server, which has the key, is
+#                    unchanged.
+#   1 / true / on  - always enabled. A missing key fails loudly, as before.
+#   0 / false / off - always disabled, even if a key is configured.
+# When disabled: vault reads return empty, vault writes are refused with a
+# clear error. Local preferences (PERSISTENT_MEMORY_VAULT_DIR) are unaffected.
+_VAULT_SETTING = os.getenv("NOVA_VAULT_ENABLED", "auto").strip().lower()
+if _VAULT_SETTING in ("1", "true", "yes", "on"):
+    VAULT_MODE = "on"
+elif _VAULT_SETTING in ("0", "false", "no", "off"):
+    VAULT_MODE = "off"
+else:
+    VAULT_MODE = "auto"
+VAULT_ENABLED = VAULT_MODE == "on" or (VAULT_MODE == "auto" and bool(AGENT_API_KEY))
 
 # --------------------------------------------------------------------------
 # Ingestion (dynamic project ingestion / two-tier filtering)

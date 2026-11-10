@@ -97,6 +97,12 @@ ws.onmessage = (event) => {
     } else if (payload.type === 'audio' && payload.audio_b64) {
         clearTimeout(audioFallbackTimeout); // audio arrived, cancel the fallback
         playAudioBase64(payload.audio_b64);
+    } else if (payload.type === 'error') {
+        // The server failed this turn but kept the connection open.
+        liveNovaMessage = null;
+        clearTimeout(audioFallbackTimeout);
+        appendMessage('NOVA', payload.text || 'Something went wrong. Please try again.', 'nova');
+        setUiState('idle');
     }
 };
 

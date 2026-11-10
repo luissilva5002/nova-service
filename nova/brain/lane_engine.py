@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterator
 
 from nova.brain.context_manager import ContextOverflow, LlamaBackend
@@ -43,15 +44,20 @@ class LaneEngine:
         load_fraction: float = 0.5,
         compact_fraction: float = 0.35,
         max_snapshot_bytes: int = 256 * 1024 * 1024,
+        base_state_dir: str | Path | None = None,
     ) -> None:
         self._llama = llama
         self._backend = LlamaBackend(llama)
+        self._persona = system_prompt
+        self._gen_reserve = gen_reserve
         self._manager = LaneManager(
             llama,
             self._backend,
             n_ctx=n_ctx,
             max_snapshot_bytes=max_snapshot_bytes,
+            base_state_dir=base_state_dir,
         )
+        self._action_specs: dict[str, LaneSpec] = {}
         self._spec = LaneSpec(
             name="chat",
             system_prompt=system_prompt,
@@ -66,6 +72,7 @@ class LaneEngine:
             "compactions": 0,
             "overflows": 0,
             "external_turns": 0,
+            "action_turns": 0,
         }
 
     def chat_stream(
@@ -213,6 +220,129 @@ class LaneEngine:
         if result is None:
             raise RuntimeError("Chat stream ended without a ChatTurnResult.")
         return result
+
+    # ---- action lanes (B2-6) -------------------------------------------
+
+    def warm_action(self, lane_name: str, tools: list[dict]) -> dict:
+        """Make the persona + tool-schema prefix of an action lane ready.
+
+        The prefix comes from memory, from the persisted base state on disk, or
+        is prefilled (and persisted). Returns a small report for logging.
+        """
+        lane = self._action_lane(lane_name, tools)
+        before = self._manager.stats()["base_loaded"]
+        started = time.monotonic()
+        prefilled = self._manager.warm(lane)
+        if prefilled:
+            source = "built"
+        elif self._manager.stats()["base_loaded"] > before:
+            source = "disk"
+        else:
+            source = "memory"
+        return {
+            "lane": lane_name,
+            "source": source,
+            "tokens": len(lane.context.system_ids),
+            "prefilled_tokens": prefilled,
+            "seconds": time.monotonic() - started,
+        }
+
+    def action_turn(
+        self,
+        lane_name: str,
+        tools: list[dict],
+        user_text: str,
+        context_block: str | None,
+        params: GenerationParams,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> ChatTurnResult:
+        """Run one independent tool-calling turn in an action lane.
+
+        Action turns never join a conversation history: the lane keeps only its
+        system prefix (persona + tool schemas), the turn is generated and then
+        discarded. The chat lane learns about the exchange separately, through
+        record_external_turn(), exactly as it does for other non-lane replies.
+        """
+        started_at = time.monotonic()
+        lane = self._action_lane(lane_name, tools)
+        warm_before = self._manager.stats()["warm_prefill_tokens"]
+        with self._manager.use(lane):
+            # use() restores or builds the prefix before this point, so the
+            # generator only sees the tail; report the prefix cost separately.
+            warm_prefill_tokens = self._manager.stats()["warm_prefill_tokens"] - warm_before
+            turn_open = False
+            try:
+                try:
+                    prompt = lane.context.begin_turn(
+                        user_text,
+                        context_block,
+                        context_position="before",
+                    )
+                except ContextOverflow as exc:
+                    self._stats["overflows"] += 1
+                    raise LaneOverflow(
+                        f"The {lane_name} turn does not fit in the action lane."
+                    ) from exc
+                turn_open = True
+                stop_ids = stop_ids_for(lane.context, self._llama)
+                generation_started = time.monotonic()
+                generation = TokenGenerator(self._llama, stop_ids).generate(
+                    prompt,
+                    params,
+                    should_stop=should_stop,
+                )
+            finally:
+                if turn_open:
+                    lane.context.abort_turn()
+
+        completed_at = time.monotonic()
+        elapsed = max(0.0, completed_at - generation_started)
+        completion_tokens = len(generation.ids)
+        if (
+            generation.finish_reason == "stop"
+            and generation.ids
+            and generation.ids[-1] in stop_ids
+        ):
+            completion_tokens -= 1
+        rate = completion_tokens / elapsed if elapsed > 0 else 0.0
+        self._stats["turns"] += 1
+        self._stats["action_turns"] += 1
+        return ChatTurnResult(
+            text=generation.text,
+            ids=list(generation.ids),
+            finish_reason=generation.finish_reason,
+            committed=False,
+            metrics={
+                "completion_tokens": completion_tokens,
+                "prompt_tokens": generation.prompt_tokens,
+                "elapsed_seconds": elapsed,
+                "total_elapsed_seconds": max(0.0, completed_at - started_at),
+                "tokens_per_second": rate,
+                "decode_tokens_per_second": rate,
+                "ttft_seconds": elapsed,
+                "cache_hit_tokens": generation.reused_tokens,
+                "evaluated_tokens": generation.evaluated_tokens,
+                "warm_prefill_tokens": warm_prefill_tokens,
+                # Not "lane": main.py treats metrics["lane"] as "this reply is
+                # already in a chat lane" and would skip record_external_turn().
+                "action_lane": lane.key,
+            },
+        )
+
+    def _action_lane(self, lane_name: str, tools: list[dict]) -> Lane:
+        spec = self._action_specs.get(lane_name)
+        if spec is None or spec.tools != tools:
+            if spec is not None:
+                # The tool schemas changed: the old prefix is no longer valid.
+                self._manager.forget_action(lane_name)
+            spec = LaneSpec(
+                name=lane_name,
+                system_prompt=self._persona,
+                tools=list(tools),
+                gen_reserve=self._gen_reserve,
+            )
+            self._action_specs[lane_name] = spec
+        return self._manager.action_lane(spec)
 
     def record_external_turn(
         self,

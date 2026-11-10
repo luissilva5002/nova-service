@@ -6,3 +6,9 @@ more `text_delta` frames, zero or more `audio_chunk` frames (`seq`,
 `metrics` frames, and then `audio_done`. Clients omitting `stream` continue
 to receive the existing `text`, `metrics`, optional `open_url`, and `audio`
 frames.
+
+If a turn fails on the server, the connection stays open and the client
+receives a single `{"type": "error", "text": "..."}` frame instead of the
+frames above. Clients should show `text`, discard any partially streamed
+message, and be ready to send the next turn. Clients that do not know the
+`error` type can ignore it.

@@ -99,6 +99,8 @@ Run from the repository root inside the model-equipped runtime: `python scripts/
 
 ## Part 3 — token-id generation probe
 
+> **Superseded (2026-11-08).** The "no prefix reuse" conclusions in this part came from a probe that called `generate(..., reset=False)`, and `reset=False` disables llama.cpp's prefix reuse by definition, so the result was invalid. The corrected probe (default `reset=True`) on llama-cpp-python 0.3.36 reused the prefix: follow-up turns evaluated 20-23 tokens instead of 222-340. Production `TokenGenerator` keeps `reset` at its default (`nova/brain/generation.py`). This section is kept for history only.
+
 `scripts/kv_generate_probe.py` loaded `qwen2.5-3b` via `LLMEngine.load()` with configured production settings and ran four fixed user turns twice (engine-default `LlamaRAMCache` and `llm.set_cache(None)`). It wraps `llm.eval` to count tokens evaluated before the first yielded token, records `llm.n_tokens` before each generation, uses `ContextManager`, `reset=False`, temperature zero, a 40-token cap, and stops at the `<|im_end|>` id. The final variation changes the first 100 token ids of the turn-four prompt before another `generate`. Reuse estimate is prompt-token count minus tokens counted in `eval` before the first generated token.
 
 ### Run A — current LlamaRAMCache attached

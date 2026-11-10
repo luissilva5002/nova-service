@@ -22,8 +22,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 
-from nova.config import WEB_UI_DIR, HOST_PROJECTS_DIR, LLM_CONFIRMATIONS, NOVA_OFFLINE, MINILM_MODEL_DIR, WHISPER_MODEL_DIR
-from nova.brain.llm_engine import llm_engine
+from nova.config import WEB_UI_DIR, HOST_PROJECTS_DIR, LLM_CONFIRMATIONS, NOVA_OFFLINE, MINILM_MODEL_DIR, WHISPER_MODEL_DIR, VAULT_ENABLED, VAULT_MODE, LLM_KV_PREWARM_ACTIONS
+from nova.brain.llm_engine import llm_engine, ACTION_LANE_INTENTS
+from nova.brain.tool_call_parser import extract_tool_call
+from nova.text_utils import sanitize_text
 from nova.brain.stt_engine import stt_engine
 from nova.brain.tts_engine import tts_engine
 from nova.brain.sentence_splitter import split_sentences
@@ -32,6 +34,8 @@ from nova.brain.intent_router import classify_intent, filter_tools_for_intent, w
 from nova.memory.core_store import core_store
 from nova.memory import vault_store
 from nova.memory.knowledge_client import (
+    KnowledgeApiError,
+    KnowledgeDisabledError,
     append_knowledge_entry,
     knowledge_path_for_box,
     read_knowledge,
@@ -52,6 +56,10 @@ logger = logging.getLogger("nova.main")
 
 app = FastAPI(title="NOVA Core API")
 
+_TOOL_PARSE_FAILURE_REPLY = "I couldn't work out that action. Could you rephrase it?"
+_TURN_ERROR_REPLY = "Something went wrong while handling that message. Please try again."
+_background_tasks: set = set()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -68,11 +76,29 @@ async def on_startup():
     logger.info("NOVA booting...")
     logger.info("offline=%s minilm=%s whisper=%s", NOVA_OFFLINE, MINILM_MODEL_DIR, WHISPER_MODEL_DIR)
     llm_engine.load()
+    logger.info("KV lanes enabled=%s", llm_engine.lanes_enabled)
+    logger.info("Knowledge vault enabled=%s (mode=%s)", VAULT_ENABLED, VAULT_MODE)
     stt_engine.load()
     tts_engine.load()
     memory_agent.set_engine(llm_engine)
     tool_router.discover_skills()
     logger.info("NOVA ready. Skills: %s", tool_router.list_skills())
+    if llm_engine.lanes_enabled and LLM_KV_PREWARM_ACTIONS:
+        task = asyncio.create_task(_prewarm_action_lanes())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+
+async def _prewarm_action_lanes() -> None:
+    """Build or restore the action-lane prefixes without delaying startup."""
+    try:
+        tools_by_intent = {
+            intent: filter_tools_for_intent(tool_router.tool_schemas, intent)
+            for intent in ACTION_LANE_INTENTS
+        }
+        await llm_engine.prewarm_action_lanes(tools_by_intent)
+    except Exception:
+        logger.exception("Action-lane prewarm failed; lanes will warm on first use.")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -87,14 +113,24 @@ async def get_web_ui():
 @app.get("/api/status")
 async def get_status():
     """Endpoint for checking NOVA system health & RAM usage."""
+    vault_state = "enabled" if VAULT_ENABLED else "disabled"
+    active_project = None
+    if VAULT_ENABLED:
+        try:
+            active_project = vault_store.get_profile_fields().get("active_project")
+        except KnowledgeApiError as exc:
+            vault_state = "error"
+            logger.warning("Vault unavailable for /api/status: %s", exc)
     return {
         "status": "online",
         "brain_loaded": llm_engine._loaded,
         "stt_loaded": stt_engine._loaded,
         "tts_loaded": tts_engine._loaded,
-        "active_project": vault_store.get_profile_fields().get("active_project"),
+        "active_project": active_project,
+        "vault": vault_state,
         "voices_available": tts_engine.list_available_voices(),
         "models": llm_engine.list_models(),
+        "kv_lanes": llm_engine.lane_stats(),
     }
 
 
@@ -140,41 +176,14 @@ async def post_ingest(project_id: str):
     return result
 
 
-def _extract_tool_call_from_text(content: str) -> Optional[dict]:
+def _extract_tool_call_from_text(content: str, allowed_names=None) -> Optional[dict]:
+    """Recover a tool call the model emitted as free-form text.
+
+    Handles doubled, unbalanced and trailing-comma JSON, code fences and a
+    missing closing tag (see nova/brain/tool_call_parser.py). When
+    ``allowed_names`` is given, a call to any other tool is rejected.
     """
-    Recovers a tool call the model emitted as free-form text instead of
-    a structured `tool_calls` field (small models like Qwen3-0.6B often
-    do this instead of honoring the grammar-constrained tool-call API).
-
-    Handles the common case where the model doubles the outer JSON
-    braces, e.g.:
-        <tool_call>{{"name": "x", "arguments": {...}}}</tool_call>
-    which is syntactically invalid JSON as-is (json.loads raises on the
-    doubled braces) - so we peel one layer of outer braces and retry
-    before giving up.
-    """
-    match = re.search(r"<tool_call>(.*?)</tool_call>", content, re.S)
-    raw = match.group(1).strip() if match else content.strip()
-
-    candidates = [raw]
-    if raw.startswith("{{") and raw.endswith("}}"):
-        candidates.append(raw[1:-1].strip())
-
-    first, last = raw.find("{"), raw.rfind("}")
-    if first != -1 and last > first:
-        trimmed = raw[first:last + 1]
-        candidates.append(trimmed)
-        if trimmed.startswith("{{") and trimmed.endswith("}}"):
-            candidates.append(trimmed[1:-1].strip())
-
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict) and "name" in parsed:
-                return parsed
-        except json.JSONDecodeError:
-            continue
-    return None
+    return extract_tool_call(content, allowed_names)
 
 
 def _extract_name_from_text(text: str) -> Optional[str]:
@@ -295,6 +304,9 @@ def _answer_from_memory(user_text: str, facts: dict, session_history: list[dict]
     return None
 
 
+_VAULT_DISABLED_REPLY = "The knowledge vault isn't enabled on this machine, so I didn't save that."
+
+
 def _handle_session_commands(user_text: str, session_id: str) -> Optional[str]:
     """Handle one-shot session commands that should not go through the LLM."""
     lower = user_text.strip().lower()
@@ -317,7 +329,10 @@ def _handle_session_commands(user_text: str, session_id: str) -> Optional[str]:
         if matched:
             fact = matched.group(1).strip().rstrip(".?! ")
             if fact:
-                append_knowledge_entry(knowledge_path_for_box("project_notes"), fact)
+                try:
+                    append_knowledge_entry(knowledge_path_for_box("project_notes"), fact)
+                except KnowledgeDisabledError:
+                    return _VAULT_DISABLED_REPLY
                 return "I saved that as a project fact in my persistent memory."
 
     if re.search(r"\b(?:create|make|save|store)\s+(?:a\s+)?memory\b", lower) or re.search(r"\b(?:save|store)\s+(?:this|that)\s+to\s+memory\b", lower):
@@ -334,10 +349,22 @@ def _handle_session_commands(user_text: str, session_id: str) -> Optional[str]:
                     target_box = "user_profile"
                 elif re.search(r"\b(?:prefer|like|favorite|study|work|school|project)\b", fact, re.I):
                     target_box = "general_notes"
-                append_knowledge_entry(knowledge_path_for_box(target_box), fact)
+                try:
+                    append_knowledge_entry(knowledge_path_for_box(target_box), fact)
+                except KnowledgeDisabledError:
+                    return _VAULT_DISABLED_REPLY
                 return "I saved that memory in my persistent memory."
 
     return None
+
+
+def _is_clear_command(user_text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(clear|reset)\b.*\b(chat|conversation|history)\b",
+            user_text.strip().lower(),
+        )
+    )
 
 
 async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str, bytes, dict, Optional[dict]]:
@@ -354,6 +381,7 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
     accidentally surfacing unrelated knowledge notes or being offered
     memory tools it has no reason to call.
     """
+    user_text = sanitize_text(user_text, "user_text")
     session_command = _handle_session_commands(user_text, session_id)
     if session_command is not None:
         reply_text = session_command
@@ -361,6 +389,11 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
         client_action = None
         append_turn(session_id, "user", user_text)
         append_turn(session_id, "assistant", reply_text)
+        if llm_engine.lanes_enabled:
+            if _is_clear_command(user_text):
+                await llm_engine.forget_lane(session_id)
+            else:
+                await llm_engine.record_external_turn(session_id, user_text, reply_text)
         core_store.log_message("user", user_text)
         core_store.log_message("nova", reply_text)
         audio_chunks = []
@@ -378,6 +411,11 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
     )
 
     session_history = get_context(session_id, limit=12)
+    history = (
+        get_context(session_id, limit=400)
+        if llm_engine.lanes_enabled
+        else session_history
+    )
     session_summary = get_session_summary(session_id)
     facts = vault_store.get_profile_fields() if intent == "memory_recall" else {}
 
@@ -392,6 +430,8 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
             client_action = None
             append_turn(session_id, "user", user_text)
             append_turn(session_id, "assistant", reply_text)
+            if llm_engine.lanes_enabled:
+                await llm_engine.record_external_turn(session_id, user_text, reply_text)
             core_store.log_message("nova", reply_text)
             audio_chunks = []
             async for chunk in tts_engine.synthesize_stream(reply_text):
@@ -451,8 +491,9 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
         user_text=user_text,
         tool_schemas=filtered_tool_schemas,
         memory_context=memory_context,
-        history=session_history,
+        history=history,
         intent=intent,
+        session_id=session_id,
     )
     # Debug: log the LLM decision so we can trace tool_call vs text paths
     logger.info("LLM decision: %s", json.dumps(decision) if isinstance(decision, dict) else str(decision))
@@ -463,7 +504,8 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
     if isinstance(decision, dict) and decision.get("type") == "text":
         content = decision.get("content", "")
         if "<tool_call" in content:
-            parsed = _extract_tool_call_from_text(content)
+            allowed_names = {t["function"]["name"] for t in filtered_tool_schemas}
+            parsed = _extract_tool_call_from_text(content, allowed_names)
             if parsed:
                 decision = {
                     "type": "tool_call",
@@ -473,7 +515,18 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
                 }
                 logger.info("Recovered tool_call from LLM text output: %s", json.dumps(decision))
             else:
-                logger.warning("Found <tool_call> in output but failed to parse JSON: %r", content)
+                # Never show or speak raw tool-call markup to the user.
+                logger.warning(
+                    "Found <tool_call> in output but could not recover a valid call "
+                    "(allowed tools=%s): %r",
+                    sorted(allowed_names),
+                    content,
+                )
+                decision = {
+                    "type": "text",
+                    "content": _TOOL_PARSE_FAILURE_REPLY,
+                    "metrics": decision.get("metrics", {}),
+                }
 
     audio_bytes = b""
     generation_metrics = {}
@@ -544,6 +597,11 @@ async def run_pipeline(user_text: str, session_id: str = "default") -> tuple[str
 
     append_turn(session_id, "user", user_text)
     append_turn(session_id, "assistant", reply_text)
+    lane_handled = isinstance(decision, dict) and bool(
+        (decision.get("metrics") or {}).get("lane")
+    )
+    if llm_engine.lanes_enabled and not lane_handled:
+        await llm_engine.record_external_turn(session_id, user_text, reply_text)
     core_store.log_message("nova", reply_text)
     if intent == "memory_write":
         asyncio.create_task(memory_agent.process_turn(user_text))
@@ -585,119 +643,138 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             raw = await websocket.receive_text()
             try:
-                message = json.loads(raw)
-            except json.JSONDecodeError:
-                # Backward-compatible plain-text fallback.
-                message = {"type": "text", "text": raw}
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    # Backward-compatible plain-text fallback.
+                    message = {"type": "text", "text": raw}
 
-            msg_type = message.get("type", "text")
-            if msg_type == "session" and isinstance(message.get("session_id"), str) and message["session_id"].strip():
-                session_id = message["session_id"].strip()
-                setattr(websocket, "_nova_session_id", session_id)
-                logger.info("Updated WS session_id from client handshake to %s", session_id)
-                continue
-
-            if msg_type == "audio":
-                audio_buffer.extend(base64.b64decode(message.get("audio_b64", "")))
-                if not message.get("final"):
-                    continue  # keep buffering until the client signals end-of-utterance
-                user_text = await asyncio.to_thread(stt_engine.transcribe_media, bytes(audio_buffer))
-                logger.info("Transcribed user text: %r", user_text)
-                audio_buffer.clear()
-            else:
-                if isinstance(message.get("session_id"), str) and message["session_id"].strip():
+                msg_type = message.get("type", "text")
+                if msg_type == "session" and isinstance(message.get("session_id"), str) and message["session_id"].strip():
                     session_id = message["session_id"].strip()
                     setattr(websocket, "_nova_session_id", session_id)
-                user_text = message.get("text", "")
-
-            if not user_text.strip():
-                continue
-
-            if message.get("stream") is True:
-                stream_classification = await classify_intent(user_text, llm_engine)
-                if stream_classification["intent"] == "chat":
-                    history = get_context(session_id, limit=12)
-                    stream_context = json.dumps({
-                        "chat_context_summary": get_session_summary(session_id),
-                        "relevant_profile_fields": {},
-                    }, ensure_ascii=False)
-                    full_text = ""
-                    pending = ""
-                    metrics = {}
-                    audio_seq = 0
-                    async for event in llm_engine.stream_chat(
-                        user_text, memory_context=stream_context, history=history, intent="chat"
-                    ):
-                        if event["type"] == "text_delta":
-                            delta = event["text"]
-                            full_text += delta
-                            pending += delta
-                            complete = split_sentences(pending)
-                            if complete:
-                                trailing_complete = bool(re.search(r"[.!?]+\s*$", pending))
-                                spoken_parts = complete if trailing_complete else complete[:-1]
-                                if spoken_parts:
-                                    spoken = " ".join(spoken_parts)
-                                    pending = "" if trailing_complete else complete[-1]
-                                    audio_parts = []
-                                    async for chunk in tts_engine.synthesize_stream(spoken):
-                                        audio_parts.append(chunk)
-                                    if audio_parts:
-                                        await websocket.send_text(json.dumps({
-                                            "type": "audio_chunk",
-                                            "seq": audio_seq,
-                                            "sample_rate": tts_engine.sample_rate(),
-                                            "audio_b64": base64.b64encode(b"".join(audio_parts)).decode(),
-                                        }))
-                                        audio_seq += 1
-                            await websocket.send_text(json.dumps({"type": "text_delta", "text": delta}))
-                        else:
-                            metrics = event.get("metrics", {})
-                            full_text = event.get("text", full_text)
-                    append_turn(session_id, "user", user_text)
-                    append_turn(session_id, "assistant", full_text)
-                    core_store.log_message("nova", full_text)
-                    await websocket.send_text(json.dumps({"type": "text", "text": full_text}))
-                    await websocket.send_text(json.dumps({"type": "metrics", "llm": metrics}))
-                    final_audio = []
-                    async for chunk in tts_engine.synthesize_stream(pending):
-                        final_audio.append(chunk)
-                    if final_audio:
-                        await websocket.send_text(json.dumps({
-                            "type": "audio_chunk", "seq": audio_seq,
-                            "sample_rate": tts_engine.sample_rate(),
-                            "audio_b64": base64.b64encode(b"".join(final_audio)).decode(),
-                        }))
-                    await websocket.send_text(json.dumps({"type": "audio_done"}))
+                    logger.info("Updated WS session_id from client handshake to %s", session_id)
                     continue
 
-            reply_text, audio_bytes, generation_metrics, client_action = await run_pipeline(user_text, session_id=session_id)
+                if msg_type == "audio":
+                    audio_buffer.extend(base64.b64decode(message.get("audio_b64", "")))
+                    if not message.get("final"):
+                        continue  # keep buffering until the client signals end-of-utterance
+                    user_text = await asyncio.to_thread(stt_engine.transcribe_media, bytes(audio_buffer))
+                    logger.info("Transcribed user text: %r", user_text)
+                    audio_buffer.clear()
+                else:
+                    if isinstance(message.get("session_id"), str) and message["session_id"].strip():
+                        session_id = message["session_id"].strip()
+                        setattr(websocket, "_nova_session_id", session_id)
+                    user_text = message.get("text", "")
 
-            # Log what we are about to send to the client (debug)
-            logger.info(
-                "Sending to WS client: text=%s, open_url=%s, audio_bytes=%s",
-                reply_text,
-                client_action.get("url") if client_action and isinstance(client_action, dict) else None,
-                'yes' if audio_bytes else 'no',
-            )
+                user_text = sanitize_text(user_text, "websocket user_text")
+                if not user_text.strip():
+                    continue
 
-            await websocket.send_text(json.dumps({"type": "text", "text": reply_text}))
-            await websocket.send_text(json.dumps({"type": "metrics", "llm": generation_metrics}))
+                if message.get("stream") is True:
+                    stream_classification = await classify_intent(user_text, llm_engine)
+                    if stream_classification["intent"] == "chat":
+                        history = get_context(
+                            session_id,
+                            limit=400 if llm_engine.lanes_enabled else 12,
+                        )
+                        stream_context = json.dumps({
+                            "chat_context_summary": get_session_summary(session_id),
+                            "relevant_profile_fields": {},
+                        }, ensure_ascii=False)
+                        full_text = ""
+                        pending = ""
+                        metrics = {}
+                        audio_seq = 0
+                        async for event in llm_engine.stream_chat(
+                            user_text,
+                            memory_context=stream_context,
+                            history=history,
+                            intent="chat",
+                            session_id=session_id,
+                        ):
+                            if event["type"] == "text_delta":
+                                delta = event["text"]
+                                full_text += delta
+                                pending += delta
+                                complete = split_sentences(pending)
+                                if complete:
+                                    trailing_complete = bool(re.search(r"[.!?]+\s*$", pending))
+                                    spoken_parts = complete if trailing_complete else complete[:-1]
+                                    if spoken_parts:
+                                        spoken = " ".join(spoken_parts)
+                                        pending = "" if trailing_complete else complete[-1]
+                                        audio_parts = []
+                                        async for chunk in tts_engine.synthesize_stream(spoken):
+                                            audio_parts.append(chunk)
+                                        if audio_parts:
+                                            await websocket.send_text(json.dumps({
+                                                "type": "audio_chunk",
+                                                "seq": audio_seq,
+                                                "sample_rate": tts_engine.sample_rate(),
+                                                "audio_b64": base64.b64encode(b"".join(audio_parts)).decode(),
+                                            }))
+                                            audio_seq += 1
+                                await websocket.send_text(json.dumps({"type": "text_delta", "text": delta}))
+                            else:
+                                metrics = event.get("metrics", {})
+                                full_text = event.get("text", full_text)
+                        append_turn(session_id, "user", user_text)
+                        append_turn(session_id, "assistant", full_text)
+                        core_store.log_message("nova", full_text)
+                        await websocket.send_text(json.dumps({"type": "text", "text": full_text}))
+                        await websocket.send_text(json.dumps({"type": "metrics", "llm": metrics}))
+                        final_audio = []
+                        async for chunk in tts_engine.synthesize_stream(pending):
+                            final_audio.append(chunk)
+                        if final_audio:
+                            await websocket.send_text(json.dumps({
+                                "type": "audio_chunk", "seq": audio_seq,
+                                "sample_rate": tts_engine.sample_rate(),
+                                "audio_b64": base64.b64encode(b"".join(final_audio)).decode(),
+                            }))
+                        await websocket.send_text(json.dumps({"type": "audio_done"}))
+                        continue
 
-            # If the tool asked the client to open a URL, send that action
-            if client_action and isinstance(client_action, dict) and client_action.get("type") == "open_url":
-                logger.info("Forwarding open_url to client: %s", client_action.get("url"))
-                await websocket.send_text(json.dumps({
-                    "type": "open_url",
-                    "url": client_action.get("url"),
-                    "text": client_action.get("message"),
-                }))
+                reply_text, audio_bytes, generation_metrics, client_action = await run_pipeline(user_text, session_id=session_id)
 
-            if audio_bytes:
-                await websocket.send_text(json.dumps({
-                    "type": "audio",
-                    "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
-                }))
+                # Log what we are about to send to the client (debug)
+                logger.info(
+                    "Sending to WS client: text=%s, open_url=%s, audio_bytes=%s",
+                    reply_text,
+                    client_action.get("url") if client_action and isinstance(client_action, dict) else None,
+                    'yes' if audio_bytes else 'no',
+                )
+
+                await websocket.send_text(json.dumps({"type": "text", "text": reply_text}))
+                await websocket.send_text(json.dumps({"type": "metrics", "llm": generation_metrics}))
+
+                # If the tool asked the client to open a URL, send that action
+                if client_action and isinstance(client_action, dict) and client_action.get("type") == "open_url":
+                    logger.info("Forwarding open_url to client: %s", client_action.get("url"))
+                    await websocket.send_text(json.dumps({
+                        "type": "open_url",
+                        "url": client_action.get("url"),
+                        "text": client_action.get("message"),
+                    }))
+
+                if audio_bytes:
+                    await websocket.send_text(json.dumps({
+                        "type": "audio",
+                        "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
+                    }))
+            except WebSocketDisconnect:
+                raise
+            except Exception:
+                # One failed turn must never close the connection.
+                logger.exception("Turn failed for session %s.", session_id)
+                audio_buffer.clear()
+                try:
+                    await websocket.send_text(json.dumps({"type": "error", "text": _TURN_ERROR_REPLY}))
+                except Exception:
+                    raise WebSocketDisconnect()
 
     except WebSocketDisconnect:
         logger.info("Client disconnected.")

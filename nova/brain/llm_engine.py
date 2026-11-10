@@ -14,6 +14,7 @@ are non-LLM "organs", not separate brains.
 """
 import datetime
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -42,11 +43,64 @@ from nova.config import (
     LLM_GPU_LAYERS,
     LLM_KV_LANES,
     LLM_KV_LANES_MAX_SNAPSHOT_MB,
+    LLM_KV_ACTION_LANES,
+    LLM_KV_BASE_STATES,
+    LLM_KV_ACTION_HISTORY_TURNS,
+    KV_BASE_DIR,
     NOVA_PERSONA_PROMPT,
 )
+from nova.text_utils import sanitize_text
 
 logger = logging.getLogger("nova.llm_engine")
 _THINKING_BLOCK = re.compile(r"<think>.*?</think>\s*", re.IGNORECASE | re.DOTALL)
+
+# Intents whose tool turns run in an action lane (a prefix of persona + tool
+# schemas that is prefilled once). Single-tool intents (memory_recall) stay on
+# the legacy path because llama.cpp forces that one tool call with a grammar.
+ACTION_LANE_INTENTS = ("action_calendar", "action_music", "memory_write")
+_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+_RECENT_EXCHANGE_CHARS = 240
+# Background prewarming only starts a lane build after user-facing work has
+# been quiet this long, so it does not sit in front of a reply that is about
+# to be recorded (record_external_turn takes the same lock).
+PREWARM_IDLE_SECONDS = 4.0
+
+
+class _ActivityLock:
+    """asyncio.Lock that remembers when user-facing work last used the model.
+
+    ``async with lock`` marks activity when the request arrives (even if it has
+    to wait) and when it finishes. ``background()`` takes the lock without
+    marking activity, for work that should yield to users.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self.last_activity = float("-inf")
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    async def __aenter__(self) -> "_ActivityLock":
+        self.last_activity = time.monotonic()
+        await self._lock.acquire()
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        self._lock.release()
+        self.last_activity = time.monotonic()
+
+    @contextlib.asynccontextmanager
+    async def background(self):
+        await self._lock.acquire()
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    async def wait_until_idle(self, idle_seconds: float) -> None:
+        while self._lock.locked() or time.monotonic() - self.last_activity < idle_seconds:
+            await asyncio.sleep(0.25)
 
 try:
     from llama_cpp import Llama
@@ -60,7 +114,7 @@ class LLMEngine:
         self._llm: Optional["Llama"] = None
         self._loaded = False
         self._active_model_id = LLM_DEFAULT_MODEL_ID
-        self._lock = asyncio.Lock()
+        self._lock = _ActivityLock()
         self._kv_call_history: list[dict] = []
         self._kv_active_call: Optional[dict] = None
         self._kv_previous_tokens: list[int] = []
@@ -279,10 +333,13 @@ class LLMEngine:
                 NOVA_PERSONA_PROMPT,
                 gen_reserve=max(LLM_MAX_TOKENS_CHAT, LLM_MAX_TOKENS_TOOL) + 32,
                 max_snapshot_bytes=LLM_KV_LANES_MAX_SNAPSHOT_MB * 1024 * 1024,
+                base_state_dir=KV_BASE_DIR if LLM_KV_BASE_STATES else None,
             )
             logger.info(
-                "KV lanes enabled (max_snapshot_bytes=%d).",
+                "KV lanes enabled (max_snapshot_bytes=%d, action_lanes=%s, base_states=%s).",
                 LLM_KV_LANES_MAX_SNAPSHOT_MB * 1024 * 1024,
+                LLM_KV_ACTION_LANES,
+                str(KV_BASE_DIR) if LLM_KV_BASE_STATES else "off",
             )
         except Exception:
             self._lanes = None
@@ -299,6 +356,72 @@ class LLMEngine:
         if memory_context:
             context += f"\n\nKnown user context: {memory_context}"
         return f"[Context]\n{context}\n[/Context]"
+
+    def _action_lane_eligible(self, intent: str, tool_schemas: Optional[list]) -> bool:
+        return bool(
+            self._lanes is not None
+            and LLM_KV_ACTION_LANES
+            and intent in ACTION_LANE_INTENTS
+            and tool_schemas
+            and len(tool_schemas) > 1
+        )
+
+    @staticmethod
+    def _recent_exchange_text(history: Optional[list[dict]], turns: int) -> str:
+        """The last ``turns`` user/assistant exchanges as short plain text."""
+        if turns <= 0 or not history:
+            return ""
+        messages = [
+            turn for turn in history
+            if turn.get("role") in {"user", "assistant"} and str(turn.get("content", "")).strip()
+        ][-turns * 2:]
+        lines = []
+        for turn in messages:
+            text = " ".join(sanitize_text(str(turn["content"]), "history").split())
+            if len(text) > _RECENT_EXCHANGE_CHARS:
+                text = text[:_RECENT_EXCHANGE_CHARS].rstrip() + "..."
+            label = "User" if turn["role"] == "user" else "Assistant"
+            lines.append(f"{label}: {text}")
+        return "\n".join(lines)
+
+    def _action_context_block(
+        self, intent: str, memory_context: str, history: Optional[list[dict]]
+    ) -> str:
+        context = self._current_date_context(intent == "action_calendar")
+        recent = self._recent_exchange_text(history, LLM_KV_ACTION_HISTORY_TURNS)
+        if recent:
+            context += f"\n\nRecent conversation:\n{recent}"
+        if memory_context:
+            context += f"\n\nKnown user context: {memory_context}"
+        return f"[Context]\n{context}\n[/Context]"
+
+    async def prewarm_action_lanes(self, tools_by_intent: dict[str, list]) -> list[dict]:
+        """Build or restore every action-lane prefix, one lane at a time.
+
+        The model lock is taken per lane, and only once user-facing work has
+        been quiet for PREWARM_IDLE_SECONDS, so a user request never queues
+        behind a build that could have waited (an already running build is the
+        one thing it may have to wait for).
+        """
+        reports: list[dict] = []
+        for intent in ACTION_LANE_INTENTS:
+            tools = tools_by_intent.get(intent) or []
+            if not self._action_lane_eligible(intent, tools):
+                continue
+            try:
+                await self._lock.wait_until_idle(PREWARM_IDLE_SECONDS)
+                async with self._lock.background():
+                    report = await asyncio.to_thread(self._lanes.warm_action, intent, tools)
+            except Exception:
+                logger.exception("Could not prewarm KV action lane %s.", intent)
+                continue
+            logger.info(
+                "KV action lane ready: lane=%s source=%s tokens=%d prefilled=%d seconds=%.2f",
+                report["lane"], report["source"], report["tokens"],
+                report["prefilled_tokens"], report["seconds"],
+            )
+            reports.append(report)
+        return reports
 
     def _lane_chat_eligible(
         self,
@@ -317,13 +440,14 @@ class LLMEngine:
         metrics = result.metrics
         logger.info(
             "KV-LANE lane=%s prompt_tokens=%d reused=%d evaluated=%d "
-            "ttft_s=%.3f completion_tokens=%d",
-            metrics.get("lane", ""),
+            "ttft_s=%.3f completion_tokens=%d warm_prefill=%d",
+            metrics.get("lane") or metrics.get("action_lane", ""),
             metrics.get("prompt_tokens", 0),
             metrics.get("cache_hit_tokens", 0),
             metrics.get("evaluated_tokens", 0),
             metrics.get("ttft_seconds", 0.0),
             metrics.get("completion_tokens", 0),
+            metrics.get("warm_prefill_tokens", 0),
         )
 
     async def record_external_turn(
@@ -587,6 +711,8 @@ class LLMEngine:
           {"type": "text", "content": "..."}
         """
         self.load()
+        user_text = sanitize_text(user_text, "user_text")
+        memory_context = sanitize_text(memory_context, "memory_context")
         max_tokens = max_tokens or (LLM_MAX_TOKENS_TOOL if tool_schemas else LLM_MAX_TOKENS_CHAT)
         messages = self._build_messages(user_text, memory_context, tool_schemas, history, intent)
 
@@ -618,6 +744,26 @@ class LLMEngine:
                         await asyncio.to_thread(self._lanes.forget, session_id)
                     except Exception:
                         logger.exception("Could not forget failed KV lane %s.", session_id)
+
+        if self._action_lane_eligible(intent, tool_schemas):
+            try:
+                async with self._lock:
+                    result = await asyncio.to_thread(
+                        self._lanes.action_turn,
+                        intent,
+                        tool_schemas,
+                        user_text,
+                        self._action_context_block(intent, memory_context, history),
+                        self._GenerationParams(max_tokens=max_tokens, temperature=LLM_TEMP_TOOLS),
+                    )
+                self._log_lane_result(result)
+                return {
+                    "type": "text",
+                    "content": self._without_thinking(result.text),
+                    "metrics": result.metrics,
+                }
+            except Exception:
+                logger.exception("KV action lane failed for intent %s; using legacy path.", intent)
 
         started_at = time.perf_counter()
         kwargs = {"messages": messages, "max_tokens": max_tokens,
@@ -675,6 +821,8 @@ class LLMEngine:
         self.load()
         if self._llm is None:
             return "{}", {"completion_tokens": 0, "elapsed_seconds": 0.0, "tokens_per_second": 0.0}
+        system_prompt = sanitize_text(system_prompt, "system_prompt")
+        user_prompt = sanitize_text(user_prompt, "user_prompt")
         started_at = time.perf_counter()
         async with self._lock:
             completion = await asyncio.to_thread(
@@ -692,6 +840,8 @@ class LLMEngine:
     ) -> AsyncIterator[dict]:
         """Stream chat deltas while serializing access to the single model."""
         self.load()
+        user_text = sanitize_text(user_text, "user_text")
+        memory_context = sanitize_text(memory_context, "memory_context")
         if self._llm is None:
             yield {"type": "text_delta", "text": f"[stub-brain] You said: {user_text}"}
             yield {"type": "done", "metrics": {"completion_tokens": 0, "prompt_tokens": 0, "elapsed_seconds": 0.0, "total_elapsed_seconds": 0.0, "tokens_per_second": 0.0}}
@@ -841,15 +991,38 @@ class LLMEngine:
         COMPUTE "today + 4 days" via arithmetic - so give them the answer
         pre-computed instead of asking them to derive it.
         """
-        now = datetime.datetime.now().astimezone()
-        lines = [now.strftime("Current date: %A, %Y-%m-%d %Z")]
+        return LLMEngine._format_date_context(datetime.datetime.now().astimezone(), include_lookup)
+
+    @staticmethod
+    def _utc_offset_label(moment: datetime.datetime) -> str:
+        offset = moment.utcoffset()
+        minutes = int(offset.total_seconds() // 60) if offset is not None else 0
+        sign = "+" if minutes >= 0 else "-"
+        minutes = abs(minutes)
+        return f"UTC{sign}{minutes // 60:02d}:{minutes % 60:02d}"
+
+    @staticmethod
+    def _format_date_context(now: datetime.datetime, include_lookup: bool = False) -> str:
+        """Locale-independent date text.
+
+        strftime's %A/%Z depend on the operating system's language: on a
+        Portuguese Windows install %Z returns a localized name containing a
+        non-ASCII byte, which became a lone surrogate and crashed tokenization.
+        Weekday names and the UTC offset are built here from plain ASCII.
+        """
+        def iso(day: datetime.datetime) -> str:
+            return f"{day.year:04d}-{day.month:02d}-{day.day:02d}"
+
+        lines = [
+            f"Current date: {_WEEKDAYS[now.weekday()]}, {iso(now)} ({LLMEngine._utc_offset_label(now)})"
+        ]
         if not include_lookup:
             return lines[0]
         lines.append("Upcoming dates (use these directly - do not calculate offsets yourself):")
         for offset in range(14):
             day = now + datetime.timedelta(days=offset)
-            label = "Today" if offset == 0 else ("Tomorrow" if offset == 1 else day.strftime("%A"))
-            lines.append(f"  {label}: {day.strftime('%Y-%m-%d')}")
+            label = "Today" if offset == 0 else ("Tomorrow" if offset == 1 else _WEEKDAYS[day.weekday()])
+            lines.append(f"  {label}: {iso(day)}")
         return "\n".join(lines)
 
 
@@ -865,11 +1038,17 @@ class LLMEngine:
         messages = [{"role": "system", "content": NOVA_PERSONA_PROMPT}]
         for turn in (history or [])[-LLM_HISTORY_TURNS * 2:]:
             if turn.get("role") in {"user", "assistant"}:
-                messages.append({"role": turn["role"], "content": turn.get("content", "")})
+                messages.append({
+                    "role": turn["role"],
+                    "content": sanitize_text(turn.get("content", ""), "history"),
+                })
         context = cls._current_date_context(intent == "action_calendar")
         if memory_context:
             context += f"\n\nKnown user context: {memory_context}"
-        return messages + [{"role": "user", "content": f"[Context]\n{context}\n[/Context]\n\n{user_text}"}]
+        content = sanitize_text(
+            f"[Context]\n{context}\n[/Context]\n\n{user_text}", "legacy prompt"
+        )
+        return messages + [{"role": "user", "content": content}]
 
 
 llm_engine = LLMEngine()

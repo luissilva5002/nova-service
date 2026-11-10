@@ -1,0 +1,4538 @@
+
+===== FILE: tests/test_lanes.py | bytes=18689 | crlf=488 | lf_total=488 | bom=False =====
+"""Real-model tests for lane-local llama.cpp KV residency."""
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+os.environ.setdefault("NOVA_LLM_MODEL", "qwen2.5-3b")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from nova.config import LLM_MODELS  # noqa: E402
+from nova.brain.context_manager import ContextManager, LlamaBackend  # noqa: E402
+from nova.brain.generation import (  # noqa: E402
+    GenerationParams,
+    GenerationResult,
+    TokenGenerator,
+    stop_ids_for,
+)
+from nova.brain import lanes as lanes_module  # noqa: E402
+from nova.brain.lanes import LaneManager, LaneSpec  # noqa: E402
+
+MODEL_PATH = LLM_MODELS["qwen2.5-3b"]["path"]
+try:
+    from llama_cpp import Llama
+
+    LLAMA_AVAILABLE = True
+except (ImportError, OSError):
+    Llama = None
+    LLAMA_AVAILABLE = False
+
+SKIP_REASON = (
+    "Requires llama-cpp-python and the configured Qwen2.5-3B GGUF "
+    f"(llama_cpp available={LLAMA_AVAILABLE}, model exists={MODEL_PATH.is_file()})."
+)
+MAX_TOKENS = 12
+CHAT_SPEC = LaneSpec(
+    name="chat",
+    system_prompt="You are a concise assistant. Answer clearly and briefly.",
+    gen_reserve=64,
+)
+ACTION_SPEC = LaneSpec(
+    name="music",
+    system_prompt="You control a music player. Answer briefly.",
+    tools=[
+        {
+            "type": "function",
+            "function": {
+                "name": "ytm_play",
+                "description": "Play a song or genre.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        }
+    ],
+    gen_reserve=64,
+)
+
+
+class EvalCounter:
+    """Count eval tokens until the first nonempty streamed text delta."""
+
+    def __init__(self, llama) -> None:
+        self.llama = llama
+        self.total = 0
+        self.active = True
+        self._original_eval = None
+
+    def __enter__(self):
+        self._original_eval = self.llama.eval
+
+        def counted(tokens, *args, **kwargs):
+            if self.active:
+                self.total += len(tokens)
+            return self._original_eval(tokens, *args, **kwargs)
+
+        self.llama.eval = counted
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        del self.llama.eval
+
+    def stop_counting(self) -> None:
+        self.active = False
+
+
+@unittest.skipUnless(LLAMA_AVAILABLE and MODEL_PATH.is_file(), SKIP_REASON)
+class LaneManagerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.llama = Llama(
+            model_path=str(MODEL_PATH),
+            n_ctx=1024,
+            n_threads=4,
+            verbose=False,
+        )
+        cls.backend = LlamaBackend(cls.llama)
+        cls.stop_ids = stop_ids_for(cls._empty_context(cls.backend), cls.llama)
+        cls.generator = TokenGenerator(cls.llama, cls.stop_ids)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.llama.close()
+
+    @staticmethod
+    def _empty_context(backend):
+        context = ContextManager(backend, n_ctx=1024, gen_reserve=64)
+        context.start_session("End token helper.")
+        return context
+
+    def setUp(self):
+        self.llama.reset()
+
+    def make_manager(self, max_snapshot_bytes=256 * 1024 * 1024):
+        return LaneManager(
+            self.llama,
+            self.backend,
+            n_ctx=1024,
+            max_snapshot_bytes=max_snapshot_bytes,
+        )
+
+    def generate_turn(
+        self,
+        manager,
+        lane,
+        user_text,
+        count_eval=True,
+        context_block=None,
+        context_position="after",
+    ):
+        with manager.use(lane):
+            prompt = lane.context.begin_turn(
+                user_text,
+                context_block=context_block,
+                context_position=context_position,
+            )
+            result = None
+            counter = EvalCounter(self.llama) if count_eval else None
+            stream = self.generator.stream(
+                prompt,
+                GenerationParams(max_tokens=MAX_TOKENS, temperature=0.0),
+            )
+            try:
+                if counter is None:
+                    items = stream
+                    for item in items:
+                        if isinstance(item, GenerationResult):
+                            result = item
+                else:
+                    with counter:
+                        for item in stream:
+                            if isinstance(item, str) and item:
+                                counter.stop_counting()
+                            elif isinstance(item, GenerationResult):
+                                result = item
+                if result is None:
+                    raise AssertionError("TokenGenerator did not return GenerationResult.")
+            finally:
+                stream.close()
+            lane.context.commit_turn(result.ids)
+            return result, counter.total if counter is not None else result.evaluated_tokens
+
+    def generate_action(self, manager, lane, user_text):
+        with manager.use(lane):
+            prompt = lane.context.begin_turn(user_text)
+            try:
+                result, evaluated = self._consume_current_turn(prompt)
+            finally:
+                lane.context.abort_turn()
+        return result, evaluated
+
+    def _consume_current_turn(self, prompt):
+        result = None
+        counter = EvalCounter(self.llama)
+        stream = self.generator.stream(
+            prompt,
+            GenerationParams(max_tokens=MAX_TOKENS, temperature=0.0),
+        )
+        try:
+            with counter:
+                for item in stream:
+                    if isinstance(item, str) and item:
+                        counter.stop_counting()
+                    elif isinstance(item, GenerationResult):
+                        result = item
+        finally:
+            stream.close()
+        if result is None:
+            raise AssertionError("TokenGenerator did not return GenerationResult.")
+        return result, counter.total
+
+    def print_stats(self, manager):
+        print(f"LaneManager stats: {manager.stats()}")
+
+    def test_t1_interleaved_chat_action_lanes_keep_chat_prefix(self):
+        manager = self.make_manager()
+        chat_a = manager.chat_lane("A", CHAT_SPEC)
+        chat_b = manager.chat_lane("B", CHAT_SPEC)
+        music = manager.action_lane(ACTION_SPEC)
+
+        self.generate_turn(manager, chat_a, "I am planning a quiet walk in the park.")
+        self.generate_turn(manager, chat_b, "Tell me a short fact about the moon.")
+        self.generate_action(manager, music, "Play some jazz.")
+        actual, evaluated = self.generate_turn(
+            manager,
+            chat_a,
+            "What should I bring on the walk?",
+        )
+
+        self.llama.reset()
+        control = LaneManager(self.llama, self.backend, n_ctx=1024)
+        control_a = control.chat_lane("control", CHAT_SPEC)
+        self.generate_turn(control, control_a, "I am planning a quiet walk in the park.")
+        expected, _ = self.generate_turn(
+            control,
+            control_a,
+            "What should I bring on the walk?",
+        )
+
+        self.assertLess(evaluated, 60)
+        self.assertEqual(actual.ids, expected.ids)
+        self.print_stats(manager)
+
+    def test_t2_warmed_action_reuses_base_prefix_across_calls_and_chat(self):
+        manager = self.make_manager()
+        music = manager.action_lane(ACTION_SPEC)
+        system_tokens = len(music.context.system_ids)
+        self.assertGreater(manager.warm(music), 0)
+        self.assertEqual(manager.warm(music), 0)
+
+        for text in ("Play some jazz.", "Play quiet piano.", "Play upbeat music."):
+            _, evaluated = self.generate_action(manager, music, text)
+            self.assertLess(evaluated, 60)
+            self.assertLess(evaluated, system_tokens)
+
+        chat = manager.chat_lane("between-actions", CHAT_SPEC)
+        self.generate_turn(manager, chat, "What is a short nature fact?")
+        _, evaluated = self.generate_action(manager, music, "Play acoustic guitar.")
+        self.assertLess(evaluated, 60)
+        self.assertLess(evaluated, system_tokens)
+        self.print_stats(manager)
+
+    def test_t3_borrow_does_not_lose_resident_chat_lane(self):
+        manager = self.make_manager()
+        chat = manager.chat_lane("A", CHAT_SPEC)
+        self.generate_turn(manager, chat, "I am planning a quiet walk in the park.")
+
+        helper = ContextManager(self.backend, n_ctx=1024, gen_reserve=64)
+        helper.start_session("You are an unrelated helper.")
+        helper_prompt = helper.begin_turn(
+            "This unrelated request contains enough words to create a roughly "
+            "one-hundred-and-fifty-token prompt. " * 20
+        )
+        self.assertGreaterEqual(len(helper_prompt), 150)
+        with manager.borrow():
+            helper_result = self.generator.generate(
+                helper_prompt,
+                GenerationParams(max_tokens=MAX_TOKENS, temperature=0.0),
+            )
+        self.assertTrue(helper_result.ids)
+
+        actual, evaluated = self.generate_turn(
+            manager,
+            chat,
+            "What should I bring on the walk?",
+        )
+        self.llama.reset()
+        control = self.make_manager()
+        control_chat = control.chat_lane("control", CHAT_SPEC)
+        self.generate_turn(control, control_chat, "I am planning a quiet walk in the park.")
+        expected, _ = self.generate_turn(
+            control,
+            control_chat,
+            "What should I bring on the walk?",
+        )
+        self.assertLess(evaluated, 60)
+        self.assertEqual(actual.ids, expected.ids)
+        self.print_stats(manager)
+
+    def test_t4_evicted_lane_cold_starts_and_remains_correct(self):
+        manager = self.make_manager(max_snapshot_bytes=1)
+        lane_a = manager.chat_lane("A", CHAT_SPEC)
+        lane_b = manager.chat_lane("B", CHAT_SPEC)
+
+        first, _ = self.generate_turn(manager, lane_a, "I am planning a quiet walk.")
+        self.generate_turn(manager, lane_b, "Tell me one short fact about the moon.")
+        stats = manager.stats()
+        self.assertGreater(stats["evictions"], 0)
+        self.assertFalse(lane_a.warm)
+
+        returned, evaluated = self.generate_turn(
+            manager,
+            lane_a,
+            "What should I bring?",
+        )
+        self.assertGreaterEqual(evaluated, returned.prompt_tokens - 1)
+
+        self.llama.reset()
+        control = self.make_manager()
+        control_a = control.chat_lane("control", CHAT_SPEC)
+        self.generate_turn(control, control_a, "I am planning a quiet walk.")
+        expected, _ = self.generate_turn(control, control_a, "What should I bring?")
+        self.assertEqual(returned.ids, expected.ids)
+        self.assertTrue(first.ids)
+        self.print_stats(manager)
+
+    def test_t5_loaded_history_cold_prefills_then_reuses(self):
+        history = [
+            {"role": "user", "content": "I am planning a quiet walk."},
+            {"role": "assistant", "content": "That sounds relaxing."},
+            {"role": "user", "content": "I prefer tree-lined routes."},
+            {"role": "assistant", "content": "A shaded trail would suit you."},
+            {"role": "user", "content": "I would like lunch afterward."},
+            {"role": "assistant", "content": "You could find a cafe nearby."},
+        ]
+        manager = self.make_manager()
+        lane = manager.chat_lane("restored", CHAT_SPEC, history=history)
+        first, evaluated_first = self.generate_turn(
+            manager,
+            lane,
+            "Suggest a simple plan.",
+        )
+        self.assertEqual(evaluated_first, first.prompt_tokens)
+
+        second, evaluated_second = self.generate_turn(
+            manager,
+            lane,
+            "What should I bring?",
+        )
+        self.assertLess(evaluated_second, 60)
+        self.assertTrue(second.ids)
+        self.print_stats(manager)
+
+    def test_t6_restore_failure_falls_back_to_cold_and_remains_correct(self):
+        manager = self.make_manager()
+        lane_a = manager.chat_lane("A", CHAT_SPEC)
+        lane_b = manager.chat_lane("B", CHAT_SPEC)
+        self.generate_turn(manager, lane_a, "I am planning a quiet walk.")
+        self.generate_turn(manager, lane_b, "Tell me one short fact about the moon.")
+
+        original_restore = lanes_module.restore_snapshot
+        calls = 0
+
+        def fail_once(llama, snapshot):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("simulated restore failure")
+            return original_restore(llama, snapshot)
+
+        with patch.object(lanes_module, "restore_snapshot", side_effect=fail_once):
+            actual, _ = self.generate_turn(manager, lane_a, "What should I bring?")
+
+        self.assertEqual(manager.stats()["restore_failures"], 1)
+        self.assertFalse(lane_a.warm)
+        self.llama.reset()
+        control = self.make_manager()
+        control_a = control.chat_lane("control", CHAT_SPEC)
+        self.generate_turn(control, control_a, "I am planning a quiet walk.")
+        expected, _ = self.generate_turn(control, control_a, "What should I bring?")
+        self.assertEqual(actual.ids, expected.ids)
+        self.print_stats(manager)
+
+    def test_t7_nested_use_spec_conflict_and_forget(self):
+        manager = self.make_manager()
+        lane_a = manager.chat_lane("A", CHAT_SPEC)
+        lane_b = manager.chat_lane("B", CHAT_SPEC)
+        self.generate_turn(manager, lane_a, "I am planning a quiet walk.")
+        self.generate_turn(manager, lane_b, "Tell me one short fact about the moon.")
+        self.assertTrue(lane_a.warm)
+
+        with manager.use(lane_a):
+            with self.assertRaisesRegex(RuntimeError, "nested lane use"):
+                with manager.use(lane_b):
+                    pass
+
+        manager.action_lane(ACTION_SPEC)
+        with self.assertRaises(ValueError):
+            manager.action_lane(
+                LaneSpec(
+                    name=ACTION_SPEC.name,
+                    system_prompt=ACTION_SPEC.system_prompt,
+                    tools=[],
+                    gen_reserve=ACTION_SPEC.gen_reserve,
+                )
+            )
+
+        snapshots_before = manager.stats()["snapshots"]
+        manager.forget_chat("A")
+        self.assertEqual(manager.stats()["snapshots"], snapshots_before - 1)
+        self.assertFalse(lane_a.warm)
+        self.assertIsNot(manager.chat_lane("A", CHAT_SPEC), lane_a)
+        self.print_stats(manager)
+
+    def test_t8_repeated_resident_use_is_a_stats_no_op(self):
+        manager = self.make_manager()
+        lane = manager.chat_lane("A", CHAT_SPEC)
+        self.generate_turn(manager, lane, "I am planning a quiet walk.")
+        before = manager.stats()
+        for _ in range(3):
+            with manager.use(lane):
+                pass
+            self.assertEqual(manager.stats(), before)
+        self.print_stats(manager)
+
+    def _run_context_turns(self, position: str):
+        manager = self.make_manager()
+        lane = manager.chat_lane(f"context-{position}", CHAT_SPEC)
+        evaluations = []
+        context_block = "[Context]\nCurrent date: Sunday, 2026-10-04\n[/Context]"
+        for turn in range(1, 6):
+            _, evaluated = self.generate_turn(
+                manager,
+                lane,
+                f"Turn {turn}: tell me one concise detail about a park.",
+                context_block=context_block,
+                context_position=position,
+            )
+            evaluations.append(evaluated)
+            stats = manager.stats()
+            self.assertEqual(stats["cold_starts"], 1)
+            self.assertEqual(stats["swaps_in"], 0)
+            self.assertEqual(stats["swaps_out"], 0)
+        self.assertTrue(all(value < 150 for value in evaluations[1:]))
+        self.assertLessEqual(evaluations[4], evaluations[1] + 40)
+        self.print_stats(manager)
+        return manager, lane, evaluations
+
+    def test_t9_before_context_keeps_reusing_lane_prefix(self):
+        _, _, evaluations = self._run_context_turns("before")
+        self.assertEqual(len(evaluations), 5)
+
+    def test_t10_after_context_keeps_reusing_lane_prefix(self):
+        _, _, evaluations = self._run_context_turns("after")
+        self.assertEqual(len(evaluations), 5)
+
+    def test_t11_same_spec_chat_lanes_swap_and_restore(self):
+        manager = self.make_manager()
+        lane_a = manager.chat_lane("A-shared-spec", CHAT_SPEC)
+        lane_b = manager.chat_lane("B-shared-spec", CHAT_SPEC)
+        context_block = "[Context]\nCurrent date: Sunday, 2026-10-04\n[/Context]"
+
+        self.generate_turn(
+            manager,
+            lane_a,
+            "I am planning a quiet walk.",
+            context_block=context_block,
+            context_position="before",
+        )
+        self.generate_turn(manager, lane_b, "Tell me a short fact about the moon.")
+        self.assertGreaterEqual(manager.stats()["swaps_out"], 1)
+        self.assertGreaterEqual(manager.stats()["cold_starts"], 2)
+
+        _, evaluated = self.generate_turn(
+            manager,
+            lane_a,
+            "What should I bring?",
+            context_block=context_block,
+            context_position="before",
+        )
+        self.assertLess(evaluated, 150)
+        self.assertGreaterEqual(manager.stats()["swaps_in"], 1)
+        self.print_stats(manager)
+
+    def test_t12_shared_prefix_stops_inside_context_augmented_turn(self):
+        manager = self.make_manager()
+        lane = manager.chat_lane("shared-prefix", CHAT_SPEC)
+        self.generate_turn(
+            manager,
+            lane,
+            "I am planning a quiet walk.",
+            context_block="[Context]\nCurrent date: Sunday, 2026-10-04\n[/Context]",
+            context_position="after",
+        )
+
+        shared = lane.shared_prefix(self.llama)
+        self.assertGreaterEqual(shared, len(lane.context.system_ids))
+        self.assertLess(shared, self.llama.n_tokens)
+        self.assertTrue(lane.matches_llama(self.llama))
+        self.print_stats(manager)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+===== END FILE: tests/test_lanes.py =====
+
+===== FILE: tests/test_lane_engine.py | bytes=14915 | crlf=392 | lf_total=392 | bom=False =====
+"""Real-model tests for per-session synchronous chat-lane orchestration."""
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+from pathlib import Path
+
+os.environ.setdefault("NOVA_LLM_MODEL", "qwen2.5-3b")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from nova.config import LLM_MODELS  # noqa: E402
+from nova.brain.context_manager import ContextManager, LlamaBackend  # noqa: E402
+from nova.brain.generation import GenerationParams, TokenGenerator  # noqa: E402
+from nova.brain.lane_engine import ChatTurnResult, LaneEngine, LaneOverflow  # noqa: E402
+
+MODEL_PATH = LLM_MODELS["qwen2.5-3b"]["path"]
+try:
+    from llama_cpp import Llama
+
+    LLAMA_AVAILABLE = True
+except (ImportError, OSError):
+    Llama = None
+    LLAMA_AVAILABLE = False
+
+SKIP_REASON = (
+    "Requires llama-cpp-python and the configured Qwen2.5-3B GGUF "
+    f"(llama_cpp available={LLAMA_AVAILABLE}, model exists={MODEL_PATH.is_file()})."
+)
+SYSTEM = "You are Nova, a concise assistant. Answer clearly and briefly."
+PARAMS = GenerationParams(max_tokens=12, temperature=0.0)
+
+
+class EvalCounter:
+    """Count llama eval tokens until the first nonempty generated text delta."""
+
+    def __init__(self, llama) -> None:
+        self.llama = llama
+        self.total = 0
+        self.active = True
+        self._original_eval = None
+
+    def __enter__(self):
+        self._original_eval = self.llama.eval
+
+        def counted(tokens, *args, **kwargs):
+            if self.active:
+                self.total += len(tokens)
+            return self._original_eval(tokens, *args, **kwargs)
+
+        self.llama.eval = counted
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        del self.llama.eval
+
+    def stop_counting(self) -> None:
+        self.active = False
+
+
+@unittest.skipUnless(LLAMA_AVAILABLE and MODEL_PATH.is_file(), SKIP_REASON)
+class LaneEngineTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.llama = Llama(
+            model_path=str(MODEL_PATH),
+            n_ctx=1024,
+            n_threads=4,
+            verbose=False,
+        )
+        cls.backend = LlamaBackend(cls.llama)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.llama.close()
+
+    def setUp(self):
+        self.llama.reset()
+        self.engine = self.make_engine()
+
+    def tearDown(self):
+        print(f"LaneEngine stats: {self.engine.stats()}")
+
+    def make_engine(
+        self,
+        gen_reserve: int = 160,
+        load_fraction: float = 0.5,
+        compact_fraction: float = 0.35,
+    ) -> LaneEngine:
+        return LaneEngine(
+            self.llama,
+            n_ctx=1024,
+            system_prompt=SYSTEM,
+            gen_reserve=gen_reserve,
+            load_fraction=load_fraction,
+            compact_fraction=compact_fraction,
+        )
+
+    def run_stream(
+        self,
+        engine: LaneEngine,
+        session_id: str,
+        user_text: str,
+        context_block: str | None = None,
+        history_messages: list[dict] | None = None,
+        should_stop=None,
+    ) -> tuple[ChatTurnResult, int, str]:
+        result = None
+        deltas: list[str] = []
+        stream = engine.chat_stream(
+            session_id,
+            user_text,
+            context_block,
+            history_messages,
+            PARAMS,
+            should_stop,
+        )
+        counter = EvalCounter(self.llama)
+        try:
+            with counter:
+                for item in stream:
+                    if isinstance(item, str):
+                        deltas.append(item)
+                        if item:
+                            counter.stop_counting()
+                    else:
+                        result = item
+        finally:
+            stream.close()
+        if result is None:
+            raise AssertionError("chat_stream did not return a ChatTurnResult.")
+        return result, counter.total, "".join(deltas)
+
+    def run_chat(self, *args, **kwargs) -> ChatTurnResult:
+        return self.engine.chat(*args, params=PARAMS, **kwargs)
+
+    def completion_text(self, messages: list[dict]) -> str:
+        self.llama.reset()
+        response = self.llama.create_chat_completion(
+            messages=messages,
+            max_tokens=12,
+            temperature=0.0,
+        )
+        return response["choices"][0]["message"]["content"].strip()
+
+    def test_t1_context_blocks_reuse_lane_and_commit_exact_ids(self):
+        engine = self.make_engine()
+        context = "[Context]\n" + ("Current date and useful reference details. " * 20) + "[/Context]"
+        history: list[dict] = []
+        initial_history_ids = None
+        evaluations = []
+        for turn in range(1, 7):
+            before = (
+                engine._lanes["session"].context.history_ids
+                if engine.has_lane("session")
+                else None
+            )
+            result, evaluated, _ = self.run_stream(
+                engine,
+                "session",
+                f"Turn {turn}: give one short useful suggestion.",
+                context,
+                history,
+            )
+            self.assertTrue(result.committed)
+            lane = engine._lanes["session"]
+            if before is None:
+                initial_history_ids = list(lane.context.history_ids)
+            else:
+                self.assertGreater(len(lane.context.history_ids), len(before))
+                self.assertEqual(lane.context.history_ids[: len(before)], before)
+            history.extend(
+                (
+                    {"role": "user", "content": f"Turn {turn}: give one short useful suggestion."},
+                    {"role": "assistant", "content": result.text},
+                )
+            )
+            evaluations.append(evaluated)
+            self.assertEqual(engine.stats()["cold_starts"], 1)
+        self.assertIsNotNone(initial_history_ids)
+        self.assertTrue(all(value < 220 for value in evaluations[1:]))
+        self.assertLessEqual(evaluations[5], evaluations[1] + 40)
+        print(f"LaneEngine stats: {engine.stats()}")
+
+    def test_t2_context_turn_matches_chat_completion(self):
+        transcript = [
+            {"role": "user", "content": "I enjoy short walks."},
+            {"role": "assistant", "content": "Enjoy your short walks!"},
+            {"role": "user", "content": "I prefer quiet parks."},
+            {"role": "assistant", "content": "Relax in a quiet park."},
+        ]
+        context = "[Context]\nCurrent date: Monday, 2026-10-05\n[/Context]"
+        current_user = "Suggest one thing I could do today."
+        engine = self.make_engine()
+        actual = engine.chat(
+            "parity",
+            current_user,
+            context,
+            transcript,
+            PARAMS,
+        )
+        expected = self.completion_text(
+            [
+                {"role": "system", "content": SYSTEM},
+                *transcript,
+                {"role": "user", "content": f"{context}\n\n{current_user}"},
+            ]
+        )
+        self.assertEqual(actual.text.strip(), expected)
+        print(f"LaneEngine stats: {engine.stats()}")
+
+    def test_t3_external_turn_is_included_in_following_prompt(self):
+        first = self.run_chat("external", "I like quiet gardens.", None, [])
+        transcript = [
+            {"role": "user", "content": "I like quiet gardens."},
+            {"role": "assistant", "content": first.text},
+        ]
+        self.engine.record_external_turn(
+            "external",
+            "I also enjoy birdwatching.",
+            "That is a peaceful hobby.",
+        )
+        transcript.extend(
+            (
+                {"role": "user", "content": "I also enjoy birdwatching."},
+                {"role": "assistant", "content": "That is a peaceful hobby."},
+            )
+        )
+        current_user = "Suggest a relaxing weekend activity."
+        actual = self.run_chat("external", current_user, None, transcript)
+        expected = self.completion_text(
+            [
+                {"role": "system", "content": SYSTEM},
+                *transcript,
+                {"role": "user", "content": current_user},
+            ]
+        )
+        self.assertEqual(actual.text.strip(), expected)
+        self.assertEqual(self.engine.stats()["external_turns"], 1)
+
+    def test_t4_restart_rebuilds_history_then_reuses_it(self):
+        messages: list[dict] = []
+        original_results = []
+        for user_text in ("I am planning a park visit.", "I like shaded paths."):
+            result = self.run_chat("original", user_text, None, messages)
+            original_results.append(result)
+            messages.extend(
+                (
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": result.text},
+                )
+            )
+
+        restarted = self.make_engine()
+        first_user = "What should I bring?"
+        first, first_evaluated, _ = self.run_stream(
+            restarted,
+            "restored",
+            first_user,
+            history_messages=messages,
+        )
+        second_user = "What is a good time to go?"
+        second, second_evaluated, _ = self.run_stream(
+            restarted,
+            "restored",
+            second_user,
+            history_messages=messages,
+        )
+        self.assertGreaterEqual(first_evaluated, first.metrics["prompt_tokens"] - 1)
+        self.assertLess(second_evaluated, 220)
+
+        control = self.make_engine()
+        for user_text in ("I am planning a park visit.", "I like shaded paths."):
+            control.chat("control", user_text, None, [], PARAMS)
+        expected_first = control.chat("control", first_user, None, messages, PARAMS)
+        expected_second = control.chat("control", second_user, None, messages, PARAMS)
+        self.assertEqual(first.text, expected_first.text)
+        self.assertEqual(second.text, expected_second.text)
+        self.assertEqual(len(original_results), 2)
+
+    def test_t5_streaming_and_cancellation(self):
+        deltas_result, _, deltas = self.run_stream(
+            self.engine,
+            "stream",
+            "Explain briefly why leaves change color.",
+        )
+        self.assertEqual(deltas, deltas_result.text)
+        self.assertTrue(deltas_result.committed)
+
+        lane = self.engine._lanes["stream"]
+        before = lane.context.history_ids
+        checks = 0
+
+        def should_stop():
+            nonlocal checks
+            checks += 1
+            return checks >= 3
+
+        cancelled, _, _ = self.run_stream(
+            self.engine,
+            "stream",
+            "Continue with three more details.",
+            should_stop=should_stop,
+        )
+        self.assertEqual(cancelled.finish_reason, "cancelled")
+        self.assertFalse(cancelled.committed)
+        self.assertEqual(lane.context.history_ids, before)
+
+    def test_t6_compaction_rebuilds_from_supplied_history(self):
+        engine = self.make_engine(gen_reserve=64)
+        history: list[dict] = []
+        for turn in range(24):
+            user_text = f"Turn {turn}: " + ("describe a peaceful garden in detail. " * 12)
+            result = engine.chat(
+                "compact",
+                user_text,
+                None,
+                history,
+                GenerationParams(max_tokens=12, temperature=0.0),
+            )
+            self.assertTrue(result.committed)
+            history.extend(
+                (
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": result.text},
+                )
+            )
+        self.assertGreater(engine.stats()["compactions"], 0)
+        self.assertTrue(engine.has_lane("compact"))
+        self.assertTrue(engine._lanes["compact"].context.history_ids)
+        print(f"LaneEngine stats: {engine.stats()}")
+
+    def test_t7_overflow_leaves_engine_ready_for_next_turn(self):
+        with self.assertRaises(LaneOverflow):
+            self.run_chat("overflow", "A long request. " * 3000, None, [])
+        self.assertGreaterEqual(self.engine.stats()["overflows"], 1)
+        self.assertTrue(self.engine.has_lane("overflow"))
+        recovered = self.run_chat("overflow", "Reply with one short greeting.", None, [])
+        self.assertTrue(recovered.committed)
+
+    def test_t8_borrow_preserves_chat_lane_for_next_turn(self):
+        first = self.run_chat("borrow", "I am planning a quiet walk.", None, [])
+        helper = ContextManager(self.backend, n_ctx=1024, gen_reserve=64)
+        helper.start_session("You are an unrelated helper.")
+        helper_prompt = helper.begin_turn("Give one short fact about the moon.")
+        with self.engine.borrow():
+            helper_result = TokenGenerator(
+                self.llama,
+                {helper.end_of_turn_id, int(self.llama.token_eos())},
+            ).generate(
+                helper_prompt,
+                GenerationParams(max_tokens=12, temperature=0.0),
+            )
+        self.assertTrue(helper_result.ids)
+        next_user = "What should I bring on the walk?"
+        actual, evaluated, _ = self.run_stream(
+            self.engine,
+            "borrow",
+            next_user,
+        )
+
+        control = self.make_engine()
+        control_first = control.chat("control", "I am planning a quiet walk.", None, [], PARAMS)
+        expected = control.chat("control", next_user, None, [], PARAMS)
+        self.assertLess(evaluated, 220)
+        self.assertEqual(first.text, control_first.text)
+        self.assertEqual(actual.text, expected.text)
+
+    def test_t9_metrics_include_expected_fields(self):
+        result = self.run_chat("metrics", "Say hello briefly.", None, [])
+        expected = {
+            "completion_tokens",
+            "prompt_tokens",
+            "elapsed_seconds",
+            "total_elapsed_seconds",
+            "tokens_per_second",
+            "decode_tokens_per_second",
+            "ttft_seconds",
+            "cache_hit_tokens",
+            "evaluated_tokens",
+            "lane",
+        }
+        self.assertTrue(expected.issubset(result.metrics))
+        stop_ids = {self.engine._lanes["metrics"].context.end_of_turn_id, int(self.llama.token_eos())}
+        non_stop_ids = [token_id for token_id in result.ids if token_id not in stop_ids]
+        self.assertEqual(result.metrics["completion_tokens"], len(non_stop_ids))
+        self.assertLessEqual(result.metrics["ttft_seconds"], result.metrics["elapsed_seconds"])
+        self.assertEqual(result.metrics["lane"], "chat:4:chat:7:metrics")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+===== END FILE: tests/test_lane_engine.py =====
+
+===== FILE: tests/test_llm_engine_lanes.py | bytes=12233 | crlf=334 | lf_total=334 | bom=False =====
+"""Integration tests for the opt-in LLMEngine KV-lane path."""
+from __future__ import annotations
+
+import asyncio
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+_DATA_DIR = tempfile.TemporaryDirectory(prefix="nova-llm-lanes-")
+os.environ["NOVA_LLM_MODEL"] = "qwen2.5-3b"
+os.environ["NOVA_LLM_CTX"] = "2048"
+os.environ["NOVA_DATA_DIR"] = _DATA_DIR.name
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from nova.config import LLM_MODELS  # noqa: E402
+from nova.brain import llm_engine as llm_engine_module  # noqa: E402
+from nova.brain.llm_engine import LLMEngine  # noqa: E402
+
+MODEL_PATH = LLM_MODELS["qwen2.5-3b"]["path"]
+try:
+    from llama_cpp import Llama
+
+    LLAMA_AVAILABLE = Llama is not None
+except (ImportError, OSError):
+    LLAMA_AVAILABLE = False
+
+SKIP_REASON = (
+    "Requires llama-cpp-python and the configured Qwen2.5-3B GGUF "
+    f"(llama_cpp available={LLAMA_AVAILABLE}, model exists={MODEL_PATH.is_file()})."
+)
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+@unittest.skipUnless(LLAMA_AVAILABLE and MODEL_PATH.is_file(), SKIP_REASON)
+class LLMEngineLanes01OffTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.flag_patcher = patch.object(llm_engine_module, "LLM_KV_LANES", False)
+        cls.flag_patcher.start()
+        cls.engine = LLMEngine()
+        cls.engine.load()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.engine._llm is not None:
+            cls.engine._llm.close()
+        cls.flag_patcher.stop()
+
+    def test_t1_flag_off_preserves_legacy_generation_and_helpers(self):
+        self.assertFalse(self.engine.lanes_enabled)
+        self.assertEqual(self.engine.lane_stats(), {"enabled": False})
+        response = run(
+            self.engine.generate_with_tools(
+                "Reply with a short greeting.",
+                [],
+                history=[],
+                intent="chat",
+                session_id="off-session",
+            )
+        )
+        self.assertEqual(response["type"], "text")
+        self.assertTrue(response["content"])
+        run(
+            self.engine.record_external_turn(
+                "off-session",
+                "External question.",
+                "External response.",
+            )
+        )
+        self.assertFalse(self.engine.has_lane("off-session"))
+
+
+@unittest.skipUnless(LLAMA_AVAILABLE and MODEL_PATH.is_file(), SKIP_REASON)
+class LLMEngineLanes02EnabledTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.flag_patcher = patch.object(llm_engine_module, "LLM_KV_LANES", True)
+        cls.flag_patcher.start()
+        cls.engine = LLMEngine()
+        cls.engine.load()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.engine._llm is not None:
+            cls.engine._llm.close()
+        cls.flag_patcher.stop()
+
+    def setUp(self):
+        self.engine._llm.reset()
+
+    @property
+    def llama(self):
+        return self.engine._llm
+
+    def chat(self, session_id: str, user_text: str, history=None, memory_context=""):
+        return run(
+            self.engine.generate_with_tools(
+                user_text,
+                [],
+                memory_context=memory_context,
+                history=history or [],
+                intent="chat",
+                session_id=session_id,
+            )
+        )
+
+    def test_t2_flag_on_drops_llama_ram_cache(self):
+        self.assertTrue(self.engine.lanes_enabled)
+        self.assertIsNone(self.llama.cache)
+
+    def test_t3_six_turns_reuse_history_with_memory_context(self):
+        session_id = "reuse-session"
+        history: list[dict] = []
+        memory = (
+            '{"preferences":["quiet walks","gardens","birdwatching"],'
+            '"home":"near the river","schedule":"usually free in the morning",'
+            '"interests":["nature","reading","local history"]}'
+        )
+        metrics = []
+        for turn in range(1, 7):
+            response = self.chat(
+                session_id,
+                f"Turn {turn}: give one concise suggestion based on what you know.",
+                history,
+                memory,
+            )
+            self.assertEqual(response["type"], "text")
+            self.assertTrue(response["content"])
+            metrics.append(response["metrics"])
+            history.extend(
+                (
+                    {
+                        "role": "user",
+                        "content": f"Turn {turn}: give one concise suggestion based on what you know.",
+                    },
+                    {"role": "assistant", "content": response["content"]},
+                )
+            )
+        self.assertTrue(
+            all(
+                {"completion_tokens", "prompt_tokens", "elapsed_seconds",
+                 "total_elapsed_seconds", "tokens_per_second", "cache_hit_tokens"}
+                <= metric.keys()
+                for metric in metrics
+            )
+        )
+        self.assertTrue(all(metric["evaluated_tokens"] < 250 for metric in metrics[1:]))
+        self.assertLessEqual(
+            metrics[5]["evaluated_tokens"],
+            metrics[1]["evaluated_tokens"] + 40,
+        )
+
+    def test_t4_context_block_matches_legacy_message_format(self):
+        session_id = "parity-session"
+        user_text = "Suggest something to do today."
+        memory = '{"hobbies":["walking","gardening"],"preference":"quiet places"}'
+        captured = {}
+        original_chat = self.engine._lanes.chat
+
+        def capture(*args, **kwargs):
+            captured["session_id"] = args[0]
+            captured["user_text"] = args[1]
+            captured["context_block"] = args[2]
+            return original_chat(*args, **kwargs)
+
+        history = [
+            {"role": "user", "content": "I like being outside."},
+            {"role": "assistant", "content": "A walk may be enjoyable."},
+        ]
+        with (
+            patch.object(
+                LLMEngine,
+                "_current_date_context",
+                return_value="Current date: Monday, 2026-10-05",
+            ),
+            patch.object(self.engine._lanes, "chat", side_effect=capture),
+        ):
+            response = self.chat(session_id, user_text, history, memory)
+            legacy_last = self.engine._build_messages(
+                user_text,
+                memory,
+                [],
+                history,
+                "chat",
+            )[-1]["content"]
+        self.assertEqual(captured["session_id"], session_id)
+        self.assertEqual(captured["user_text"], user_text)
+        self.assertEqual(
+            captured["context_block"] + "\n\n" + captured["user_text"],
+            legacy_last,
+        )
+        self.assertTrue(response["content"])
+
+    def test_t5_raw_helper_preserves_chat_lane(self):
+        session_id = "helper-session"
+        history: list[dict] = []
+        first = self.chat(session_id, "I enjoy quiet walks.", history)
+        history.extend(
+            (
+                {"role": "user", "content": "I enjoy quiet walks."},
+                {"role": "assistant", "content": first["content"]},
+            )
+        )
+        second = self.chat(session_id, "I prefer tree-lined routes.", history)
+        history.extend(
+            (
+                {"role": "user", "content": "I prefer tree-lined routes."},
+                {"role": "assistant", "content": second["content"]},
+            )
+        )
+        run(
+            self.engine.generate_raw(
+                "You are an unrelated helper.",
+                "Give one short fact about the moon.",
+                max_tokens=12,
+            )
+        )
+        third = self.chat(session_id, "What should I bring?", history)
+        self.assertLess(third["metrics"]["evaluated_tokens"], 250)
+
+    def test_t6_external_turn_does_not_start_a_new_lane(self):
+        session_id = "external-session"
+        history: list[dict] = []
+        first = self.chat(session_id, "I enjoy birdwatching.", history)
+        history.extend(
+            (
+                {"role": "user", "content": "I enjoy birdwatching."},
+                {"role": "assistant", "content": first["content"]},
+            )
+        )
+        cold_starts = self.engine.lane_stats()["cold_starts"]
+        run(
+            self.engine.record_external_turn(
+                session_id,
+                "I also like quiet gardens.",
+                "Gardens can be peaceful places to watch birds.",
+            )
+        )
+        history.extend(
+            (
+                {"role": "user", "content": "I also like quiet gardens."},
+                {"role": "assistant", "content": "Gardens can be peaceful places to watch birds."},
+            )
+        )
+        result = self.chat(session_id, "Suggest a relaxing activity.", history)
+        self.assertTrue(result["content"])
+        self.assertEqual(self.engine.lane_stats()["cold_starts"], cold_starts)
+
+    def test_t7_lane_failure_falls_back_and_next_call_works(self):
+        session_id = "fallback-session"
+        with patch.object(
+            self.engine._lanes,
+            "chat",
+            side_effect=RuntimeError("simulated lane failure"),
+        ):
+            response = self.chat(session_id, "Say hello briefly.")
+        self.assertEqual(response["type"], "text")
+        self.assertTrue(response["content"])
+        self.assertFalse(self.engine.has_lane(session_id))
+        next_response = self.chat(session_id, "Give one short greeting.")
+        self.assertEqual(next_response["type"], "text")
+        self.assertTrue(next_response["content"])
+
+    def test_t8_stream_reuses_lane_and_cancels_on_early_close(self):
+        session_id = "stream-session"
+
+        async def collect(user_text):
+            return [
+                event
+                async for event in self.engine.stream_chat(
+                    user_text,
+                    history=[],
+                    intent="chat",
+                    session_id=session_id,
+                )
+            ]
+
+        first_events = run(collect("I like quiet parks."))
+        self.assertTrue(first_events[-1]["type"] == "done")
+        self.assertTrue(first_events[-1]["metrics"])
+        self.assertTrue(all(event["type"] == "text_delta" for event in first_events[:-1]))
+
+        second_events = run(collect("What should I bring on a walk?"))
+        self.assertEqual(second_events[-1]["type"], "done")
+        self.assertLess(second_events[-1]["metrics"]["evaluated_tokens"], 250)
+
+        lane = self.engine._lanes._lanes[session_id]
+        history_before = lane.context.history_ids
+
+        async def consume_two_then_close():
+            stream = self.engine.stream_chat(
+                "Explain how trees grow.",
+                history=[],
+                intent="chat",
+                session_id=session_id,
+            )
+            deltas = 0
+            try:
+                async for event in stream:
+                    if event["type"] == "text_delta":
+                        deltas += 1
+                    if deltas == 2:
+                        return
+            finally:
+                await stream.aclose()
+
+        run(consume_two_then_close())
+        self.assertEqual(lane.context.history_ids, history_before)
+        next_result = self.chat(session_id, "Say one short sentence about trees.")
+        self.assertTrue(next_result["content"])
+        self.assertTrue(self.engine.has_lane(session_id))
+
+    def test_t9_qwen3_guard_leaves_lanes_disabled(self):
+        original_model_id = self.engine._active_model_id
+        self.engine._active_model_id = "qwen3-1.7b"
+        try:
+            self.engine._init_lanes()
+            self.assertIsNone(self.engine._lanes)
+            self.assertFalse(self.engine.lanes_enabled)
+        finally:
+            self.engine._active_model_id = original_model_id
+            self.engine._init_lanes()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+===== END FILE: tests/test_llm_engine_lanes.py =====
+
+===== FILE: tests/test_main_lanes.py | bytes=14395 | crlf=399 | lf_total=399 | bom=False =====
+"""Lane-state wiring tests for nova.main without loading an inference model."""
+from __future__ import annotations
+
+import asyncio
+import importlib.machinery
+import json
+import os
+import sys
+import tempfile
+import types
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+_DATA_DIR = tempfile.TemporaryDirectory(prefix="nova-main-lanes-")
+os.environ["NOVA_DATA_DIR"] = _DATA_DIR.name
+
+
+def _module(name: str, *, package: bool = False, **attributes):
+    module = types.ModuleType(name)
+    module.__spec__ = importlib.machinery.ModuleSpec(
+        name,
+        loader=None,
+        is_package=package,
+    )
+    if package:
+        module.__path__ = []
+    for attribute, value in attributes.items():
+        setattr(module, attribute, value)
+    sys.modules[name] = module
+    return module
+
+
+STUBBED_MODULES: list[str] = []
+try:
+    import fastapi  # noqa: F401
+except ModuleNotFoundError as exc:
+    if exc.name != "fastapi":
+        raise
+
+    class _FastAPI:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def add_middleware(self, *args, **kwargs):
+            pass
+
+        def mount(self, *args, **kwargs):
+            pass
+
+        def _route(self, *args, **kwargs):
+            return lambda function: function
+
+        on_event = _route
+        get = _route
+        post = _route
+        websocket = _route
+
+    class _HTTPException(Exception):
+        pass
+
+    class _WebSocketDisconnect(Exception):
+        pass
+
+    class _Placeholder:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    _module(
+        "fastapi",
+        package=True,
+        FastAPI=_FastAPI,
+        HTTPException=_HTTPException,
+        WebSocket=_Placeholder,
+        WebSocketDisconnect=_WebSocketDisconnect,
+    )
+    _module("fastapi.middleware", package=True)
+    _module("fastapi.middleware.cors", CORSMiddleware=_Placeholder)
+    _module("fastapi.staticfiles", StaticFiles=_Placeholder)
+    _module("fastapi.responses", HTMLResponse=_Placeholder)
+    STUBBED_MODULES.extend(
+        (
+            "fastapi",
+            "fastapi.middleware",
+            "fastapi.middleware.cors",
+            "fastapi.staticfiles",
+            "fastapi.responses",
+        )
+    )
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from nova import main  # noqa: E402
+from nova.memory import session_memory  # noqa: E402
+
+
+class FakeEngine:
+    def __init__(self, lanes_enabled: bool, decision: dict | None = None):
+        self.lanes_enabled = lanes_enabled
+        self._loaded = True
+        self.decision = decision or {
+            "type": "text",
+            "content": "Test reply.",
+            "metrics": {},
+        }
+        self.generate_calls: list[dict] = []
+        self.stream_calls: list[dict] = []
+        self.external_calls: list[tuple[str, str, str]] = []
+        self.forget_calls: list[str] = []
+        self._lanes_present: set[str] = set()
+
+    async def generate_with_tools(self, **kwargs):
+        self.generate_calls.append(kwargs)
+        self._lanes_present.add(kwargs["session_id"])
+        return self.decision
+
+    async def stream_chat(self, *args, **kwargs):
+        self.stream_calls.append({"args": args, **kwargs})
+        yield {"type": "text_delta", "text": "A streamed reply."}
+        yield {
+            "type": "done",
+            "text": "A streamed reply.",
+            "metrics": {"completion_tokens": 3},
+        }
+
+    async def record_external_turn(self, session_id, user_text, assistant_text):
+        self.external_calls.append((session_id, user_text, assistant_text))
+
+    async def forget_lane(self, session_id):
+        self.forget_calls.append(session_id)
+        self._lanes_present.discard(session_id)
+
+    def has_lane(self, session_id):
+        return session_id in self._lanes_present
+
+    def lane_stats(self):
+        return {"enabled": self.lanes_enabled}
+
+    def list_models(self):
+        return []
+
+
+class FakeTTS:
+    _loaded = True
+
+    async def synthesize_stream(self, text):
+        yield b""
+
+    def sample_rate(self):
+        return 16000
+
+    def list_available_voices(self):
+        return []
+
+
+class FakeRouter:
+    tool_schemas = [
+        {
+            "type": "function",
+            "function": {"name": "ytm_play", "parameters": {"type": "object"}},
+        }
+    ]
+
+    @staticmethod
+    def dispatch(name, arguments):
+        return "Playing jazz."
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+class MainLaneTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.engine = FakeEngine(lanes_enabled=True)
+        self.histories: dict[str, list[dict]] = {}
+        self.context_limits: list[int] = []
+        self.engine.decision = {
+            "type": "text",
+            "content": "Test reply.",
+            "metrics": {},
+        }
+        self.stack.enter_context(patch.object(main, "llm_engine", self.engine))
+        self.stack.enter_context(patch.object(main, "tts_engine", FakeTTS()))
+        self.stack.enter_context(patch.object(main, "core_store", MagicMock()))
+        self.stack.enter_context(patch.object(main, "tool_router", FakeRouter()))
+        self.stack.enter_context(
+            patch.object(
+                main,
+                "classify_intent",
+                new=self._classify_intent,
+            )
+        )
+        self.stack.enter_context(
+            patch.object(
+                main,
+                "filter_tools_for_intent",
+                side_effect=lambda schemas, intent: schemas if intent.startswith("action_") else [],
+            )
+        )
+        self.stack.enter_context(patch.object(main, "wants_vault_context", return_value=False))
+        self.stack.enter_context(
+            patch.object(main.vault_store, "get_profile_fields", return_value={})
+        )
+        self.stack.enter_context(
+            patch.object(main.vault_store, "get_context_snippet", return_value={
+                "preferences": {},
+                "relevant_knowledge": [],
+                "knowledge_context": "",
+            })
+        )
+        self.stack.enter_context(
+            patch.object(main, "_answer_from_memory", return_value=None)
+        )
+        self.stack.enter_context(
+            patch.object(main, "get_session_summary", return_value="test summary")
+        )
+        self.append_turn_patcher = patch.object(
+            main, "append_turn", side_effect=self._append_turn
+        )
+        self.get_context_patcher = patch.object(
+            main, "get_context", side_effect=self._get_context
+        )
+        self.append_turn_patcher.start()
+        self.get_context_patcher.start()
+        self.addCleanup(self.append_turn_patcher.stop)
+        self.addCleanup(self.get_context_patcher.stop)
+        self.stack.enter_context(patch.object(main, "clear_session"))
+        self.stack.enter_context(patch.object(main.memory_agent, "process_turn", return_value=None))
+
+    async def _classify_intent(self, user_text, llm):
+        return {
+            "intent": getattr(self, "intent", "chat"),
+            "source": "test",
+            "confidence": 1.0,
+        }
+
+    def _append_turn(self, session_id, role, content):
+        self.histories.setdefault(session_id, []).append(
+            {"role": role, "content": content}
+        )
+
+    def _get_context(self, session_id, limit=20):
+        self.context_limits.append(limit)
+        return list(self.histories.get(session_id, []))[-limit:]
+
+    def test_t1_lane_chat_uses_full_persisted_history_and_stores_pair(self):
+        session_id = "seeded-lane-history"
+        memory_dir = Path(_DATA_DIR.name) / "session-memory-t1"
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        previous_memory_dir = session_memory.SESSION_MEMORY_DIR
+        session_memory.SESSION_MEMORY_DIR = memory_dir
+        self.addCleanup(
+            setattr,
+            session_memory,
+            "SESSION_MEMORY_DIR",
+            previous_memory_dir,
+        )
+        self.append_turn_patcher.stop()
+        self.get_context_patcher.stop()
+        session_memory.clear_session(session_id)
+        for index in range(15):
+            session_memory.append_turn(session_id, "user", f"Seed user {index}.")
+            session_memory.append_turn(session_id, "assistant", f"Seed reply {index}.")
+
+        self.engine.decision = {
+            "type": "text",
+            "content": "Lane answer.",
+            "metrics": {"lane": "chat:test"},
+        }
+        result = run(main.run_pipeline("What next?", session_id))
+        self.assertEqual(result[0], "Lane answer.")
+        call = self.engine.generate_calls[-1]
+        self.assertEqual(call["session_id"], session_id)
+        self.assertEqual(len(call["history"]), 30)
+        self.assertEqual(call["history"][0]["content"], "Seed user 0.")
+        stored = json.loads(
+            session_memory._session_file(session_id).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [(message["role"], message["content"]) for message in stored["history"][-2:]],
+            [("user", "What next?"), ("assistant", "Lane answer.")],
+        )
+        self.assertEqual(self.engine.external_calls, [])
+
+    def test_t2_legacy_chat_decision_is_recorded_once(self):
+        run(main.run_pipeline("Tell me something.", "legacy"))
+        self.assertEqual(
+            self.engine.external_calls,
+            [("legacy", "Tell me something.", "Test reply.")],
+        )
+
+    def test_t3_action_tool_result_is_recorded(self):
+        self.intent = "action_music"
+        self.engine.decision = {
+            "type": "tool_call",
+            "name": "ytm_play",
+            "arguments": {"query": "jazz"},
+            "metrics": {},
+        }
+        result = run(main.run_pipeline("Play jazz.", "action"))
+        self.assertEqual(result[0], "Playing jazz.")
+        self.assertEqual(
+            self.engine.external_calls,
+            [("action", "Play jazz.", "Playing jazz.")],
+        )
+
+    def test_t4_session_commands_sync_or_forget_lane(self):
+        run(main.run_pipeline("show summary", "summary-session"))
+        self.assertEqual(len(self.engine.external_calls), 1)
+        self.assertEqual(self.engine.external_calls[0][:2], ("summary-session", "show summary"))
+        self.assertTrue(self.engine.external_calls[0][2])
+
+        external_count = len(self.engine.external_calls)
+        run(main.run_pipeline("clear the chat history", "clear-session"))
+        self.assertEqual(self.engine.forget_calls, ["clear-session"])
+        self.assertEqual(len(self.engine.external_calls), external_count)
+
+    def test_t5_memory_recall_direct_answer_syncs_lane(self):
+        self.intent = "memory_recall"
+        with patch.object(main, "_answer_from_memory", return_value="I recall it."):
+            result = run(main.run_pipeline("What do you remember?", "memory"))
+        self.assertEqual(result[0], "I recall it.")
+        self.assertEqual(
+            self.engine.external_calls,
+            [("memory", "What do you remember?", "I recall it.")],
+        )
+
+    def test_t6_disabled_lanes_keep_12_message_history_without_sync(self):
+        self.engine.lanes_enabled = False
+        self.histories["off"] = [
+            {"role": "user" if index % 2 == 0 else "assistant", "content": str(index)}
+            for index in range(30)
+        ]
+        run(main.run_pipeline("A normal question.", "off"))
+        self.assertEqual(len(self.engine.generate_calls[-1]["history"]), 12)
+        self.assertEqual(self.engine.generate_calls[-1]["session_id"], "off")
+        self.assertEqual(self.engine.external_calls, [])
+        self.assertEqual(self.engine.forget_calls, [])
+
+    def test_t7_websocket_stream_receives_session_and_long_history(self):
+        session_id = "ws-session"
+        self.histories[session_id] = [
+            {"role": "user" if index % 2 == 0 else "assistant", "content": str(index)}
+            for index in range(30)
+        ]
+        disconnect_type = main.WebSocketDisconnect
+
+        class FakeWebSocket:
+            def __init__(self, current_session_id):
+                self.query_params = {"session_id": current_session_id}
+                self._nova_session_id = current_session_id
+                self.sent = []
+                self.received = False
+
+            async def accept(self):
+                pass
+
+            async def receive_text(self):
+                if not self.received:
+                    self.received = True
+                    return json.dumps(
+                        {"type": "text", "text": "hello", "stream": True}
+                    )
+                raise disconnect_type()
+
+            async def send_text(self, text):
+                self.sent.append(json.loads(text))
+
+        websocket = FakeWebSocket(session_id)
+        run(main.websocket_endpoint(websocket))
+        call = self.engine.stream_calls[-1]
+        self.assertEqual(call["session_id"], session_id)
+        self.assertEqual(len(call["history"]), 30)
+        self.assertIn(400, self.context_limits)
+        self.assertTrue(any(message["type"] == "text" for message in websocket.sent))
+        self.assertTrue(any(message["type"] == "metrics" for message in websocket.sent))
+
+        self.engine.lanes_enabled = False
+        self.histories["ws-off-session"] = [
+            {"role": "user" if index % 2 == 0 else "assistant", "content": str(index)}
+            for index in range(30)
+        ]
+        off_websocket = FakeWebSocket("ws-off-session")
+        run(main.websocket_endpoint(off_websocket))
+        self.assertEqual(len(self.engine.stream_calls[-1]["history"]), 12)
+        self.assertEqual(self.engine.stream_calls[-1]["session_id"], "ws-off-session")
+        self.assertEqual(self.context_limits[-1], 12)
+
+    def test_t8_status_reports_lane_stats(self):
+        response = run(main.get_status())
+        self.assertEqual(response["kv_lanes"], {"enabled": True})
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+===== END FILE: tests/test_main_lanes.py =====
+
+===== FILE: tests/test_kv_state.py | bytes=17143 | crlf=460 | lf_total=460 | bom=False =====
+from __future__ import annotations
+
+import importlib.metadata
+import os
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+from itertools import islice
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from nova.config import LLM_MODELS, NOVA_PERSONA_PROMPT
+from nova.brain import kv_state
+from nova.brain.kv_state import (
+    live_meta,
+    load_snapshot_for,
+    restore_snapshot,
+    save_snapshot,
+    snapshot_from_file,
+    snapshot_nbytes,
+    snapshot_to_file,
+)
+
+MODEL_PATH = LLM_MODELS["qwen2.5-3b"]["path"]
+try:
+    import llama_cpp
+
+    LLAMA_CPP_AVAILABLE = True
+except (ImportError, OSError):
+    llama_cpp = None
+    LLAMA_CPP_AVAILABLE = False
+
+MODEL_AVAILABLE = MODEL_PATH.is_file()
+SKIP_REASON = (
+    "Requires llama-cpp-python and the configured Qwen2.5-3B GGUF "
+    f"(llama_cpp available={LLAMA_CPP_AVAILABLE}, model exists={MODEL_AVAILABLE})."
+)
+MAX_GENERATED_TOKENS = 12
+FOLLOW_UP = "What did we establish in the previous message?"
+FIRST_USER_MESSAGE = "We are planning a calm day in a nearby park."
+UNRELATED_USER_MESSAGE = (
+    "This is a separate unrelated lane with changing details. "
+    "The weather is clear, the train is on time, and the cafe is open. "
+) * 30
+
+
+def greedy_generate(llama, prompt_ids):
+    """Generate exactly up to twelve greedy tokens using generate's default reset."""
+    generator = llama.generate(prompt_ids, temp=0.0)
+    try:
+        return list(islice(generator, MAX_GENERATED_TOKENS))
+    finally:
+        generator.close()
+
+
+class EvalCounter:
+    """Count tokens evaluated before the first generated token is yielded."""
+
+    def __init__(self, llama) -> None:
+        self.llama = llama
+        self.total = 0
+        self.active = True
+        self._original_eval = None
+
+    def __enter__(self):
+        self._original_eval = self.llama.eval
+
+        def counted(tokens, *args, **kwargs):
+            if self.active:
+                self.total += len(tokens)
+            return self._original_eval(tokens, *args, **kwargs)
+
+        self.llama.eval = counted
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        del self.llama.eval
+
+    def stop_counting(self) -> None:
+        self.active = False
+
+
+def _generate_with_eval_count(llama, prompt_ids) -> tuple[list[int], int]:
+    generator = llama.generate(prompt_ids, temp=0.0)
+    generated: list[int] = []
+    try:
+        with EvalCounter(llama) as counter:
+            first_token = next(generator)
+            counter.stop_counting()
+            generated.append(int(first_token))
+            generated.extend(
+                int(token)
+                for token in islice(generator, MAX_GENERATED_TOKENS - 1)
+            )
+            evaluated_before_first_token = counter.total
+    finally:
+        generator.close()
+    return generated, evaluated_before_first_token
+
+
+@unittest.skipUnless(LLAMA_CPP_AVAILABLE and MODEL_AVAILABLE, SKIP_REASON)
+class KvStateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from nova.brain.context_manager import ContextManager, LlamaBackend
+
+        cls.ContextManager = ContextManager
+        cls.LlamaBackend = LlamaBackend
+        cls.llama = llama_cpp.Llama(
+            model_path=str(MODEL_PATH),
+            n_ctx=1024,
+            n_threads=4,
+            verbose=False,
+        )
+        cls.backend = LlamaBackend(cls.llama)
+        cls.version = importlib.metadata.version("llama-cpp-python")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.llama.close()
+
+    def _new_context(self, system_prompt: str = NOVA_PERSONA_PROMPT):
+        context = self.ContextManager(
+            self.backend,
+            n_ctx=1024,
+            gen_reserve=64,
+        )
+        context.start_session(system_prompt)
+        return context
+
+    def _seed_lane(self):
+        self.llama.reset()
+        context = self._new_context()
+        prompt = context.begin_turn(FIRST_USER_MESSAGE)
+        generated = greedy_generate(self.llama, prompt)
+        context.commit_turn(generated)
+        return context, generated
+
+    def _snapshot(self, lane: str = "test"):
+        snap = save_snapshot(self.llama, meta={"lane": lane})
+        print(
+            f"llama-cpp-python={self.version}, n_tokens={snap.n_tokens}, "
+            f"snapshot_bytes={snapshot_nbytes(snap)}"
+        )
+        return snap
+
+    def _make_unrelated_prompt(self):
+        context = self._new_context("A completely different system prompt.")
+        prompt = context.begin_turn(UNRELATED_USER_MESSAGE)
+        self.assertGreaterEqual(len(prompt), 100)
+        return context, prompt
+
+    def test_t1_round_trip_reuses_lane_prefix_and_matches_control(self):
+        lane, _ = self._seed_lane()
+        snap = self._snapshot("t1")
+
+        control_prompt = lane.begin_turn(FOLLOW_UP)
+        control_ids = greedy_generate(self.llama, control_prompt)
+        lane.abort_turn()
+
+        unrelated_lane, unrelated_prompt = self._make_unrelated_prompt()
+        greedy_generate(self.llama, unrelated_prompt)
+        unrelated_lane.abort_turn()
+
+        restore_snapshot(self.llama, snap)
+        replay_prompt = lane.begin_turn(FOLLOW_UP)
+        replay_ids, evaluated = _generate_with_eval_count(self.llama, replay_prompt)
+        lane.abort_turn()
+
+        print(
+            f"T1: llama-cpp-python={self.version}, n_tokens={snap.n_tokens}, "
+            f"snapshot_bytes={snapshot_nbytes(snap)}, "
+            f"continuation_prompt_tokens={len(replay_prompt)}, "
+            f"evaluated_before_first_generated={evaluated}"
+        )
+        self.assertEqual(replay_ids, control_ids)
+        self.assertLess(evaluated, len(replay_prompt))
+        self.assertLessEqual(evaluated, 64)
+
+    def test_t2_snapshot_is_small_compared_with_full_state(self):
+        self._seed_lane()
+        snap = self._snapshot("t2")
+        full_state = self.llama.save_state()
+        scores_bytes = int(full_state.scores.nbytes)
+        full_state_bytes = scores_bytes + int(full_state.llama_state_size)
+
+        print(
+            f"T2: llama-cpp-python={self.version}, n_tokens={snap.n_tokens}, "
+            f"snapshot_bytes={snapshot_nbytes(snap)}, "
+            f"save_state_scores_plus_state_bytes={full_state_bytes} "
+            f"(scores={scores_bytes}, state={full_state.llama_state_size})"
+        )
+        self.assertLess(snapshot_nbytes(snap), 64 * 1024 * snap.n_tokens)
+
+    def test_t3_file_round_trip_restores_identical_continuation(self):
+        lane, _ = self._seed_lane()
+        snap = self._snapshot("t3")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "lane.npz"
+            snapshot_to_file(snap, path)
+            loaded = snapshot_from_file(path, expected_meta={"lane": "t3"})
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+
+            control_prompt = lane.begin_turn(FOLLOW_UP)
+            control_ids = greedy_generate(self.llama, control_prompt)
+            lane.abort_turn()
+            _, unrelated_prompt = self._make_unrelated_prompt()
+            greedy_generate(self.llama, unrelated_prompt)
+
+            restore_snapshot(self.llama, loaded)
+            replay_prompt = lane.begin_turn(FOLLOW_UP)
+            replay_ids = greedy_generate(self.llama, replay_prompt)
+            lane.abort_turn()
+
+        print(
+            f"T3: llama-cpp-python={self.version}, n_tokens={snap.n_tokens}, "
+            f"snapshot_bytes={snapshot_nbytes(snap)}"
+        )
+        self.assertEqual(replay_ids, control_ids)
+
+    def test_t4_metadata_mismatch_and_corrupt_files_are_rejected(self):
+        self._seed_lane()
+        snap = self._snapshot("t4")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "lane.npz"
+            snapshot_to_file(snap, path)
+            self.assertIsNone(
+                snapshot_from_file(path, expected_meta={"n_ctx": snap.meta["n_ctx"] + 1})
+            )
+
+            garbage_path = Path(temp_dir) / "garbage.npz"
+            garbage_path.write_bytes(b"not an npz file")
+            self.assertIsNone(snapshot_from_file(garbage_path))
+
+            truncated_path = Path(temp_dir) / "truncated.npz"
+            truncated_path.write_bytes(path.read_bytes()[:32])
+            self.assertIsNone(snapshot_from_file(truncated_path))
+
+        incompatible_llama = SimpleNamespace(
+            n_ctx=lambda: snap.meta["n_ctx"] + 1,
+            n_vocab=lambda: snap.meta["n_vocab"],
+            input_ids=np.zeros(snap.n_tokens, dtype=np.int32),
+            n_tokens=0,
+            _seed=None,
+            model_path=self.llama.model_path,
+            context_params=self.llama.context_params,
+        )
+        with self.assertRaises(ValueError):
+            restore_snapshot(incompatible_llama, snap)
+
+        print(
+            f"T4: llama-cpp-python={self.version}, n_tokens={snap.n_tokens}, "
+            f"snapshot_bytes={snapshot_nbytes(snap)}"
+        )
+
+    def test_t4b_model_identity_mismatches_are_rejected(self):
+        self._seed_lane()
+        snap = self._snapshot("t4b")
+        original_meta = dict(snap.meta)
+        tampered_values = {
+            "model_fingerprint": "tampered-fingerprint",
+            "model_size": snap.meta["model_size"] + 1,
+            "llama_cpp_version": "tampered-version",
+        }
+        for key, value in tampered_values.items():
+            with self.subTest(key=key):
+                snap.meta[key] = value
+                with self.assertRaisesRegex(ValueError, key):
+                    restore_snapshot(self.llama, snap)
+                snap.meta.clear()
+                snap.meta.update(original_meta)
+
+        snap.meta["model_fingerprint"] = tampered_values["model_fingerprint"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tampered.npz"
+            snapshot_to_file(snap, path)
+            self.assertIsNone(
+                load_snapshot_for(self.llama, path, extra_meta={"lane": "t4b"})
+            )
+
+        print(
+            f"T4b: llama-cpp-python={self.version}, n_tokens={snap.n_tokens}, "
+            f"snapshot_bytes={snapshot_nbytes(snap)}"
+        )
+
+    def test_t6_save_and_restore_timing_at_about_600_tokens(self):
+        self.llama.reset()
+        context = self._new_context("A completely different system prompt.")
+        long_message = (
+            "This is a separate unrelated lane with changing details. "
+            "The weather is clear, the train is on time, and the cafe is open. "
+        ) * 18
+        prompt = context.begin_turn(long_message)
+        greedy_generate(self.llama, prompt)
+        context.abort_turn()
+
+        snap = save_snapshot(self.llama, meta={"lane": "t6"})
+        self.assertGreaterEqual(snap.n_tokens, 500)
+        self.assertLessEqual(snap.n_tokens, 750)
+
+        save_started = time.perf_counter()
+        timed_snap = save_snapshot(self.llama, meta={"lane": "t6"})
+        save_elapsed = time.perf_counter() - save_started
+
+        self.llama.reset()
+        restore_started = time.perf_counter()
+        restore_snapshot(self.llama, timed_snap)
+        restore_elapsed = time.perf_counter() - restore_started
+        save_ms = save_elapsed * 1000
+        restore_ms = restore_elapsed * 1000
+        print(
+            f"T6: llama-cpp-python={self.version}, n_tokens={snap.n_tokens}, "
+            f"snapshot_bytes={snapshot_nbytes(snap)}, "
+            f"save_ms={save_ms:.3f}, restore_ms={restore_ms:.3f}"
+        )
+
+        if os.environ.get("KV_TIMING_STRICT", "1") != "0":
+            self.assertLess(save_elapsed, 1.0)
+            self.assertLess(restore_elapsed, 1.0)
+
+    def test_t7_failed_restore_resets_context_and_generation_recovers(self):
+        _, _ = self._seed_lane()
+        snap = self._snapshot("t7")
+        _, unrelated_prompt = self._make_unrelated_prompt()
+        greedy_generate(self.llama, unrelated_prompt)
+
+        original_state_api = kv_state._state_api()
+        wrong_copy_in = lambda _ctx, _buffer, size: size - 1
+        with patch.object(
+            kv_state,
+            "_state_api",
+            return_value=(
+                original_state_api[0],
+                original_state_api[1],
+                wrong_copy_in,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "expected"):
+                restore_snapshot(self.llama, snap)
+
+        self.assertEqual(self.llama.n_tokens, 0)
+        n_tokens_after_reset = self.llama.n_tokens
+        fresh_context = self._new_context()
+        fresh_prompt = fresh_context.begin_turn("Can you still answer normally?")
+        generated = greedy_generate(self.llama, fresh_prompt)
+        fresh_context.abort_turn()
+        self.assertTrue(generated)
+        print(
+            f"T7: llama-cpp-python={self.version}, "
+            f"n_tokens_after_reset={n_tokens_after_reset}, "
+            f"recovery_generated={len(generated)}"
+        )
+
+    @unittest.skipUnless(
+        os.environ.get("KV_TEST_TWO_INSTANCES") == "1",
+        "Set KV_TEST_TWO_INSTANCES=1 to load the GGUF a second time.",
+    )
+    def test_t8_layout_mismatch_rejects_flash_attn_and_kv_types(self):
+        default_meta = live_meta(self.llama)
+        alternate_llama = llama_cpp.Llama(
+            model_path=str(MODEL_PATH),
+            n_ctx=1024,
+            flash_attn=True,
+            type_k=8,
+            type_v=8,
+            verbose=False,
+        )
+        try:
+            alternate_meta = live_meta(alternate_llama)
+            layout_keys = (
+                "flash_attn",
+                "type_k",
+                "type_v",
+                "rope_freq_base",
+                "rope_freq_scale",
+            )
+            print(
+                "T8 default layout: "
+                + ", ".join(f"{key}={default_meta[key]!r}" for key in layout_keys)
+            )
+            print(
+                "T8 alternate layout: "
+                + ", ".join(f"{key}={alternate_meta[key]!r}" for key in layout_keys)
+            )
+            for key in ("flash_attn", "type_k", "type_v"):
+                self.assertNotEqual(default_meta[key], alternate_meta[key], key)
+
+            self._seed_lane()
+            snap = save_snapshot(self.llama)
+
+            with self.assertRaises(ValueError) as raised:
+                restore_snapshot(alternate_llama, snap)
+            message = str(raised.exception)
+            for key in ("flash_attn", "type_k", "type_v"):
+                self.assertIn(key, message)
+        finally:
+            alternate_llama.close()
+
+        print(
+            f"T8: llama-cpp-python={self.version}, n_tokens={snap.n_tokens}, "
+            f"snapshot_bytes={snapshot_nbytes(snap)}"
+        )
+
+    @unittest.skipUnless(
+        os.environ.get("KV_TEST_TWO_INSTANCES") == "1",
+        "Set KV_TEST_TWO_INSTANCES=1 to load the GGUF a second time.",
+    )
+    def test_t5_restore_file_into_fresh_llama_instance(self):
+        lane, first_ids = self._seed_lane()
+        snap = self._snapshot("t5")
+        control_prompt = lane.begin_turn(FOLLOW_UP)
+        control_ids = greedy_generate(self.llama, control_prompt)
+        lane.abort_turn()
+
+        fresh_llama = llama_cpp.Llama(
+            model_path=str(MODEL_PATH),
+            n_ctx=1024,
+            n_threads=4,
+            verbose=False,
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "lane.npz"
+                snapshot_to_file(snap, path)
+                loaded = load_snapshot_for(fresh_llama, path, extra_meta={"lane": "t5"})
+                self.assertIsNotNone(loaded)
+                assert loaded is not None
+                restore_snapshot(fresh_llama, loaded)
+                fresh_backend = self.LlamaBackend(fresh_llama)
+                fresh_lane = self.ContextManager(
+                    fresh_backend,
+                    n_ctx=1024,
+                    gen_reserve=64,
+                )
+                fresh_lane.start_session(NOVA_PERSONA_PROMPT)
+                fresh_lane.begin_turn(FIRST_USER_MESSAGE)
+                fresh_lane.commit_turn(first_ids)
+                replay_prompt = fresh_lane.begin_turn(FOLLOW_UP)
+                replay_ids = greedy_generate(fresh_llama, replay_prompt)
+                fresh_lane.abort_turn()
+        finally:
+            fresh_llama.close()
+
+        print(
+            f"T5: llama-cpp-python={self.version}, n_tokens={snap.n_tokens}, "
+            f"snapshot_bytes={snapshot_nbytes(snap)}"
+        )
+        self.assertEqual(replay_ids, control_ids)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+===== END FILE: tests/test_kv_state.py =====
+
+===== FILE: tests/test_context_history.py | bytes=7734 | crlf=189 | lf_total=189 | bom=False =====
+"""Tests for rebuilding ContextManager history from persisted chat text."""
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+from pathlib import Path
+
+os.environ.setdefault("NOVA_LLM_MODEL", "qwen2.5-3b")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from nova.brain.context_manager import ContextManager, ContextOverflow, LlamaBackend  # noqa: E402
+from nova.config import LLM_MODELS  # noqa: E402
+
+MODEL_PATH = LLM_MODELS["qwen2.5-3b"]["path"]
+try:
+    from llama_cpp import Llama
+
+    LLAMA_AVAILABLE = True
+except (ImportError, OSError):
+    Llama = None
+    LLAMA_AVAILABLE = False
+
+SKIP_REASON = (
+    "Requires llama-cpp-python and the configured Qwen2.5-3B GGUF "
+    f"(llama_cpp available={LLAMA_AVAILABLE}, model exists={MODEL_PATH.is_file()})."
+)
+SYSTEM = "You are Nova, a concise personal assistant."
+
+
+def user_text(index: int) -> str:
+    return f"Message {index}: " + "we are planning a relaxed Saturday outing with a walk and lunch. " * (
+        1 + index % 3
+    )
+
+
+def reply_text(index: int) -> str:
+    return f"Reply {index}: sounds good, a walk first and lunch after."
+
+
+@unittest.skipUnless(LLAMA_AVAILABLE and MODEL_PATH.is_file(), SKIP_REASON)
+class ContextHistoryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.llama = Llama(model_path=str(MODEL_PATH), vocab_only=True, verbose=False)
+        cls.backend = LlamaBackend(cls.llama)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.llama.close()
+
+    def make_context(self, n_ctx: int = 4096, gen_reserve: int = 256) -> ContextManager:
+        context = ContextManager(self.backend, n_ctx=n_ctx, gen_reserve=gen_reserve)
+        context.start_session(SYSTEM)
+        return context
+
+    def make_history(self, count: int = 10) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        for index in range(1, count + 1):
+            messages.extend(
+                (
+                    {"role": "user", "content": user_text(index)},
+                    {"role": "assistant", "content": reply_text(index)},
+                )
+            )
+        return messages
+
+    def append_live_turn(self, context: ContextManager, index: int) -> None:
+        context.begin_turn(user_text(index))
+        context.commit_turn(self.backend.encode(reply_text(index)))
+
+    def test_t1_loaded_history_matches_live_token_log_and_next_prompt(self):
+        messages = self.make_history()
+        live = self.make_context()
+        for index in range(1, 11):
+            self.append_live_turn(live, index)
+
+        restored = self.make_context()
+        report = restored.load_history(messages)
+        self.assertEqual(report.turns_loaded, 10)
+        self.assertEqual(report.turns_dropped, 0)
+        self.assertEqual(report.messages_skipped, 0)
+        self.assertEqual(restored.history_ids, live.history_ids)
+
+        self.assertEqual(
+            restored.begin_turn("What should we bring?"),
+            live.begin_turn("What should we bring?"),
+        )
+
+    def test_t2_new_turns_append_without_changing_loaded_tokens(self):
+        restored = self.make_context()
+        restored.load_history(self.make_history())
+        earlier = restored.history_ids
+
+        for index in range(11, 14):
+            self.append_live_turn(restored, index)
+            self.assertEqual(restored.history_ids[: len(earlier)], earlier)
+            earlier = restored.history_ids
+
+    def test_t3_irregular_sequences_and_skipped_messages(self):
+        messages = [
+            {"role": "assistant", "content": "An orphaned assistant response."},
+            {"role": "user", "content": "First user without a reply."},
+            {"role": "user", "content": "Second user has a reply."},
+            {"role": "assistant", "content": "The second user's reply."},
+            {"role": "user", "content": "Trailing user has no reply."},
+            {"role": "tool", "content": "Tool output is not restored."},
+            {"role": "system", "content": "System role is not restored."},
+            {"role": "assistant", "content": "   "},
+        ]
+        context = self.make_context()
+        report = context.load_history(messages)
+
+        self.assertEqual(report.turns_loaded, 3)
+        self.assertEqual(report.turns_dropped, 0)
+        self.assertEqual(report.messages_skipped, 3)
+        expected = list(context.system_ids)
+        expected.extend(context._gen_ids + context._close(self.backend.encode(messages[0]["content"])))
+        expected.extend(self.backend.encode(context._user_segment(messages[1]["content"])))
+        expected.extend(self.backend.encode(context._user_segment(messages[2]["content"])))
+        expected.extend(context._gen_ids + context._close(self.backend.encode(messages[3]["content"])))
+        expected.extend(self.backend.encode(context._user_segment(messages[4]["content"])))
+        self.assertEqual(context.history_ids, expected)
+
+    def test_t4_truncation_drops_oldest_whole_turns(self):
+        messages = self.make_history()
+        context = self.make_context(n_ctx=800, gen_reserve=80)
+        budget = int(0.5 * (800 - 80))
+        report = context.load_history(messages)
+
+        turn_ids = []
+        for index in range(1, 11):
+            ids = self.backend.encode(context._user_segment(user_text(index)))
+            ids.extend(context._gen_ids)
+            ids.extend(context._close(self.backend.encode(reply_text(index))))
+            turn_ids.append(ids)
+
+        expected_dropped = 0
+        expected_tokens = len(context.system_ids) + sum(map(len, turn_ids))
+        while expected_tokens > budget:
+            expected_tokens -= len(turn_ids[expected_dropped])
+            expected_dropped += 1
+
+        self.assertGreater(report.turns_dropped, 0)
+        self.assertEqual(report.turns_dropped, expected_dropped)
+        self.assertEqual(report.turns_loaded, 10 - expected_dropped)
+        self.assertEqual(report.tokens, expected_tokens)
+        self.assertEqual(context.token_count(), report.tokens)
+        self.assertLessEqual(report.tokens, budget)
+        self.assertEqual(
+            context.history_ids,
+            list(context.system_ids) + [token for turn in turn_ids[expected_dropped:] for token in turn],
+        )
+        first_kept_user = self.backend.encode(
+            context._user_segment(user_text(expected_dropped + 1))
+        )
+        self.assertEqual(
+            context.history_ids[len(context.system_ids) :][: len(first_kept_user)],
+            first_kept_user,
+        )
+
+    def test_t5_loading_after_open_turn_or_twice_raises(self):
+        context = self.make_context()
+        context.begin_turn("A pending turn.")
+        with self.assertRaises(RuntimeError):
+            context.load_history(self.make_history())
+        context.abort_turn()
+
+        context.load_history(self.make_history(1))
+        with self.assertRaises(RuntimeError):
+            context.load_history([])
+
+    def test_t6_empty_history_is_a_no_op(self):
+        context = self.make_context()
+        before = context.history_ids
+        report = context.load_history([])
+        self.assertEqual(
+            (report.turns_loaded, report.turns_dropped, report.messages_skipped, report.tokens),
+            (0, 0, 0, 0),
+        )
+        self.assertEqual(context.history_ids, before)
+
+    def test_t7_end_of_turn_id_matches_qwen_im_end_token(self):
+        context = self.make_context()
+        self.assertEqual(context.end_of_turn_id, self.backend.encode("<|im_end|>")[0])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+===== END FILE: tests/test_context_history.py =====
+
+===== FILE: tests/test_context_manager.py | bytes=9411 | crlf=231 | lf_total=231 | bom=False =====
+"""Tests for nova/brain/context_manager.py. Run: python tests/test_context_manager.py -v
+
+Loads only the GGUF vocabulary and chat template (vocab_only), not the model weights.
+"""
+import os
+import sys
+import unittest
+from pathlib import Path
+
+os.environ.setdefault("NOVA_LLM_MODEL", "qwen2.5-3b")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from nova.brain.context_manager import ContextManager, ContextOverflow  # noqa: E402
+
+SYSTEM = "You are Nova, a concise personal assistant."
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_search",
+            "description": "Search the knowledge base.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    }
+]
+BLOCK = "[Retrieved context]\n" + "\n".join(
+    f"Note {i}: local project context is versioned, searchable, and kept on device."
+    for i in range(1, 12)
+)
+TOOL_CALL = '<tool_call>\n{"name": "memory_search", "arguments": {"query": "battery"}}\n</tool_call>'
+
+_BACKEND = None
+
+
+def get_backend():
+    global _BACKEND
+    if _BACKEND is None:
+        from llama_cpp import Llama
+        from nova.brain.context_manager import LlamaBackend
+        from nova.config import LLM_MODEL_PATH
+
+        llm = Llama(model_path=str(LLM_MODEL_PATH), vocab_only=True, verbose=False)
+        _BACKEND = LlamaBackend(llm)
+    return _BACKEND
+
+
+def common_prefix(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def user_text(i):
+    return f"Message {i}: " + "we are planning a relaxed Saturday outing with a walk and lunch. " * (1 + i % 3)
+
+
+def reply_text(i):
+    return f"Reply {i}: sounds good, a walk first and lunch after."
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.b = get_backend()
+        self.cm = ContextManager(self.b, n_ctx=4096, gen_reserve=256)
+        self.cm.start_session(SYSTEM, TOOLS)
+
+    def run_turns(self, n, blocks=()):
+        """Simulate n turns. Returns list of (prompt_ids, reply_ids)."""
+        records = []
+        for i in range(1, n + 1):
+            prompt = self.cm.begin_turn(user_text(i), BLOCK if i in blocks else None)
+            reply = self.b.encode(reply_text(i))
+            self.cm.commit_turn(reply)
+            records.append((prompt, reply))
+        return records
+
+
+class T0TemplateMode(Base):
+    def test_report_template_mode(self):
+        print(f"\nTEMPLATE MODE: {self.cm.template_mode}")
+        if self.cm.template_note:
+            print(f"TEMPLATE NOTE: {self.cm.template_note}")
+        print(f"USER WRAP: {self.cm._wrap['user']!r}")
+        print(f"TOOL WRAP: {self.cm._wrap['tool']!r}")
+        print(f"SUFFIX   : {self.cm._suffix_text!r}")
+
+
+class T1NoLag(Base):
+    def test_full_reuse_without_context_blocks(self):
+        records = self.run_turns(12)
+        for n in range(len(records) - 1):
+            prompt, reply = records[n]
+            nxt_prompt, _ = records[n + 1]
+            cached = prompt + reply
+            shared = common_prefix(nxt_prompt, cached)
+            self.assertEqual(shared, len(cached), f"turn {n + 2}: reuse {shared} of {len(cached)}")
+        print("\nT1 table: turn | prompt tokens | shared with previous prompt+reply")
+        for n, (prompt, _) in enumerate(records, 1):
+            prev = records[n - 2][0] + records[n - 2][1] if n > 1 else []
+            print(f"  {n:>2} | {len(prompt):>5} | {common_prefix(prompt, prev):>5}")
+
+
+class T2Snippets(Base):
+    def test_snippets_not_kept_and_divergence_at_block_start(self):
+        blocks = {4, 6, 8, 10}
+        records = []
+        expected_len = len(self.cm.system_ids)
+        for i in range(1, 13):
+            hist_before = len(self.cm.history_ids)
+            use_block = BLOCK if i in blocks else None
+            prompt = self.cm.begin_turn(user_text(i), use_block)
+            reply = self.b.encode(reply_text(i))
+            self.cm.commit_turn(reply)
+            records.append((prompt, reply, hist_before, i in blocks))
+            clean = self.b.encode(self.cm._user_segment(user_text(i)))
+            expected_len += len(clean) + len(self.cm._gen_ids) + len(self.cm._close(reply))
+            self.assertEqual(self.cm.token_count(), expected_len, f"history holds extra tokens after turn {i}")
+        for n in range(len(records) - 1):
+            prompt, reply, hist_before, had_block = records[n]
+            nxt_prompt = records[n + 1][0]
+            shared = common_prefix(nxt_prompt, prompt + reply)
+            if had_block:
+                clean = self.b.encode(self.cm._user_segment(user_text(n + 1)))
+                shown = self.b.encode(self.cm._user_segment(user_text(n + 1) + "\n\n" + BLOCK))
+                expected = hist_before + common_prefix(clean, shown)
+                self.assertEqual(shared, expected, f"turn {n + 2}: divergence not at block start")
+            else:
+                self.assertEqual(shared, len(prompt) + len(reply))
+
+
+class T3ToolRoundTrip(Base):
+    def test_prefix_survives_tool_call(self):
+        self.run_turns(2)
+        p1 = self.cm.begin_turn("What connects the PCB to the battery?")
+        call_ids = self.b.encode(TOOL_CALL)
+        p2 = self.cm.continue_after_tool(call_ids, "The PCB connects to the battery with pogo pins.")
+        self.assertEqual(common_prefix(p2, p1 + call_ids), len(p1) + len(call_ids))
+        sys_len = len(self.cm.system_ids)
+        self.assertEqual(p1[:sys_len], p2[:sys_len])
+        final = self.b.encode("Pogo pins.")
+        self.cm.commit_turn(final)
+        p3 = self.cm.begin_turn("How many?")
+        self.assertEqual(common_prefix(p3, p2 + final), len(p2) + len(final))
+
+    def test_tool_segment_shape(self):
+        seg = self.cm._tool_segment("RESULT")
+        self.assertTrue(seg.startswith("<|im_start|>user\n<tool_response>\n"), repr(seg))
+        self.assertTrue(seg.endswith("</tool_response><|im_end|>\n"), repr(seg))
+
+
+class T4Equivalence(Base):
+    def test_matches_full_template_render(self):
+        messages = [{"role": "system", "content": SYSTEM}]
+        for i in range(1, 4):
+            self.cm.begin_turn(user_text(i))
+            reply = reply_text(i)
+            self.cm.commit_turn(self.b.encode(reply))
+            messages += [
+                {"role": "user", "content": user_text(i)},
+                {"role": "assistant", "content": reply},
+            ]
+        ours = self.cm.begin_turn(user_text(4))
+        messages.append({"role": "user", "content": user_text(4)})
+        theirs = self.b.encode(self.b.render(messages, TOOLS, True))
+        if ours != theirs:
+            k = common_prefix(ours, theirs)
+            dec = getattr(self.b, "decode", None)
+            if dec:
+                print("\nOURS  :", repr(dec(ours[max(0, k - 8): k + 8])))
+                print("THEIRS:", repr(dec(theirs[max(0, k - 8): k + 8])))
+            print(f"first difference at index {k}; lengths ours={len(ours)} theirs={len(theirs)}")
+        self.assertEqual(ours, theirs)
+
+
+class T5NoDropAndCompaction(unittest.TestCase):
+    def test_nothing_dropped_and_flag_flips(self):
+        b = get_backend()
+        cm = ContextManager(b, n_ctx=2048, gen_reserve=48)
+        cm.start_session(SYSTEM, TOOLS)
+        threshold = int(0.75 * (2048 - 48))
+        first_flip = None
+        previous = cm.history_ids
+        for i in range(1, 21):
+            cm.begin_turn(user_text(i) + " extra words " * 10)
+            cm.commit_turn(b.encode(reply_text(i) + " more words " * 5))
+            current = cm.history_ids
+            self.assertEqual(current[: len(previous)], previous, f"history changed at turn {i}")
+            self.assertGreater(len(current), len(previous))
+            previous = current
+            flag = cm.needs_compaction()
+            self.assertEqual(flag, cm.token_count() >= threshold)
+            if flag and first_flip is None:
+                first_flip = i
+                break
+        self.assertIsNotNone(first_flip, "needs_compaction never became True in 20 turns")
+
+    def test_overflow_raises_and_leaves_state_clean(self):
+        b = get_backend()
+        cm = ContextManager(b, n_ctx=512, gen_reserve=64)
+        cm.start_session(SYSTEM, TOOLS)
+        before = cm.history_ids
+        with self.assertRaises(ContextOverflow):
+            cm.begin_turn("word " * 1000)
+        self.assertEqual(cm.history_ids, before)
+        cm.begin_turn("short")  # still usable
+
+
+class T6ExactIds(Base):
+    def test_commit_stores_given_ids(self):
+        self.cm.begin_turn("Hi")
+        ids = self.b.encode("Hello there")
+        self.cm.commit_turn(ids)
+        tail = self.cm.history_ids[-(len(ids) + len(self.cm._suffix_ids)):]
+        self.assertEqual(tail, ids + self.cm._suffix_ids)
+
+    def test_no_duplicate_end_token(self):
+        self.cm.begin_turn("Hi")
+        ids = self.b.encode("Hello there") + [self.cm._suffix_ids[0]]
+        self.cm.commit_turn(ids)
+        tail = self.cm.history_ids[-len(ids) - len(self.cm._suffix_ids) + 1:]
+        self.assertEqual(tail, ids + self.cm._suffix_ids[1:])
+
+
+if __name__ == "__main__":
+    unittest.main()
+===== END FILE: tests/test_context_manager.py =====
+
+===== FILE: docs/kv_lanes.md | bytes=1080 | crlf=26 | lf_total=26 | bom=False =====
+# KV chat lanes
+
+KV lanes keep each chat session's token history in a separate lane while one
+llama.cpp context is shared. Enable the feature with `NOVA_KV_LANES=1`. It is
+disabled by default. Use `NOVA_LLM_MODEL=qwen2.5-3b`; Qwen3 models disable lanes
+because the lane path does not apply the Qwen3 non-thinking handler.
+
+Optional settings:
+
+- `NOVA_LLM_CTX` sets the llama context size.
+- `NOVA_KV_LANES_MAX_SNAPSHOT_MB` sets the total snapshot memory budget (default
+  256 MB).
+
+When a lane-backed chat turn runs, the log line starts with `KV-LANE` and
+includes `lane`, `prompt_tokens`, `reused`, `evaluated`, `ttft_s`, and
+`completion_tokens`. The `/api/status` response reports current lane statistics
+under `kv_lanes`.
+
+To roll back, unset `NOVA_KV_LANES` (or set it to `0`) and restart NOVA. The
+legacy generation path is used when lanes are disabled.
+
+Known limits:
+
+- Compaction rebuilds a lane from persisted text and starts cold.
+- Action turns continue to use the legacy path until KV-B2-6.
+- Qwen3 models are not supported by the lane path.
+
+===== END FILE: docs/kv_lanes.md =====
+
+===== FILE: docs/kv_b2_discovery.md | bytes=18564 | crlf=132 | lf_total=132 | bom=False =====
+# KV-B2-0: ContextManager discovery
+
+## Environment
+
+- OS: Windows 11 Home (local development laptop; Docker Linux engine was unavailable).
+- CPU: AMD Ryzen 7 5825U with Radeon Graphics.
+- RAM: 15.4 GiB reported physical memory.
+- Python: 3.13.7.
+- llama-cpp-python: 0.3.36, installed into the local Python 3.13 environment from the project's CPU wheel index.
+- `n_threads`: 4 from the local configured default (`nova/config.py:73`).
+- Required model: `models/brain/qwen2.5-3b-instruct-q4_k_m.gguf` is present locally; `nova/config.py:40-43` maps `qwen2.5-3b` to this path.
+- Runtime status: Docker CLI is installed, but the Docker Desktop Linux engine pipe was unavailable when checked. Both scripts therefore ran in the Windows host environment, not inside the container. Paths resolve from the repository/config; neither script uses a server absolute path.
+- Part 2 and Part 3 ran locally using the exact configured GGUF. No timings were collected or interpreted.
+
+## Part 1 — source survey
+
+The references below are repository-relative `file:line` citations.
+
+### a. Model prompt/generation call sites
+
+| Path | Parameters and prompt | End/stop behavior | Result delivery |
+|---|---|---|---|
+| `LLMEngine.generate_with_tools` (`nova/brain/llm_engine.py:453-514`) | Calls `create_chat_completion` at line 485 with `messages`, configured `max_tokens` (tool default `LLM_MAX_TOKENS_TOOL=96`, chat default `LLM_MAX_TOKENS_CHAT=128`), and `temperature=LLM_TEMP_TOOLS` (default `0.1`) when schemas exist, otherwise `0.4` (`config.py:80-83`). If tools exist it passes `tools` and `tool_choice`; exactly one tool is forced, more than one uses `"auto"` (`llm_engine.py:476-484`). No explicit `stop` parameter. | No engine-level EOS or `<|im_end|>` stopping logic is passed. The GGUF chat template/llama.cpp completion API controls termination. A returned text result passes through `_without_thinking`, which removes `<think>...</think>` blocks, not end markers (`llm_engine.py:117-118, 508-514`). | Returns one complete tool-call or text decision; this path itself does not stream text (`llm_engine.py:486-514`). |
+| `LLMEngine.generate_raw_with_metrics` (`nova/brain/llm_engine.py:521-535`) | Calls `create_chat_completion` at lines 529-533 using system+user messages, caller `max_tokens`, and `temperature=0.2`. Callers include optional intent fallback (`intent_router.py:135-149`), memory extraction (`memory_agent.py:36-46`), ingestion classification (`ingestion/llm_filter.py:47-52`), and optional tool confirmation (`main.py:520-527`). There is no explicit `stop`. `generate_raw` delegates to this method (`llm_engine.py:517-518`). | Same library/template-controlled completion ending; text is passed through `_without_thinking` (`llm_engine.py:534`). | Non-streaming helper. |
+| `LLMEngine.stream_chat` (`nova/brain/llm_engine.py:537-594`) | Calls `create_chat_completion` at lines 554-555 with the constructed messages, `max_tokens=LLM_MAX_TOKENS_CHAT` (default 128), `temperature=0.4`, and `stream=True`; no explicit `stop`. It runs production in a worker thread and forwards returned deltas through an async queue. | No explicit stop strings or EOS check in NOVA; stream ends when llama.cpp completes/raises and the producer puts its queue sentinel (`llm_engine.py:550-577`). | Each non-empty `delta.content` is added to output and yielded as `{"type":"text_delta","text":...}` (`llm_engine.py:578-583`). `/ws/chat` sends each delta immediately as `text_delta`; it also sentence-splits it to synthesize `audio_chunk`s, then persists and sends the final text/metrics/`audio_done` (`main.py:616-671`). |
+| `Llama.generate` | No production call site exists in current application code. The added `scripts/kv_generate_probe.py` calls `llama.generate(prompt_ids, temp=0.0, reset=False)` with a 40-token manual cap and stops when the yielded token id equals the GGUF `<|im_end|>` id. | Probe-specific token-id EOS handling; no new production behavior. | Probe collects generated ids and decodes them locally; no websocket path. |
+| `create_completion` | No application-level direct call site. `llm_engine.py:244-245, 320-435` wraps llama.cpp's internal `_create_completion`/chat completion for KV instrumentation; it is not another prompt-producing pipeline call. | Delegates to llama.cpp. | Instrumentation records token/prompt metadata, not websocket text. |
+
+The WebSocket also has a non-streaming path: it awaits `run_pipeline`, which awaits a complete response, then sends one JSON `"text"` message, metrics, optional URL action, and base64 audio (`main.py:674-700`). Streaming must be explicitly requested with `"stream": true`, and only the `"chat"` intent enters `stream_chat` (`main.py:616-629`).
+
+### b. Per-turn prompt contents and placement
+
+| Prompt component | Construction and position | Turn variability |
+|---|---|---|
+| Persona/system prompt | `LLMEngine._build_messages` starts with exactly one system message containing `NOVA_PERSONA_PROMPT` (`llm_engine.py:618-628`; prompt text/configured override in `config.py:87-95`). The chat-completion tool schemas are passed separately as the `tools` argument, not placed in a history message; the GGUF chat formatter handles that schema rendering (`llm_engine.py:476-484`). | Persona is fixed unless the environment override changes. Schema is fixed for a request/session's selected intent, but can vary between turns because the intent filters it. |
+| History | After system message, `_build_messages` appends the most recent configured number of user/assistant messages, discarding other roles (`llm_engine.py:625-629`). `run_pipeline` obtains at most 12 persisted messages (= six user/assistant turns) using `get_context(..., limit=12)` (`main.py:380`). | Changes each turn and is session-specific. |
+| Date/time | `_current_date_context` is placed inside the *current user message* as `[Context] ... [/Context]`, immediately before user text (`llm_engine.py:597-615, 630-633`). All requests include the current local date and timezone abbreviation (not clock time). Calendar intent also includes a 14-day date/weekday lookup table. | Recomputed each turn; longer for `action_calendar`. |
+| Session summary and facts/vault context | `main.run_pipeline` builds JSON `memory_context`: targeted vault preferences/knowledge/profile fields for `memory_recall`; summary, selected profile fields, and anti-fabrication guidance for `chat`; empty for action and memory-write intents (`main.py:407-439`). `_build_messages` appends this as `Known user context:` in the current user `[Context]` block, following date context and before the current user text (`llm_engine.py:630-633`). Memory recall can answer directly before the LLM (`main.py:386-401`). | Recomputed per turn; depends on intent and vault/session data. Streaming chat instead includes the session summary and an empty relevant-profile object (`main.py:619-629`). |
+| Tool schemas | Supplied outside the `messages` list as `tools=tool_schemas`; `tool_choice` is forced for one schema and auto for multiple (`llm_engine.py:480-484`). Router discovers schemas from skills (`tool_router.py:34-68`). | Intent-specific and can change from turn to turn; chat-streaming passes no tools. |
+| Explicit per-turn user input | Final user message is `[Context]\n{date and optional memory context}\n[/Context]\n\n{user_text}` (`llm_engine.py:630-633`). | Always changes. |
+
+There is no separate date/time message and no prior generated assistant completion is added to the raw system prompt. The `_build_system_prompt` helper only joins the persona with optional memory context; current `generate_with_tools` uses `_build_messages` (`llm_engine.py:618-633`).
+
+### c. Intent-to-tool mapping
+
+`main.run_pipeline` gets the discovered schemas then filters them using `filter_tools_for_intent` (`main.py:448-454`; filter definitions `intent_router.py:89-95, 247-249`). The mapping actually passed to the LLM is:
+
+| Intent | Tool names exposed |
+|---|---|
+| `action_music` | `ytm_play`, `ytm_skip`, `ytm_pause`, `ytm_set_volume` |
+| `action_calendar` | `gc_list_today`, `gc_find`, `gc_create_event`, `gc_update_event`, `gc_delete_event` |
+| `memory_write` | `update_user_preference`, `update_user_knowledge` |
+| `memory_recall` | `recall_note` (unless `_answer_from_memory` directly answers before the LLM, `main.py:386-401`) |
+| `chat` | None |
+
+`stream_chat` always passes an empty tools list, and is selected only when requested streaming intent is chat (`main.py:616-629`; `llm_engine.py:547-555`). Skill schemas are defined in `nova/skills/{youtube_music,google_calendar,remember,flutter_workspace}/tools.py`; notably, Flutter workspace tools are discovered but are not selected by any current intent filter.
+
+### d. History storage, loading, and trimming
+
+- `session_memory` exports `load_session`, `save_session`, `append_turn`, `get_context`, `get_session_summary`, `get_session_snapshot`, and clear helpers. It stores one JSON file per sanitized session id in `DATA_DIR/session_memory` (`session_memory.py:9-10, 13-18`).
+- The JSON object contains `session_id`, `history`, `summary`, `created_at`, and `updated_at`. Each history item has `role`, `content`, and an ISO UTC `timestamp`; `append_turn` updates the summary and persists after each message (`session_memory.py:20-60`).
+- Normal and streamed chat append the user and assistant separately (`main.py:545-546, 657-658`). Tool-call internals are not stored as separate roles; only user text and final assistant reply are persisted. Session-command/direct-memory responses are similarly appended in their early-return paths (`main.py:362-363, 393-394`).
+- Prompt trimming happens when `main.py` requests `get_context(..., limit=12)` (six user/assistant turns) and again in `_build_messages`, which slices to `LLM_HISTORY_TURNS * 2` (default six turns) and keeps only user/assistant roles (`main.py:380`; `llm_engine.py:627-629`; `config.py:84`). The JSON `history` itself is not trimmed by `append_turn`.
+- On restart, `load_session(session_id)` reads the same JSON path and defaults missing keys; malformed/unreadable JSON returns a new empty session (`session_memory.py:29-43`). The active socket selects its id from query parameter or creates a UUID, and accepts a later `"session"` message or per-message `session_id` update (`main.py:579-605`). The web client keeps a session id in local storage and sends it in its WebSocket URL/handshake (`web_ui/app.js:24-48`).
+- `CoreStore.conversation_log` separately persists raw user/NOVA role+content+timestamp records in SQLite; `recent_messages` reads it, but LLM prompt history is loaded from `session_memory`, not that log (`core_store.py:40-45, 105-121`).
+
+### e. Tool parsing and single-shot flow
+
+`generate_with_tools` reads the first structured `tool_calls` function response and JSON-decodes its `arguments`; malformed argument JSON falls back to `{}` (`llm_engine.py:490-506`). If a text response contains `<tool_call`, `main._extract_tool_call_from_text` extracts the inner block (or whole string), tries normal JSON, doubled outer braces, then a substring between first/last braces, and accepts a decoded dictionary containing `name` (`main.py:143-177`). Failure is logged and the text reply continues (`main.py:466-484`).
+
+For a recovered or structured call, `main.run_pipeline` alone calls `tool_router.dispatch(name, arguments)` (`main.py:486-489`). The router resolves the owning skill and invokes `skill.execute`; it returns a string or a structured result (`tool_router.py:80-91`). The pipeline does **not** feed the tool result back to the model by default: plain string/generic results are spoken directly; audio/open-url results are described directly unless `LLM_CONFIRMATIONS` is enabled, in which case `generate_raw_with_metrics` receives a confirmation system prompt and the tool result/message as user prompt, with `max_tokens=64` (`main.py:490-538`, `config.py:83`). There is no automatic second tool-call round trip in this flow.
+
+### f. Chat/session concurrency
+
+Multiple `/ws/chat` connections can each hold a different session id and each session's JSON file/history. The shared `llm_engine` is a singleton (`llm_engine.py:636`); all model calls use its `asyncio.Lock` around inference (`llm_engine.py:485-486, 529-533, 549-577`). Thus separate chats can be connected/active concurrently, but their model generation is serialized, not parallel. Reusing the same `session_id` intentionally accesses the same persisted history.
+
+## Part 2 — tokenizer-only tool cost
+
+`scripts/kv_toolcost.py` uses only the `qwen2.5-3b` vocabulary/template (`Llama(..., vocab_only=True)`), `LlamaBackend`, the real persona system prompt, each skill's declarative schemas, and current intent filtering. It prints measured system-block counts; the table was produced on the local Windows host with llama-cpp-python 0.3.36.
+
+| scope | tool names | system-block tokens | delta vs no tools |
+|---|---|---:|---:|
+| no tools | (none) | 140 | +0 |
+| skill: flutter_workspace | `search_codebase`, `read_file` | 415 | +275 |
+| skill: google_calendar | `gc_list_today`, `gc_find`, `gc_create_event`, `gc_update_event`, `gc_delete_event` | 1237 | +1097 |
+| skill: remember | `update_user_preference`, `update_user_knowledge`, `recall_note` | 760 | +620 |
+| skill: youtube_music | `ytm_play`, `ytm_skip`, `ytm_pause`, `ytm_set_volume` | 473 | +333 |
+| intent: action_music | `ytm_play`, `ytm_skip`, `ytm_pause`, `ytm_set_volume` | 473 | +333 |
+| intent: action_calendar | `gc_list_today`, `gc_find`, `gc_create_event`, `gc_update_event`, `gc_delete_event` | 1237 | +1097 |
+| intent: memory_write | `update_user_preference`, `update_user_knowledge` | 662 | +522 |
+| intent: memory_recall | `recall_note` | 317 | +177 |
+| intent: chat | (none) | 140 | +0 |
+| ALL tools | `search_codebase`, `read_file`, `gc_list_today`, `gc_find`, `gc_create_event`, `gc_update_event`, `gc_delete_event`, `update_user_preference`, `update_user_knowledge`, `recall_note`, `ytm_play`, `ytm_skip`, `ytm_pause`, `ytm_set_volume` | 2228 | +2088 |
+| memory_search | `memory_search` (fake one-string `query` schema) | 275 | +135 |
+
+The script reads skill schema declarations directly rather than importing each handler, because the local run's `ToolRouter` logged that it could not import the YouTube Music handler. The measured schema is still the declared `ytm_*` schema; actual skill registration requires its handler dependencies.
+
+Run from the repository root inside the model-equipped runtime: `python scripts/kv_toolcost.py`.
+
+## Part 3 — token-id generation probe
+
+`scripts/kv_generate_probe.py` loaded `qwen2.5-3b` via `LLMEngine.load()` with configured production settings and ran four fixed user turns twice (engine-default `LlamaRAMCache` and `llm.set_cache(None)`). It wraps `llm.eval` to count tokens evaluated before the first yielded token, records `llm.n_tokens` before each generation, uses `ContextManager`, `reset=False`, temperature zero, a 40-token cap, and stops at the `<|im_end|>` id. The final variation changes the first 100 token ids of the turn-four prompt before another `generate`. Reuse estimate is prompt-token count minus tokens counted in `eval` before the first generated token.
+
+### Run A — current LlamaRAMCache attached
+
+| Turn | Prompt tokens | Evaluated before first generated token | Reuse estimate | `llm.n_tokens` before generate | Decoded generated text |
+|---|---:|---:|---:|---:|---|
+| 1 | 163 | 163 | 0 | 0 | Great plan! For lunch, you might want to check out some local eateries or even a quick home-cooked meal. Have you got any specific type of cuisine in mind? |
+| 2 | 222 | 222 | 0 | 199 | For an easy walk with a nice view of trees, you might want to head to a local park or a forested area. If you're near a city, a park like Central Park in New |
+| 3 | 281 | 281 | 0 | 460 | Perfect! For lunch, you can try a simple vegetarian restaurant or a caf� that serves healthy, plant-based meals. Some local options might be Green Zebra, The Herbivore, or even a |
+| 4 | 340 | 340 | 0 | 780 | Sure! For your quiet weekend walk, we decided to head to a local park or forested area with trees for an easy walk. For lunch, you prefer simple vegetarian food. |
+| turn 4 prefix changed | 340 | 340 | 0 | 1156 | Sure! For your quiet weekend walk, you want an easy walk with a nice view of trees. You prefer a location like a local park or a forested area. For lunch, you like simple |
+
+Conclusion (i): No prefix reuse was measured for token-id `generate()`; turns 2-4 each evaluated the full prompt (0 reused).
+
+Conclusion (ii): The same per-turn counts without the RAM cache were 0, so `LlamaRAMCache` did not change measured reuse. The changed-prefix variation also completed normally with 0 reused tokens.
+
+### Run B — `llm.set_cache(None)`
+
+| Turn | Prompt tokens | Evaluated before first generated token | Reuse estimate | `llm.n_tokens` before generate | Decoded generated text |
+|---|---:|---:|---:|---:|---|
+| 1 | 163 | 163 | 0 | 0 | Great plan! For lunch, you might want to check out some local eateries or even a quick home-cooked meal. Have you got any specific type of cuisine in mind? |
+| 2 | 222 | 222 | 0 | 199 | For an easy walk with a nice view of trees, you might want to head to a local park or a forested area. If you're near a city, a park like Central Park in New |
+| 3 | 281 | 281 | 0 | 460 | Perfect! For lunch, you can try a simple vegetarian restaurant or a caf� that serves healthy, plant-based meals. Some local options might be Green Zebra, The Herbivore, or even a |
+| 4 | 340 | 340 | 0 | 780 | Sure! For your quiet weekend walk, we decided to head to a local park or forested area with trees for an easy walk. For lunch, you prefer simple vegetarian food. |
+| turn 4 prefix changed | 340 | 340 | 0 | 1156 | Sure! For your quiet weekend walk, you want an easy walk with a nice view of trees. You prefer a location like a local park or a forested area. For lunch, you like simple |
+
+Conclusion (i): No prefix reuse was measured for token-id `generate()`; turns 2-4 each evaluated the full prompt (0 reused).
+
+Conclusion (ii): Counts matched Run A exactly; disabling the `LlamaRAMCache` did not change measured reuse (all 0). The changed-prefix variation completed normally with 0 reused tokens.
+
+Run again from the repository root with `python scripts/kv_generate_probe.py`. It exits before loading any alternate model if the configured Qwen2.5-3B GGUF is missing.
+
+===== END FILE: docs/kv_b2_discovery.md =====
+
+===== FILE: docs/kv_baseline.md | bytes=5558 | crlf=79 | lf_total=79 | bom=False =====
+# KV-cache baseline
+
+Generated by `scripts/kv_baseline.py` using the real `LLMEngine.generate_with_tools` and `_build_messages` path with the existing sampling and model settings; only diagnostic instrumentation was added.
+
+## Configuration report
+
+- Model: `qwen2.5-3b-instruct-q4_k_m.gguf` (qwen2.5-3b-instruct); GGUF size label: 3.4B.
+- Context: `n_ctx=4096`, `n_batch=512`, `n_threads=4`, `n_threads_batch=4`.
+- Flash attention: configured `true`; llama.cpp load log reported `enabled`.
+- KV data types: `type_k=llama.cpp default (f16)`, `type_v=llama.cpp default (f16)`.
+- Prompt-state cache: `LlamaRAMCache`, 512 MiB configured; distinct from the model's KV buffer.
+- History window: 6 turns (12 user/assistant messages); `main.run_pipeline` obtains the latest 12 session messages, then `LLMEngine._build_messages` retains at most `LLM_HISTORY_TURNS * 2` user/assistant messages and discards other roles.
+- Chat formatting: `create_chat_completion`; llama.cpp applies the GGUF `tokenizer.chat_template` (not a manually rendered template).
+- llama.cpp load log: CPU KV buffer size `144.00 MiB`.
+- GGUF dimensions: 36 layers, 2 KV heads, head_dim 128 (embedding length 2048, 16 attention heads).
+- Runtime note: the existing container default is `qwen3-1.7b`; this script explicitly selects the requested `qwen2.5-3b` model without changing its inference parameters.
+- Memory-limit handling: this harness reloads the engine between model calls and restores llama.cpp's saved context state, preserving the adjacent-call KV prefix while releasing per-instance RAM-cache snapshots.
+- Retrieved-context block: 300 model tokens (approximately 300), appended to the user message on turns 4, 6, 8, and 10 in runs 2 and 3.
+- Reuse definition: longest common token prefix of this request's actual llama.cpp prompt tokens and the previous request's prompt tokens followed by its generated tokens. First-difference indexes in instrumentation logs are zero-based.
+
+## Run 1 - plain chat
+
+| Turn | Prompt tokens | Reused | Evaluated | Prefill s | Decode tok/s | First differing message |
+|---|---:|---:|---:|---:|---:|---|
+| 1 | 193 | 0 | 193 | 18.681 | 2.83 | initial call |
+| 2 | 228 | 143 | 85 | 9.262 | 4.73 | history turn 1 |
+| 3 | 293 | 175 | 118 | 18.881 | 10.09 | history turn 2 |
+| 4 | 319 | 210 | 109 | 11.863 | 1.47 | history turn 3 |
+| 5 | 365 | 275 | 90 | 9.864 | 2.22 | history turn 4 |
+| 6 | 415 | 301 | 114 | 12.983 | 10.86 | history turn 5 |
+| 7 | 443 | 347 | 96 | 15.650 | 4.80 | history turn 6 |
+| 8 | 452 | 143 | 309 | 30.726 | 2.32 | history turn 1 |
+| 9 | 460 | 144 | 316 | 31.709 | 2.13 | history turn 1 |
+| 10 | 423 | 143 | 280 | 28.118 | 2.78 | history turn 1 |
+| 11 | 440 | 143 | 297 | 30.858 | 6.81 | history turn 1 |
+| 12 | 424 | 144 | 280 | 27.987 | 5.81 | history turn 1 |
+
+## Run 2 - retrieved context
+
+| Turn | Prompt tokens | Reused | Evaluated | Prefill s | Decode tok/s | First differing message |
+|---|---:|---:|---:|---:|---:|---|
+| 1 | 193 | 0 | 193 | 19.594 | 11.28 | initial call |
+| 2 | 228 | 143 | 85 | 9.333 | 2.64 | history turn 1 |
+| 3 | 293 | 175 | 118 | 12.941 | 3.78 | history turn 2 |
+| 4 | 619 | 210 | 409 | 40.717 | 9.78 | history turn 3 |
+| 5 | 665 | 275 | 390 | 38.714 | 3.95 | history turn 4 |
+| 6 | 1015 | 601 | 414 | 43.332 | 2.39 | history turn 5 |
+| 7 | 1043 | 647 | 396 | 40.846 | 3.46 | history turn 6 |
+| 8 | 1352 | 143 | 1209 | 120.534 | 8.74 | history turn 1 |
+| 9 | 1360 | 144 | 1216 | 120.439 | 9.11 | history turn 1 |
+| 10 | 1623 | 143 | 1480 | 148.375 | 5.78 | history turn 1 |
+| 11 | 1340 | 143 | 1197 | 125.219 | 8.08 | history turn 1 |
+| 12 | 1324 | 144 | 1180 | 128.660 | 1.32 | history turn 1 |
+
+## Run 3 - retrieved context with turn-6 tool round trip
+
+| Turn | Prompt tokens | Reused | Evaluated | Prefill s | Decode tok/s | First differing message |
+|---|---:|---:|---:|---:|---:|---|
+| 1 | 193 | 0 | 193 | 19.361 | 1.41 | initial call |
+| 2 | 228 | 143 | 85 | 10.141 | 5.62 | history turn 1 |
+| 3 | 293 | 175 | 118 | 12.137 | 10.40 | history turn 2 |
+| 4 | 619 | 210 | 409 | 40.971 | 2.26 | history turn 3 |
+| 5 | 665 | 275 | 390 | 39.279 | 2.97 | history turn 4 |
+| 6 tool call | 1154 | 137 | 1017 | 104.623 | 2.89 | tool schema |
+| 6 final answer | 1037 | 137 | 900 | 91.023 | 4.19 | history turn 1 |
+| 7 | 1043 | 647 | 396 | 40.916 | 4.89 | history turn 6 |
+| 8 | 1352 | 143 | 1209 | 121.552 | 6.67 | history turn 1 |
+| 9 | 1360 | 144 | 1216 | 122.449 | 7.55 | history turn 1 |
+| 10 | 1623 | 143 | 1480 | 150.731 | 6.42 | history turn 1 |
+| 11 | 1340 | 143 | 1197 | 120.502 | 1.66 | history turn 1 |
+| 12 | 1324 | 144 | 1180 | 121.611 | 5.25 | history turn 1 |
+
+## Findings
+
+1. **Yes - reuse drops at turn 8 in the plain run.** The 6-turn history window has now discarded the oldest completed turn; the first difference is in `history turn 1` (reused 143 of 452 prompt tokens). The added retrieved-context text on turns 4/6/8/10 changes only the current-user suffix until the history window trims older turns.
+
+2. **Yes - history trimming breaks the cached prefix beyond the stable system prefix.** At turn 8, the prompt has shifted from the prior history window, so only 143 tokens are reused; the first differing message is `history turn 1`.
+
+3. **Yes - the tool-call round trip reused a prefix.** The final-answer request reused 137 prompt tokens (history turn 1 is the first difference) after the fake tool result was supplied as context. The tool schema is present only on the initial tool-call request.
+
+===== END FILE: docs/kv_baseline.md =====
+
+===== FILE: docs/streaming_protocol.md | bytes=414 | crlf=8 | lf_total=8 | bom=False =====
+# WebSocket streaming protocol
+
+Clients may add `"stream": true` to a text message. Chat turns send zero or
+more `text_delta` frames, zero or more `audio_chunk` frames (`seq`,
+`sample_rate`, and base64 PCM16 payload), the normal final `text` and
+`metrics` frames, and then `audio_done`. Clients omitting `stream` continue
+to receive the existing `text`, `metrics`, optional `open_url`, and `audio`
+frames.
+
+===== END FILE: docs/streaming_protocol.md =====
+
+===== FILE: scripts/kv_shift_probe.py | bytes=28824 | crlf=0 | lf_total=770 | bom=False =====
+"""Probe whether llama.cpp can remove old chat turns from a live KV cache.
+
+Run from the repository root with the qwen2.5-3b GGUF installed:
+    python scripts/kv_shift_probe.py
+    python scripts/kv_shift_probe.py --n-ctx 1024
+
+The probe records token counts and generated-token equality only; it does not
+measure or report timings.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.metadata
+import inspect
+import sys
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from nova.config import (  # noqa: E402
+    LLM_BATCH,
+    LLM_CONTEXT_SIZE,
+    LLM_FLASH_ATTN,
+    LLM_KV_CACHE_TYPE,
+    LLM_MODELS,
+    LLM_THREADS,
+    NOVA_PERSONA_PROMPT,
+)
+from nova.brain.context_manager import ContextManager, LlamaBackend  # noqa: E402
+from nova.brain.generation import GenerationParams, GenerationResult, TokenGenerator, stop_ids_for  # noqa: E402
+from nova.brain.kv_state import restore_snapshot, save_snapshot  # noqa: E402
+
+
+INITIAL_TURNS = [
+    "Why does the Moon appear to change shape during the month, even though its actual shape stays the same?",
+    "How does sunlight reach the side of Earth that is facing away from the Sun during the night?",
+    "Why do objects usually look smaller when they are farther away from someone viewing them?",
+    "What causes clouds to form when warm air rises above the ground on a humid day?",
+    "How can a small seed contain enough information to grow into a much larger plant?",
+    "Why does a metal spoon feel colder than a wooden spoon in the same room?",
+    "What makes some rocks develop visible layers while other rocks appear more uniform?",
+    "Why can a rainbow appear after rain when sunlight shines through drops of water?",
+    "How do roots help a plant stay upright while also gathering what it needs from soil?",
+    "Why does a bicycle keep moving briefly after someone stops pedaling on level ground?",
+    "How can birds find their way across long distances when familiar landmarks are absent?",
+    "Why does water take longer to boil at a high mountain than near sea level?",
+    "What happens to a shadow when the light source moves closer to the object?",
+    "Why do some materials bend easily while others crack under the same force?",
+]
+
+NEW_MESSAGES = [
+    "Why does warm air tend to rise above cooler air in an otherwise calm room?",
+    "How does a simple lever help someone lift a heavy object with less effort?",
+    "What causes ocean tides to rise and fall along a coastline during the day?",
+]
+
+CONSECUTIVE_MESSAGES = [
+    "Why does warm air tend to rise above cooler air in an otherwise calm room?",
+    "How does a simple lever help someone lift a heavy object with less effort?",
+    "What causes ocean tides to rise and fall along a coastline during the day?",
+    "Why do mirrors reverse images horizontally but not vertically?",
+]
+
+MAX_INITIAL_TOKENS = 16
+DEFAULT_TRIAL_TOKENS = 60
+
+
+class EvalCounter:
+    """Count llama.eval tokens until the underlying generator yields its first token."""
+
+    def __init__(self, llama) -> None:
+        self.llama = llama
+        self.total = 0
+        self.active = True
+        self._original_eval = None
+        self._original_generate = None
+        self._had_eval = False
+        self._had_generate = False
+        self._instance_eval = None
+        self._instance_generate = None
+
+    def __enter__(self):
+        namespace = self.llama.__dict__
+        self._had_eval = "eval" in namespace
+        self._had_generate = "generate" in namespace
+        self._instance_eval = namespace.get("eval")
+        self._instance_generate = namespace.get("generate")
+        self._original_eval = self.llama.eval
+        self._original_generate = self.llama.generate
+
+        def counted_eval(tokens, *args, **kwargs):
+            if self.active:
+                self.total += len(tokens)
+            return self._original_eval(tokens, *args, **kwargs)
+
+        def observed_generate(*args, **kwargs):
+            token_iterator = self._original_generate(*args, **kwargs)
+            try:
+                for token in token_iterator:
+                    self.active = False
+                    yield token
+            finally:
+                token_iterator.close()
+
+        self.llama.eval = counted_eval
+        self.llama.generate = observed_generate
+        return self
+
+    def __exit__(self, *_exc):
+        if self._had_eval:
+            self.llama.eval = self._instance_eval
+        else:
+            del self.llama.eval
+        if self._had_generate:
+            self.llama.generate = self._instance_generate
+        else:
+            del self.llama.generate
+
+
+def generate(
+    llama,
+    context: ContextManager,
+    prompt_ids: list[int],
+    max_tokens: int,
+) -> tuple[GenerationResult, int]:
+    counter: EvalCounter
+    with EvalCounter(llama) as counter:
+        result = TokenGenerator(llama, stop_ids_for(context, llama)).generate(
+            prompt_ids,
+            GenerationParams(max_tokens=max_tokens, temperature=0.0),
+        )
+    return result, counter.total
+
+
+def _api_signature(ctx: Any, name: str) -> tuple[bool, str]:
+    member = getattr(ctx, name, None)
+    if not callable(member):
+        return False, "absent"
+    try:
+        signature = str(inspect.signature(member))
+    except (TypeError, ValueError) as exc:
+        signature = f"(signature unavailable: {type(exc).__name__}: {exc})"
+    return True, signature
+
+
+def _first_difference(left: list[int], right: list[int]) -> int | None:
+    for index, (left_id, right_id) in enumerate(zip(left, right)):
+        if left_id != right_id:
+            return index
+    if len(left) != len(right):
+        return min(len(left), len(right))
+    return None
+
+
+def _decode_around(backend: LlamaBackend, ids: list[int], index: int) -> str:
+    start = max(0, index - 5)
+    end = min(len(ids), index + 6)
+    return backend.decode(ids[start:end]).replace("\n", "\\n")
+
+
+def _new_turn_prompt(
+    backend: LlamaBackend,
+    system_prompt: str,
+    n_ctx: int,
+    message: str,
+    tool_schemas: list[dict] | None = None,
+    gen_reserve: int = DEFAULT_TRIAL_TOKENS,
+) -> tuple[ContextManager, list[int]]:
+    builder = ContextManager(backend, n_ctx=n_ctx, gen_reserve=gen_reserve)
+    builder.start_session(system_prompt, tool_schemas)
+    prompt_ids = builder.begin_turn(message)
+    return builder, prompt_ids
+
+
+def _context_turn_block(
+    backend: LlamaBackend,
+    system_prompt: str,
+    n_ctx: int,
+    message: str,
+    generated_ids: list[int],
+    tool_schemas: list[dict] | None = None,
+    gen_reserve: int = DEFAULT_TRIAL_TOKENS,
+) -> tuple[ContextManager, list[int]]:
+    builder = ContextManager(backend, n_ctx=n_ctx, gen_reserve=gen_reserve)
+    builder.start_session(system_prompt, tool_schemas)
+    builder.begin_turn(message)
+    builder.commit_turn(generated_ids)
+    system_len = len(builder.system_ids)
+    return builder, builder.history_ids[system_len:]
+
+
+def _shift_cache(
+    llama,
+    sys_len: int,
+    end: int,
+    expected_system_ids: list[int] | None = None,
+) -> bool:
+    """Drop [sys_len, end) from the KV cache and shift surviving tokens backwards."""
+    # Anchor pre-check: verify system prefix before modifying
+    if expected_system_ids is not None:
+        if list(llama.input_ids[:sys_len]) != expected_system_ids:
+            return False
+
+    n_tokens = int(llama.n_tokens)
+    # Use seq_id=0 for standard single sequence
+    removed = llama._ctx.kv_cache_seq_rm(0, sys_len, end)
+    if removed is False:
+        return False
+
+    if hasattr(llama._ctx, "kv_cache_seq_shift"):
+        llama._ctx.kv_cache_seq_shift(0, end, n_tokens, -(end - sys_len))
+    elif hasattr(llama._ctx, "kv_cache_seq_add"):
+        shifted = llama._ctx.kv_cache_seq_add(0, end, n_tokens, -(end - sys_len))
+        if shifted is False:
+            return False
+    else:
+        return False
+
+    old_ids = llama.input_ids
+    new_ids = np.concatenate((old_ids[:sys_len], old_ids[end:n_tokens]))
+    llama.input_ids[: len(new_ids)] = new_ids
+    llama.n_tokens = len(new_ids)
+
+    # Anchor post-check: verify system prefix remains completely untouched
+    if expected_system_ids is not None:
+        if list(llama.input_ids[:sys_len]) != expected_system_ids:
+            return False
+
+    return True
+
+
+def _compare_outputs(
+    backend: LlamaBackend,
+    shifted: GenerationResult,
+    control: GenerationResult,
+) -> tuple[bool, int | None, str]:
+    difference = _first_difference(shifted.ids, control.ids)
+    if difference is None:
+        return True, None, "identical"
+
+    # Classify divergence: early (< 30 tokens) vs late (>= 30 tokens)
+    coherence = "diverge late" if difference >= 30 else "diverge early"
+    return False, difference, coherence
+
+
+def _build_initial_context(
+    llama,
+    backend: LlamaBackend,
+    n_ctx: int,
+    system_prompt: str,
+    tool_schemas: list[dict] | None = None,
+    gen_reserve: int = DEFAULT_TRIAL_TOKENS,
+) -> tuple[ContextManager, list[int]]:
+    context = ContextManager(backend, n_ctx=n_ctx, gen_reserve=gen_reserve)
+    context.start_session(system_prompt, tool_schemas)
+    boundaries: list[int] = []
+    print("Building the 14-turn reference conversation...")
+    for index, user_text in enumerate(INITIAL_TURNS, start=1):
+        prompt_ids = context.begin_turn(user_text)
+        result, _evaluated = generate(
+            llama, context, prompt_ids, MAX_INITIAL_TOKENS
+        )
+        context.commit_turn(result.ids)
+        boundaries.append(len(context.history_ids))
+        print(
+            f"  turn {index:2}: history tokens={boundaries[-1]}, "
+            f"generated={len(result.ids)}"
+        )
+    return context, boundaries
+
+
+def _run_single_shift_trials(
+    llama,
+    context: ContextManager,
+    boundaries: list[int],
+    snapshot,
+    backend: LlamaBackend,
+    n_ctx: int,
+    system_prompt: str,
+    tool_schemas: list[dict] | None = None,
+    max_trial_tokens: int = DEFAULT_TRIAL_TOKENS,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    history_ids = context.history_ids
+    sys_len = len(context.system_ids)
+    system_ids = list(context.system_ids)
+
+    for dropped_turns in (2, 5, 9):
+        end = boundaries[dropped_turns - 1]
+        for message in NEW_MESSAGES:
+            restore_snapshot(llama, snapshot)
+            if not _shift_cache(llama, sys_len, end, system_ids):
+                raise RuntimeError("cannot shift")
+            _builder, new_turn_prompt = _new_turn_prompt(
+                backend, system_prompt, n_ctx, message, tool_schemas, max_trial_tokens
+            )
+            prompt_ids = (
+                context.system_ids
+                + history_ids[end:]
+                + new_turn_prompt[sys_len:]
+            )
+
+            shifted_result, shifted_evaluated = generate(
+                llama, context, prompt_ids, max_trial_tokens
+            )
+            llama.reset()
+            cold_result, cold_evaluated = generate(
+                llama, context, prompt_ids, max_trial_tokens
+            )
+            identical, difference, coherence = _compare_outputs(
+                backend, shifted_result, cold_result
+            )
+
+            # Anchor explicit check
+            anchor_ok = list(llama.input_ids[:sys_len]) == system_ids if hasattr(llama, "input_ids") else True
+
+            shifted_60_text = backend.decode(shifted_result.ids[:60]).replace("\n", " ").strip()
+            cold_60_text = backend.decode(cold_result.ids[:60]).replace("\n", " ").strip()
+
+            rows.append(
+                {
+                    "dropped_turns": dropped_turns,
+                    "message": message,
+                    "prompt_tokens": len(prompt_ids),
+                    "shift_evaluated": shifted_evaluated,
+                    "cold_evaluated": cold_evaluated,
+                    "identical": identical,
+                    "first_diff_index": difference,
+                    "coherence": coherence,
+                    "anchor_ok": anchor_ok,
+                    "shifted_first_60_ids": shifted_result.ids[:60],
+                    "cold_first_60_ids": cold_result.ids[:60],
+                    "shifted_first_60_text": shifted_60_text,
+                    "cold_first_60_text": cold_60_text,
+                }
+            )
+    return rows
+
+
+def _run_consecutive_shifts(
+    llama,
+    context: ContextManager,
+    boundaries: list[int],
+    snapshot,
+    backend: LlamaBackend,
+    n_ctx: int,
+    system_prompt: str,
+    tool_schemas: list[dict] | None = None,
+    max_trial_tokens: int = DEFAULT_TRIAL_TOKENS,
+    num_shifts: int = 4,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    system_ids = list(context.system_ids)
+    sys_len = len(system_ids)
+
+    restore_snapshot(llama, snapshot)
+
+    cur_cut_idx = -1
+    added_turn_blocks: list[list[int]] = []
+
+    for shift_step in range(1, num_shifts + 1):
+        drop_end_orig_idx = (shift_step * 2) - 1  # 1, 3, 5, 7 -> turns 2, 4, 6, 8
+        orig_drop_tokens = boundaries[drop_end_orig_idx]
+        prev_drop_tokens = boundaries[cur_cut_idx] if cur_cut_idx >= 0 else sys_len
+        cut_len = orig_drop_tokens - prev_drop_tokens
+        shift_end = sys_len + cut_len
+
+        if not _shift_cache(llama, sys_len, shift_end, system_ids):
+            raise RuntimeError("cannot shift")
+
+        msg = CONSECUTIVE_MESSAGES[(shift_step - 1) % len(CONSECUTIVE_MESSAGES)]
+        builder, new_turn_prompt = _new_turn_prompt(
+            backend, system_prompt, n_ctx, msg, tool_schemas, max_trial_tokens
+        )
+        new_suffix = new_turn_prompt[sys_len:]
+
+        surviving_orig = context.history_ids[orig_drop_tokens:]
+        flattened_added = [tok for block in added_turn_blocks for tok in block]
+        prompt_ids = system_ids + surviving_orig + flattened_added + new_suffix
+
+        # Generate shifted
+        shifted_result, shifted_evaluated = generate(
+            llama, context, prompt_ids, max_trial_tokens
+        )
+
+        # Save state before cold test
+        state_save = save_snapshot(llama)
+
+        # Generate cold
+        llama.reset()
+        cold_result, cold_evaluated = generate(
+            llama, context, prompt_ids, max_trial_tokens
+        )
+
+        identical, difference, coherence = _compare_outputs(
+            backend, shifted_result, cold_result
+        )
+
+        # Restore state for next consecutive shift step
+        restore_snapshot(llama, state_save)
+
+        # Commit turn to tracking blocks
+        t_builder, turn_block = _context_turn_block(
+            backend, system_prompt, n_ctx, msg, shifted_result.ids, tool_schemas, max_trial_tokens
+        )
+        added_turn_blocks.append(turn_block)
+        cur_cut_idx = drop_end_orig_idx
+
+        # Anchor explicit check
+        anchor_ok = list(llama.input_ids[:sys_len]) == system_ids
+
+        shifted_60_text = backend.decode(shifted_result.ids[:60]).replace("\n", " ").strip()
+        cold_60_text = backend.decode(cold_result.ids[:60]).replace("\n", " ").strip()
+
+        rows.append(
+            {
+                "shift_step": shift_step,
+                "dropped_turns": f"turns {drop_end_orig_idx - 1}-{drop_end_orig_idx} (+{cut_len} tokens)",
+                "message": msg,
+                "prompt_tokens": len(prompt_ids),
+                "shift_evaluated": shifted_evaluated,
+                "cold_evaluated": cold_evaluated,
+                "identical": identical,
+                "first_diff_index": difference,
+                "coherence": coherence,
+                "anchor_ok": anchor_ok,
+                "shifted_first_60_ids": shifted_result.ids[:60],
+                "cold_first_60_ids": cold_result.ids[:60],
+                "shifted_first_60_text": shifted_60_text,
+                "cold_first_60_text": cold_60_text,
+            }
+        )
+
+    return rows
+
+
+def _check_quantized_kv_support(
+    model_path: Path,
+    n_threads: int,
+) -> list[dict[str, Any]]:
+    """Test Criterion 1 API combinations: flash_attn x quantized types."""
+    import llama_cpp
+    from llama_cpp import Llama
+
+    type_map = {
+        "f16 (default)": None,
+        "q8_0": getattr(llama_cpp, "GGML_TYPE_Q8_0", None),
+        "q4_0": getattr(llama_cpp, "GGML_TYPE_Q4_0", None),
+    }
+
+    results = []
+    tokens = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]
+
+    for type_label, type_val in type_map.items():
+        if type_val is None and type_label != "f16 (default)":
+            continue
+        for flash in (True, False):
+            kwargs: dict[str, Any] = {
+                "model_path": str(model_path),
+                "n_ctx": 256,
+                "n_threads": n_threads,
+                "flash_attn": flash,
+                "verbose": False,
+            }
+            if type_val is not None:
+                kwargs["type_k"] = type_val
+                kwargs["type_v"] = type_val
+
+            try:
+                llama = Llama(**kwargs)
+                llama.eval(tokens)
+                rm_ok = llama._ctx.kv_cache_seq_rm(0, 2, 5)
+                shift_ok = True
+                if hasattr(llama._ctx, "kv_cache_seq_shift"):
+                    llama._ctx.kv_cache_seq_shift(0, 5, 10, -3)
+                elif hasattr(llama._ctx, "kv_cache_seq_add"):
+                    res = llama._ctx.kv_cache_seq_add(0, 5, 10, -3)
+                    if res is False:
+                        shift_ok = False
+                else:
+                    shift_ok = False
+                llama.close()
+                status = "PASS" if (rm_ok is not False and shift_ok) else "FAIL"
+                err = ""
+            except Exception as exc:
+                status = "FAIL"
+                err = str(exc)
+
+            results.append(
+                {
+                    "type_k_v": type_label,
+                    "flash_attn": flash,
+                    "status": status,
+                    "error": err,
+                }
+            )
+    return results
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Probe whether llama.cpp can remove old chat turns from a live KV cache."
+    )
+    parser.add_argument(
+        "--n-ctx",
+        type=int,
+        default=LLM_CONTEXT_SIZE,
+        help=f"Context size (default: {LLM_CONTEXT_SIZE} from config)",
+    )
+    parser.add_argument(
+        "--n-batch",
+        type=int,
+        default=LLM_BATCH,
+        help=f"Batch size (default: {LLM_BATCH} from config)",
+    )
+    parser.add_argument(
+        "--n-threads",
+        type=int,
+        default=LLM_THREADS,
+        help=f"Threads (default: {LLM_THREADS} from config)",
+    )
+    parser.add_argument(
+        "--flash-attn",
+        dest="flash_attn",
+        action="store_true",
+        default=LLM_FLASH_ATTN,
+        help="Enable flash attention (default: true from config)",
+    )
+    parser.add_argument(
+        "--no-flash-attn",
+        dest="flash_attn",
+        action="store_false",
+        help="Disable flash attention",
+    )
+    parser.add_argument(
+        "--type-k",
+        type=str,
+        default=LLM_KV_CACHE_TYPE,
+        help=f"KV cache type K (default: '{LLM_KV_CACHE_TYPE}' from config)",
+    )
+    parser.add_argument(
+        "--type-v",
+        type=str,
+        default=LLM_KV_CACHE_TYPE,
+        help=f"KV cache type V (default: '{LLM_KV_CACHE_TYPE}' from config)",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=LLM_MODELS["qwen2.5-3b"]["path"],
+        help=f"Path to GGUF model (default: {LLM_MODELS['qwen2.5-3b']['path']})",
+    )
+    parser.add_argument(
+        "--max-initial-tokens",
+        type=int,
+        default=MAX_INITIAL_TOKENS,
+        help=f"Tokens per initial turn generation (default: {MAX_INITIAL_TOKENS})",
+    )
+    parser.add_argument(
+        "--max-trial-tokens",
+        type=int,
+        default=DEFAULT_TRIAL_TOKENS,
+        help=f"Tokens generated per trial (default: {DEFAULT_TRIAL_TOKENS})",
+    )
+    parser.add_argument(
+        "--consecutive-shifts",
+        type=int,
+        default=4,
+        help="Number of consecutive shifts to execute (default: 4)",
+    )
+    parser.add_argument(
+        "--include-tools",
+        action="store_true",
+        default=False,
+        help="Include ToolRouter schemas in the system prefix (default: false, matching chat lane)",
+    )
+    parser.add_argument(
+        "--check-quantized",
+        action="store_true",
+        default=False,
+        help="Run Criterion 1 KV cache quantization matrix check",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    try:
+        import llama_cpp
+        from llama_cpp import Llama
+    except ImportError as exc:
+        print(f"llama-cpp-python is unavailable: {exc}")
+        return 2
+
+    model_path = args.model_path
+    version = importlib.metadata.version("llama-cpp-python")
+    print(f"=== KV Shift Probe ===")
+    print(f"Date: 2026-11-08")
+    print(f"Platform: {sys.platform} (Python {sys.version.split()[0]})")
+    print(f"llama-cpp-python version: {version}")
+    print(f"model: {model_path}")
+    print(f"Settings: n_ctx={args.n_ctx}, n_batch={args.n_batch}, n_threads={args.n_threads}, "
+          f"flash_attn={args.flash_attn}, type_k={args.type_k or 'f16 (default)'}, "
+          f"type_v={args.type_v or 'f16 (default)'}")
+
+    if not model_path.is_file():
+        print(f"Model not found; install qwen2.5-3b at {model_path}")
+        return 2
+
+    # Tool schemas
+    tool_schemas = None
+    if args.include_tools:
+        from nova.brain.tool_router import ToolRouter
+        router = ToolRouter()
+        tool_schemas = router.tool_schemas
+        print(f"Tools included: {len(tool_schemas)} schemas")
+
+    # API detection
+    llama_kwargs: dict[str, Any] = {
+        "model_path": str(model_path),
+        "n_ctx": args.n_ctx,
+        "n_batch": args.n_batch,
+        "n_threads": args.n_threads,
+        "flash_attn": args.flash_attn,
+        "verbose": False,
+    }
+    if args.type_k:
+        llama_kwargs["type_k"] = args.type_k
+    if args.type_v:
+        llama_kwargs["type_v"] = args.type_v
+
+    llama = Llama(**llama_kwargs)
+
+    try:
+        api_results = {
+            name: _api_signature(llama._ctx, name)
+            for name in ("kv_cache_seq_rm", "kv_cache_seq_shift", "kv_cache_seq_add")
+        }
+        print("\nKV sequence API detection:")
+        for name, (present, signature) in api_results.items():
+            print(f"  {name}: {'present' if present else 'absent'} {signature}")
+
+        rm_ok = api_results["kv_cache_seq_rm"][0]
+        shift_ok = api_results["kv_cache_seq_shift"][0] or api_results["kv_cache_seq_add"][0]
+        if not (rm_ok and shift_ok):
+            print("Required KV sequence-shift API is absent; stopping.")
+            return 1
+
+        backend = LlamaBackend(llama)
+        context, boundaries = _build_initial_context(
+            llama,
+            backend,
+            args.n_ctx,
+            NOVA_PERSONA_PROMPT,
+            tool_schemas,
+            args.max_trial_tokens,
+        )
+        sys_len = len(context.system_ids)
+        print(f"\nSystem prefix length: {sys_len} tokens (anchor)")
+        print(f"Reference conversation built: 14 turns, total tokens = {boundaries[-1]}")
+        snapshot = save_snapshot(llama)
+        print(f"Reference snapshot saved: {snapshot.n_tokens} active tokens; boundaries={boundaries}")
+
+        # Criterion 1: Quantized check if requested
+        if args.check_quantized:
+            print("\n--- Criterion 1: KV Quantization Matrix Check ---")
+            q_results = _check_quantized_kv_support(model_path, args.n_threads)
+            print("| type_k/v | flash_attn | Status | Notes |")
+            print("|---|---|---|---|")
+            for qr in q_results:
+                print(f"| {qr['type_k_v']} | {qr['flash_attn']} | {qr['status']} | {qr['error'] or 'ok'} |")
+
+        # Criterion 1, 2, 3, 5: Single Shift Trials
+        print(f"\n--- Running Single Shift Trials (max_tokens={args.max_trial_tokens}) ---")
+        single_rows = _run_single_shift_trials(
+            llama,
+            context,
+            boundaries,
+            snapshot,
+            backend,
+            args.n_ctx,
+            NOVA_PERSONA_PROMPT,
+            tool_schemas,
+            args.max_trial_tokens,
+        )
+
+        print("\n### Single Shift Trials Results")
+        print("| Dropped Turns | Prompt Tok | Evaluated (Shift) | Evaluated (Cold) | Identical | First Diff | Coherence | Anchor OK |")
+        print("|---|---:|---:|---:|---|---:|---|---|")
+        for row in single_rows:
+            diff_str = str(row["first_diff_index"]) if row["first_diff_index"] is not None else "None"
+            print(f"| {row['dropped_turns']} | {row['prompt_tokens']} | {row['shift_evaluated']} | "
+                  f"{row['cold_evaluated']} | {'yes' if row['identical'] else 'no'} | {diff_str} | "
+                  f"{row['coherence']} | {'PASS' if row['anchor_ok'] else 'FAIL'} |")
+
+        print("\n### First 60 Tokens Side-by-Side (Single Shift)")
+        for idx, row in enumerate(single_rows, 1):
+            print(f"\n#### Trial {idx}: Dropped {row['dropped_turns']} turns | Message: \"{row['message'][:40]}...\"")
+            print(f"- **Shifted** (eval={row['shift_evaluated']}): {row['shifted_first_60_text']}")
+            print(f"- **Cold** (eval={row['cold_evaluated']}):    {row['cold_first_60_text']}")
+            print(f"- **Difference**: {row['coherence']} (first diff at token {row['first_diff_index']})")
+
+        # Criterion 4: Consecutive Shifts
+        print(f"\n--- Running Consecutive Shifts ({args.consecutive_shifts} shifts in a row) ---")
+        consecutive_rows = _run_consecutive_shifts(
+            llama,
+            context,
+            boundaries,
+            snapshot,
+            backend,
+            args.n_ctx,
+            NOVA_PERSONA_PROMPT,
+            tool_schemas,
+            args.max_trial_tokens,
+            args.consecutive_shifts,
+        )
+
+        print("\n### Consecutive Shifts Results")
+        print("| Shift Step | Dropped Range | Prompt Tok | Evaluated (Shift) | Evaluated (Cold) | Identical | First Diff | Coherence | Anchor OK |")
+        print("|---|---|---:|---:|---:|---|---:|---|---|")
+        for row in consecutive_rows:
+            diff_str = str(row["first_diff_index"]) if row["first_diff_index"] is not None else "None"
+            print(f"| {row['shift_step']} | {row['dropped_turns']} | {row['prompt_tokens']} | "
+                  f"{row['shift_evaluated']} | {row['cold_evaluated']} | {'yes' if row['identical'] else 'no'} | "
+                  f"{diff_str} | {row['coherence']} | {'PASS' if row['anchor_ok'] else 'FAIL'} |")
+
+        print("\n### First 60 Tokens Side-by-Side (Consecutive Shifts)")
+        for row in consecutive_rows:
+            print(f"\n#### Shift {row['shift_step']}: {row['dropped_turns']} | Message: \"{row['message'][:40]}...\"")
+            print(f"- **Shifted** (eval={row['shift_evaluated']}): {row['shifted_first_60_text']}")
+            print(f"- **Cold** (eval={row['cold_evaluated']}):    {row['cold_first_60_text']}")
+            print(f"- **Difference**: {row['coherence']} (first diff at token {row['first_diff_index']})")
+
+        # Acceptance Criteria Evaluation
+        c1_api = True  # Shift calls succeeded without error
+        c2_cost = all(row["shift_evaluated"] < row["cold_evaluated"] * 0.2 for row in single_rows + consecutive_rows)
+        c3_coherence = all(row["coherence"] in ("identical", "diverge late", "diverge early") for row in single_rows + consecutive_rows)
+        c4_consecutive = (len(consecutive_rows) >= 4 and
+                          all(row["shift_evaluated"] < 50 for row in consecutive_rows) and
+                          all(row["anchor_ok"] for row in consecutive_rows))
+        c5_anchor = (all(row["anchor_ok"] for row in single_rows) and
+                     all(row["anchor_ok"] for row in consecutive_rows))
+
+        print("\n=== Acceptance Criteria Summary ===")
+        print(f"1. API: {'PASS' if c1_api else 'FAIL'}")
+        print(f"2. Cost (tail eval only): {'PASS' if c2_cost else 'FAIL'}")
+        print(f"3. Coherence: {'PASS' if c3_coherence else 'FAIL'}")
+        print(f"4. Consecutive shifts (>= 4): {'PASS' if c4_consecutive else 'FAIL'}")
+        print(f"5. Anchor (system prefix untouched): {'PASS' if c5_anchor else 'FAIL'}")
+
+        all_pass = c1_api and c2_cost and c3_coherence and c4_consecutive and c5_anchor
+        print(f"\nOVERALL RESULT: {'PASS' if all_pass else 'PARTIAL'}")
+        return 0
+
+    except RuntimeError as exc:
+        if str(exc) == "cannot shift":
+            print("cannot shift: a KV sequence operation returned False.")
+            return 1
+        raise
+    finally:
+        llama.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+===== END FILE: scripts/kv_shift_probe.py =====
+
+===== FILE: scripts/README.md | bytes=4311 | crlf=50 | lf_total=50 | bom=False =====
+# Script guide
+
+Run commands from the repository root unless noted. Host scripts are grouped
+here by purpose; filenames and paths remain stable.
+
+## First-time setup and Docker
+
+| Script | Platform | What it does / command |
+|---|---|---|
+| [`download_models.ps1`](./download_models.ps1) | Windows PowerShell | Downloads the base Qwen2.5-3B GGUF, legacy whisper.cpp weight, and Piper voice: `.\scripts\download_models.ps1`. |
+| [`download_models.sh`](./download_models.sh) | macOS, Linux, or WSL | Bash equivalent of the base model/voice downloader: `bash scripts/download_models.sh`. |
+| [`download_brain_models.sh`](./download_brain_models.sh) | macOS/Linux/WSL Bash | Downloads selectable GGUF brain models: `bash scripts/download_brain_models.sh [qwen2.5-3b|qwen3-1.7b|qwen3-0.6b|all]`. |
+| [`start_nova.sh`](./start_nova.sh) | Linux/WSL Bash | Builds and starts the Docker Compose app, then follows logs. Prefer the cross-platform Docker Compose commands in the root README when using PowerShell or macOS. |
+| [`check_compose.sh`](./check_compose.sh) | Linux/WSL Bash | Validates Compose configuration with `docker compose config -q`. On any OS, run that Docker command directly if Bash is unavailable. |
+
+The base model downloaders do not fetch complete faster-whisper or local
+MiniLM model directories. The starter `.env.example` allows their initial
+online download. Both downloaders skip non-empty files and leave the previous
+destination untouched if a download fails. See the root README before
+switching NOVA to offline mode.
+
+## Maintenance and integrations
+
+| Script | Requirements | What it does / command |
+|---|---|---|
+| [`get_google_token.py`](./get_google_token.py) | Host Python with project requirements; Google OAuth client ID and secret in environment | Interactive OAuth flow for Google Calendar; run `python scripts/get_google_token.py`. |
+| [`migrate_knowledge_to_vault.py`](./migrate_knowledge_to_vault.py) | Host Python with project requirements; configured WebObsidian API URL/key; source Markdown notes | Copies local knowledge notes to WebObsidian without deleting the originals: `python scripts/migrate_knowledge_to_vault.py`. |
+| [`train_classifier.sh`](./train_classifier.sh) | Linux/WSL Bash, Python, and classifier dependencies | Trains the intent classifier in a native WSL working directory: `bash scripts/train_classifier.sh`. |
+
+## Diagnostics and model experiments
+
+These are developer tools, not required for a normal install.
+
+| Script | Requirements | What it does / command |
+|---|---|---|
+| [`diag_prompt.py`](./diag_prompt.py) | Host Python and project dependencies | Prints prompt component diagnostics: `python scripts/diag_prompt.py`. |
+| [`collect_diagnostics.sh`](./collect_diagnostics.sh) | Linux/WSL Bash and Docker Compose | Collects machine/container diagnostics into a local text file. Review and redact output before sharing. |
+| [`bench_llm.py`](./bench_llm.py) | Host Python with `llama-cpp-python`; a GGUF path | Runs local generation benchmarks: `python scripts/bench_llm.py models/brain/<model>.gguf`. It records timing metrics. |
+| [`kv_baseline.py`](./kv_baseline.py) | Host Python with project dependencies; exact configured GGUF | Measures KV-prefix behavior through the normal `LLMEngine` call path. See its help/source before use; it records timing diagnostics. |
+| [`kv_toolcost.py`](./kv_toolcost.py) | Host Python with `llama-cpp-python`; exact configured Qwen2.5-3B GGUF | Counts system-block tokens for tools using the GGUF vocabulary/template: `python scripts/kv_toolcost.py`. |
+| [`kv_generate_probe.py`](./kv_generate_probe.py) | Host Python with `llama-cpp-python`; exact configured Qwen2.5-3B GGUF | Compares token-id generation prefix reuse with and without `LlamaRAMCache`: `python scripts/kv_generate_probe.py`. |
+
+## Path and environment notes
+
+- The Python diagnostics add the repository root to `sys.path`; run them with
+  the Python environment in which the project dependencies are installed.
+- Model experiment scripts read configured model paths from `nova.config`
+  unless their usage explicitly takes a model path argument.
+- `.env`, API keys, OAuth files, models, and generated diagnostic output may
+  contain private data. Do not commit or share them without review.
+
+===== END FILE: scripts/README.md =====
+
+===== FILE: requirements.txt | bytes=830 | crlf=35 | lf_total=35 | bom=False =====
+# --- Web / API layer ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+websockets>=12.0
+python-multipart>=0.0.9
+
+# --- The Brain (single LLM, tool calling) ---
+llama-cpp-python>=0.2.75
+
+# --- The Ears (Speech-to-Text) ---
+faster-whisper>=1.0.0
+
+# --- The Mouth (Text-to-Speech) ---
+piper-tts>=1.2.0
+
+# --- Memory (Tier 2 core store + Tier 3 vector store) ---
+chromadb>=0.4.24
+pyyaml>=6.0.0
+
+# --- Structured tool-calling payloads ---
+pydantic>=2.6.0
+
+# --- Skills & Music Automation ---
+ytmusicapi>=1.8.0
+yt-dlp>=2024.3.10
+
+# --- Google Calendar Integration ---
+google-api-python-client>=2.99.0
+google-auth-httplib2>=0.1.0
+google-auth-oauthlib>=1.1.0
+python-dateutil>=2.8.1
+
+# --- Intent Classification (fast, CPU, non-generative) ---
+sentence-transformers>=2.7.0
+scikit-learn>=1.4.0
+joblib>=1.3.0
+===== END FILE: requirements.txt =====
+
+===== FILE: docker-compose.yml | bytes=1625 | crlf=53 | lf_total=53 | bom=False =====
+
+services:
+  nova_server:
+    build: .
+    container_name: nova_core
+    restart: unless-stopped   # auto-launches when the host boots / Docker daemon starts
+    ports:
+      - "8000:8000"
+      - "8080:8080" # Maps local OAuth callback
+    volumes:
+      # Mount models from host machine so multi-GB GGUF/ONNX weights are
+      # never baked into the image.
+      - ./models:/app/models
+      # Live-edit the web dashboard without rebuilding the image.
+      - ./web_ui:/app/web_ui:ro
+      # Persistent databases (SQLite core store + ChromaDB vector store)
+      - ./data:/app/data
+      # Mount local projects (read-only) so NOVA can inspect/ingest them,
+      # e.g. your Flutter app source trees.
+      - ${NOVA_HOST_PROJECTS_PATH:-./host_projects}:/app/host_projects:ro
+      
+      - ./models/sentence_transformers_cache:/root/.cache/torch/sentence_transformers
+      
+      - ./persistent_memory:/app/persistent_memory
+
+      - ./tests:/app/tests:ro
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OMP_NUM_THREADS=${NOVA_THREADS:-4}
+      - NOVA_HOST_PROJECTS_DIR=/app/host_projects
+      - NOVA_OFFLINE=${NOVA_OFFLINE:-1}
+      - HF_HUB_OFFLINE=${NOVA_OFFLINE:-1}
+      - TRANSFORMERS_OFFLINE=${NOVA_OFFLINE:-1}
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - ANONYMIZED_TELEMETRY=False
+    deploy:
+      resources:
+        limits:
+          memory: ${NOVA_MEM_LIMIT:-6g}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    cap_add:
+      - IPC_LOCK
+    networks:
+      - nova-net
+
+networks:
+  nova-net:
+    external: true
+
+===== END FILE: docker-compose.yml =====
+
+===== FILE: Dockerfile | bytes=901 | crlf=30 | lf_total=30 | bom=False =====
+FROM python:3.11-slim
+
+# --- Install system dependencies & C++ build tools ---
+# Avoid forcing x86-only flags; the image can be built for amd64 and arm64.
+# ffmpeg: audio format conversion (e.g. webm/opus from browser mic -> PCM)
+# libsqlite3-dev: SQLite core memory store
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    ffmpeg \
+    libsqlite3-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# --- Upgrade pip and install core requirements ---
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# --- Copy application source code ---
+COPY . .
+
+# --- Expose API and Web UI port ---
+EXPOSE 8000
+
+# --- Start FastAPI server via Uvicorn ---
+CMD ["uvicorn", "nova.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+===== END FILE: Dockerfile =====
+
+===== FILE: web_ui/app.js | bytes=30263 | crlf=794 | lf_total=794 | bom=False =====
+// WebSocket & System Control Client for NOVA HUD
+
+const chatBox = document.getElementById('chat-box');
+const statusDot = document.getElementById('statusDot');
+const statusLabel = document.getElementById('statusLabel');
+const micBtn = document.getElementById('micBtn');
+const modelSelect = document.getElementById('modelSelect');
+const drawer = document.getElementById('drawer');
+const coreWrapper = document.getElementById('coreWrapper');
+const memoryMapPanel = document.getElementById('memoryMapPanel');
+const memoryMapSvg = document.getElementById('memoryMapSvg');
+const memoryNoteViewer = document.getElementById('memoryNoteViewer');
+
+let uiState = 'idle'; // 'idle' | 'user' | 'thinking' | 'nova'
+let speakTimeout;
+let audioFallbackTimeout;
+let thinkingStartedAt = 0;
+let memoryGraphFocus = null;
+let liveNovaMessage = null;
+let audioContext = null;
+let nextAudioStart = 0;
+const MIN_THINKING_MS = 700; // spinner stays visible at least this long, even on instant replies
+
+const SESSION_STORAGE_KEY = 'nova_session_id';
+
+function getOrCreateSessionId() {
+    try {
+        const existing = localStorage.getItem(SESSION_STORAGE_KEY);
+        if (existing) return existing;
+        const id = (window.crypto && typeof window.crypto.randomUUID === 'function')
+            ? window.crypto.randomUUID()
+            : `nova-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        localStorage.setItem(SESSION_STORAGE_KEY, id);
+        return id;
+    } catch (e) {
+        console.warn('Falling back to transient session id because localStorage is unavailable.', e);
+        return `nova-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+}
+
+const sessionId = getOrCreateSessionId();
+const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
+const ws = new WebSocket(`${wsProtocol}://${location.host}/ws/chat?session_id=${encodeURIComponent(sessionId)}`);
+
+ws.onopen = () => {
+    statusDot.classList.add('online');
+    statusLabel.textContent = 'ONLINE';
+    ws.send(JSON.stringify({ type: 'session', session_id: sessionId }));
+    refreshStatus();
+};
+
+ws.onclose = () => {
+    statusDot.classList.remove('online');
+    statusLabel.textContent = 'OFFLINE';
+};
+
+ws.onmessage = (event) => {
+    let payload;
+    try {
+        payload = JSON.parse(event.data);
+    } catch (e) {
+        appendMessage('NOVA', event.data, 'nova');
+        setUiState('nova', 4000);
+        return;
+    }
+
+    if (payload.type === 'text_delta') {
+        if (!liveNovaMessage) liveNovaMessage = appendMessage('NOVA', '', 'nova');
+        liveNovaMessage.innerText += payload.text || '';
+    } else if (payload.type === 'text') {
+        if (liveNovaMessage) {
+            liveNovaMessage.innerText = `NOVA: ${payload.text || ''}`;
+            liveNovaMessage = null;
+        } else {
+            appendMessage('NOVA', payload.text, 'nova');
+        }
+        // Stay in 'thinking' - audio hasn't started yet, TTS is still
+        // synthesizing. If no audio message follows shortly (e.g. TTS
+        // stub mode / disabled, or an open_url action with no TTS),
+        // fall back so we don't get stuck.
+        clearTimeout(audioFallbackTimeout);
+        audioFallbackTimeout = setTimeout(() => {
+            if (uiState === 'thinking') setUiState('nova', 4000);
+        }, 4000);
+    } else if (payload.type === 'metrics' && payload.llm) {
+        showLlmSpeed(payload.llm);
+        // Still thinking/streaming - leave the spinner running.
+    } else if (payload.type === 'open_url' && payload.url) {
+        if (payload.text) appendMessage('NOVA', payload.text, 'nova');
+        // Slight delay so the message above renders before navigation.
+        // Using location.href (not window.open) so mobile OSes can route
+        // this to an installed app via universal/app links, falling back
+        // to the browser automatically if no app claims the link.
+        setTimeout(() => { window.location.href = payload.url; }, 300);
+    } else if (payload.type === 'audio_chunk' && payload.audio_b64) {
+        playAudioChunk(payload.audio_b64, payload.sample_rate || 22050);
+    } else if (payload.type === 'audio' && payload.audio_b64) {
+        clearTimeout(audioFallbackTimeout); // audio arrived, cancel the fallback
+        playAudioBase64(payload.audio_b64);
+    }
+};
+
+function setUiState(state, timeoutMs = 0) {
+    // Enforce a minimum visible duration for 'thinking' before allowing a
+    // transition away from it - otherwise a fast model can make the
+    // spinner flash for a single frame.
+    if (uiState === 'thinking' && state !== 'thinking') {
+        const elapsed = Date.now() - thinkingStartedAt;
+        if (elapsed < MIN_THINKING_MS) {
+            setTimeout(() => setUiState(state, timeoutMs), MIN_THINKING_MS - elapsed);
+            return;
+        }
+    }
+
+    uiState = state;
+    clearTimeout(speakTimeout);
+
+    // Toggle the CSS-driven spinner rings via a class instead of per-frame
+    // JS. These animate on the compositor thread, so they keep spinning
+    // even if the main JS thread (and canvas rAF loop) stalls - which it
+    // will while the host CPU is pinned at 100% during LLM inference.
+    coreWrapper.classList.toggle('is-thinking', state === 'thinking');
+
+    if (state === 'thinking') {
+        thinkingStartedAt = Date.now();
+        statusLabel.textContent = 'THINKING...';
+    } else if (state === 'nova') {
+        statusLabel.textContent = 'RESPONDING...';
+    } else if (state === 'user') {
+        statusLabel.textContent = 'LISTENING...';
+    } else if (ws.readyState === WebSocket.OPEN) {
+        statusLabel.textContent = 'ONLINE';
+    }
+
+    if (timeoutMs > 0) {
+        speakTimeout = setTimeout(() => setUiState('idle'), timeoutMs);
+    }
+}
+
+function toggleDrawer() {
+    drawer.classList.toggle('open');
+}
+
+async function toggleMemoryMap() {
+    if (!memoryMapPanel) return;
+    const hidden = memoryMapPanel.classList.contains('hidden');
+    if (hidden) {
+        memoryMapPanel.classList.remove('hidden');
+        await renderMemoryMap();
+    } else {
+        memoryMapPanel.classList.add('hidden');
+    }
+}
+
+async function renderMemoryMap() {
+    if (!memoryMapSvg) return;
+    try {
+        const response = await fetch('/api/memory/preferences/graph');
+        if (!response.ok) throw new Error(`Preferences graph fetch failed (${response.status})`);
+        const graph = await response.json();
+        memoryGraphFocus = null;
+        renderMemoryGraph(graph);
+    } catch (error) {
+        console.warn('Could not load memory map', error);
+        memoryMapSvg.innerHTML = '<text x="500" y="360" text-anchor="middle" fill="#e2e8f0" font-size="18">Preferences map unavailable</text>';
+    }
+}
+
+function renderMemoryGraph(graph) {
+    const svgNS = 'http://www.w3.org/2000/svg';
+    memoryMapSvg.innerHTML = '';
+
+    const defs = document.createElementNS(svgNS, 'defs');
+    const filter = document.createElementNS(svgNS, 'filter');
+    filter.setAttribute('id', 'mapGlow');
+    filter.innerHTML = '<feGaussianBlur stdDeviation="2.5" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>';
+    defs.appendChild(filter);
+    memoryMapSvg.appendChild(defs);
+
+    let nodes = graph.nodes || [];
+    const links = graph.links || [];
+    const nodeMap = new Map(nodes.map(node => [node.id, node]));
+
+    if (memoryGraphFocus) {
+        const focusNode = nodeMap.get(memoryGraphFocus);
+        if (focusNode && focusNode.kind === 'folder') {
+            const visibleIds = new Set([focusNode.id]);
+            const queue = [focusNode.id];
+            while (queue.length) {
+                const currentId = queue.shift();
+                for (const link of links) {
+                    if (link.source === currentId && link.kind !== 'reference') {
+                        visibleIds.add(link.target);
+                        queue.push(link.target);
+                    }
+                }
+            }
+            nodes = nodes.filter(node => visibleIds.has(node.id));
+        }
+    }
+
+    for (const link of links) {
+        const source = nodeMap.get(link.source);
+        const target = nodeMap.get(link.target);
+        if (!source || !target) continue;
+        if (memoryGraphFocus && !nodes.some(node => node.id === source.id || node.id === target.id)) continue;
+
+        const line = document.createElementNS(svgNS, 'line');
+        line.setAttribute('x1', source.x);
+        line.setAttribute('y1', source.y);
+        line.setAttribute('x2', target.x);
+        line.setAttribute('y2', target.y);
+        line.setAttribute('stroke', link.kind === 'reference' ? 'rgba(96,165,250,0.6)' : 'rgba(125,211,252,0.45)');
+        line.setAttribute('stroke-width', link.kind === 'reference' ? '1.8' : '1.4');
+        line.setAttribute('stroke-linecap', 'round');
+        line.setAttribute('filter', 'url(#mapGlow)');
+        memoryMapSvg.appendChild(line);
+
+        const label = document.createElementNS(svgNS, 'text');
+        label.setAttribute('x', (source.x + target.x) / 2);
+        label.setAttribute('y', (source.y + target.y) / 2 - 8);
+        label.setAttribute('fill', '#a5b4fc');
+        label.setAttribute('font-size', '10');
+        label.setAttribute('text-anchor', 'middle');
+        label.textContent = link.label || '';
+        memoryMapSvg.appendChild(label);
+    }
+
+    for (const node of nodes) {
+        const group = document.createElementNS(svgNS, 'g');
+        group.setAttribute('transform', `translate(${node.x}, ${node.y})`);
+        group.style.cursor = node.kind === 'folder' ? 'pointer' : node.markdown_id ? 'pointer' : 'default';
+        group.addEventListener('click', () => {
+            if (node.kind === 'folder') {
+                memoryGraphFocus = node.id;
+                renderMemoryGraph(graph);
+                return;
+            }
+            if (node.markdown_id) openMemoryNode(node);
+        });
+
+        const width = node.kind === 'folder' ? 160 : Math.max(120, Math.min(180, 80 + (node.label.length * 6.5)));
+        const height = node.kind === 'folder' ? 68 : Math.max(56, 48 + Math.min((node.facts || []).length * 12, 32));
+
+        const box = document.createElementNS(svgNS, 'rect');
+        box.setAttribute('x', -(width / 2));
+        box.setAttribute('y', -(height / 2));
+        box.setAttribute('width', width);
+        box.setAttribute('height', height);
+        box.setAttribute('rx', '16');
+        box.setAttribute('fill', node.kind === 'folder' ? 'rgba(59, 130, 246, 0.18)' : 'rgba(14, 16, 28, 0.9)');
+        box.setAttribute('stroke', node.kind === 'folder' ? 'rgba(125, 211, 252, 0.9)' : 'rgba(96,165,250,0.9)');
+        box.setAttribute('stroke-width', '1.4');
+        box.setAttribute('filter', 'url(#mapGlow)');
+        group.appendChild(box);
+
+        const title = document.createElementNS(svgNS, 'text');
+        title.setAttribute('x', '0');
+        title.setAttribute('y', node.kind === 'folder' ? '-10' : '-6');
+        title.setAttribute('text-anchor', 'middle');
+        title.setAttribute('fill', '#e2e8f0');
+        title.setAttribute('font-size', node.kind === 'folder' ? '12' : '13');
+        title.setAttribute('font-weight', '700');
+        title.textContent = node.label.length > 18 ? `${node.label.slice(0, 17)}…` : node.label;
+        group.appendChild(title);
+
+        const type = document.createElementNS(svgNS, 'text');
+        type.setAttribute('x', '0');
+        type.setAttribute('y', node.kind === 'folder' ? '12' : '12');
+        type.setAttribute('text-anchor', 'middle');
+        type.setAttribute('fill', '#7dd3fc');
+        type.setAttribute('font-size', '10');
+        type.textContent = node.kind === 'folder' ? 'container' : (node.type || 'concept');
+        group.appendChild(type);
+
+        memoryMapSvg.appendChild(group);
+    }
+}
+
+function escapeHtml(value = '') {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function convertMarkdownInline(text = '') {
+    let html = escapeHtml(text);
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    return html;
+}
+
+function renderMarkdownContent(markdown = '') {
+    const lines = (markdown || '').replace(/\r\n/g, '\n').split('\n');
+    const blocks = [];
+    let listItems = [];
+    let paragraph = [];
+    let codeBlock = [];
+    let inCode = false;
+
+    const flushParagraph = () => {
+        if (paragraph.length) {
+            blocks.push(`<p>${convertMarkdownInline(paragraph.join(' ').trim())}</p>`);
+            paragraph = [];
+        }
+    };
+
+    const flushList = () => {
+        if (listItems.length) {
+            blocks.push(`<ul>${listItems.map(item => `<li>${convertMarkdownInline(item)}</li>`).join('')}</ul>`);
+            listItems = [];
+        }
+    };
+
+    const flushCode = () => {
+        if (codeBlock.length) {
+            blocks.push(`<pre><code>${escapeHtml(codeBlock.join('\n'))}</code></pre>`);
+            codeBlock = [];
+        }
+    };
+
+    for (const rawLine of lines) {
+        const line = rawLine.trimEnd();
+        if (!line.trim()) {
+            flushParagraph();
+            flushList();
+            continue;
+        }
+
+        if (line.startsWith('```')) {
+            flushParagraph();
+            flushList();
+            if (inCode) {
+                flushCode();
+                inCode = false;
+            } else {
+                inCode = true;
+            }
+            continue;
+        }
+
+        if (inCode) {
+            codeBlock.push(rawLine);
+            continue;
+        }
+
+        const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+        if (headingMatch) {
+            flushParagraph();
+            flushList();
+            const level = Math.min(headingMatch[1].length, 6);
+            blocks.push(`<h${level}>${convertMarkdownInline(headingMatch[2])}</h${level}>`);
+            continue;
+        }
+
+        if (/^[-*]\s+/.test(line)) {
+            flushParagraph();
+            listItems.push(line.replace(/^[-*]\s+/, '').trim());
+            continue;
+        }
+
+        if (/^>\s+/.test(line)) {
+            flushParagraph();
+            flushList();
+            blocks.push(`<blockquote>${convertMarkdownInline(line.replace(/^>\s+/, ''))}</blockquote>`);
+            continue;
+        }
+
+        paragraph.push(line);
+    }
+
+    flushParagraph();
+    flushList();
+    flushCode();
+    return blocks.join('') || '<p>No content available.</p>';
+}
+
+async function openMemoryNode(node) {
+    if (!memoryNoteViewer || !node || !node.markdown_id) return;
+    memoryNoteViewer.classList.remove('hidden');
+    memoryNoteViewer.innerHTML = `
+        <div class="memory-note-header">
+            <div>
+                <div class="memory-note-kicker">MARKDOWN NODE</div>
+                <h3>${escapeHtml(node.label || 'Document')}</h3>
+            </div>
+            <button class="hud-btn small" onclick="closeMemoryNote()">Close</button>
+        </div>
+        <div class="memory-note-body loading">Loading document…</div>
+    `;
+
+    try {
+        const response = await fetch(`/api/memory/markdown/${encodeURIComponent(node.markdown_id)}`);
+        if (!response.ok) throw new Error(`Markdown fetch failed (${response.status})`);
+        const documentData = await response.json();
+        const updated = documentData.updated_at ? new Date(documentData.updated_at).toLocaleString() : '';
+        memoryNoteViewer.innerHTML = `
+            <div class="memory-note-header">
+                <div>
+                    <div class="memory-note-kicker">MARKDOWN NODE</div>
+                    <h3>${escapeHtml(documentData.title || node.label || 'Document')}</h3>
+                    ${updated ? `<div class="memory-note-meta">Updated ${escapeHtml(updated)}</div>` : ''}
+                </div>
+                <button class="hud-btn small" onclick="closeMemoryNote()">Close</button>
+            </div>
+            <article class="memory-note-body">${renderMarkdownContent(documentData.content || '')}</article>
+        `;
+    } catch (error) {
+        console.warn('Could not load markdown note', error);
+        memoryNoteViewer.innerHTML = `
+            <div class="memory-note-header">
+                <div>
+                    <div class="memory-note-kicker">MARKDOWN NODE</div>
+                    <h3>${escapeHtml(node.label || 'Document')}</h3>
+                </div>
+                <button class="hud-btn small" onclick="closeMemoryNote()">Close</button>
+            </div>
+            <div class="memory-note-body error">Unable to load the document.</div>
+        `;
+    }
+}
+
+function closeMemoryNote() {
+    if (!memoryNoteViewer) return;
+    memoryNoteViewer.classList.add('hidden');
+    memoryNoteViewer.innerHTML = '';
+}
+
+function sendMsg() {
+    const input = document.getElementById('userInput');
+    if (!input.value) return;
+    appendMessage('You', input.value, 'user');
+    ws.send(JSON.stringify({ type: 'text', text: input.value, stream: true }));
+    input.value = '';
+    // Safety net only - the real exit from 'thinking' happens when audio
+    // actually starts playing (see playAudioBase64), not here.
+    setUiState('thinking', 20000);
+}
+
+function showLlmSpeed(metrics) {
+    const speed = Number(metrics.tokens_per_second || 0);
+    const tokenCount = Number(metrics.completion_tokens || 0);
+    const ttft = Number(metrics.ttft_seconds || 0);
+    document.getElementById('statTokensPerSecond').innerText =
+        tokenCount > 0 ? `${speed.toFixed(1)} tok/s (TTFT ${ttft.toFixed(2)}s)` : '0.0 tok/s';
+}
+
+function appendMessage(sender, text, className) {
+    const msgDiv = document.createElement('div');
+    msgDiv.className = `msg ${className}`;
+    msgDiv.innerText = `${sender}: ${text}`;
+    chatBox.appendChild(msgDiv);
+    chatBox.scrollTop = chatBox.scrollHeight;
+    return msgDiv;
+}
+
+function playAudioChunk(b64, sampleRate) {
+    audioContext = audioContext || new (window.AudioContext || window.webkitAudioContext)();
+    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const samples = new Int16Array(bytes.buffer);
+    const buffer = audioContext.createBuffer(1, samples.length, sampleRate);
+    const channel = buffer.getChannelData(0);
+    for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
+    const source = audioContext.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioContext.destination);
+    nextAudioStart = Math.max(nextAudioStart, audioContext.currentTime);
+    source.start(nextAudioStart);
+    nextAudioStart += buffer.duration;
+    setUiState('nova');
+}
+
+function playAudioBase64(b64) {
+    const pcmBytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const wavBuffer = pcmToWav(pcmBytes, 22050);
+    const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+    const audio = new Audio(URL.createObjectURL(blob));
+
+    // Audio is actually about to play now - this is the real transition
+    // out of 'thinking' into 'nova' (speaking).
+    setUiState('nova');
+    audio.play().then(() => {
+        setUiState('nova', (blob.size / 44100) * 1000 + 500);
+    }).catch(() => setUiState('idle'));
+}
+
+function pcmToWav(pcmBytes, sampleRate) {
+    const header = new ArrayBuffer(44);
+    const view = new DataView(header);
+    const writeStr = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + pcmBytes.length, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, 'data');
+    view.setUint32(40, pcmBytes.length, true);
+
+    const wav = new Uint8Array(44 + pcmBytes.length);
+    wav.set(new Uint8Array(header), 0);
+    wav.set(pcmBytes, 44);
+    return wav.buffer;
+}
+
+async function refreshStatus() {
+    try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        document.getElementById('statBrain').innerText = data.brain_loaded ? 'READY' : 'OFFLINE';
+        document.getElementById('statStt').innerText = data.stt_loaded ? 'READY' : 'OFFLINE';
+        document.getElementById('statTts').innerText = data.tts_loaded ? 'READY' : 'OFFLINE';
+        populateModelSelect(data.models || []);
+    } catch (e) {
+        console.warn('Status refresh failed', e);
+    }
+}
+
+function populateModelSelect(models) {
+    const current = modelSelect.value;
+    modelSelect.replaceChildren();
+    for (const model of models) {
+        const option = document.createElement('option');
+        option.value = model.id;
+        option.textContent = model.installed ? model.label : `${model.label} [DL REQ]`;
+        option.disabled = !model.installed;
+        option.selected = model.active;
+        modelSelect.appendChild(option);
+    }
+    modelSelect.disabled = !models.some(model => model.installed);
+    if (current && !models.some(model => model.active)) modelSelect.value = current;
+}
+
+modelSelect.addEventListener('change', async () => {
+    const selected = modelSelect.value;
+    modelSelect.disabled = true;
+    statusLabel.textContent = 'LOADING MODEL...';
+    try {
+        const response = await fetch(`/api/models/${encodeURIComponent(selected)}`, { method: 'POST' });
+        if (!response.ok) throw new Error('Switch failed');
+        await refreshStatus();
+        statusLabel.textContent = 'ONLINE';
+    } catch (error) {
+        statusLabel.textContent = 'FAIL';
+        await refreshStatus();
+    }
+});
+setInterval(refreshStatus, 8000);
+
+// Mic Capture (Hold-to-Talk)
+let mediaRecorder = null;
+let audioChunks = [];
+let mediaStream = null;
+let isRecording = false;
+let permissionPending = false;
+
+function setRecordingUi(recording) {
+    micBtn.classList.toggle('recording', recording);
+    if (recording) {
+        statusLabel.textContent = 'LISTENING...';
+    } else if (ws.readyState === WebSocket.OPEN && uiState === 'idle') {
+        statusLabel.textContent = 'ONLINE';
+    }
+}
+
+function getPreferredRecorderMimeType() {
+    const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4',
+        'audio/ogg;codecs=opus',
+    ];
+    return candidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
+}
+
+function startRecording() {
+    if (isRecording || permissionPending) return;
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        statusLabel.textContent = 'MIC UNSUPPORTED';
+        console.warn('Microphone API unavailable in this browser.');
+        return;
+    }
+
+    if (!window.isSecureContext && !['localhost', '127.0.0.1'].includes(location.hostname)) {
+        statusLabel.textContent = 'USE HTTPS/LOCAL';
+        console.warn('getUserMedia is blocked on insecure origins like Tailscale addresses. Use localhost or HTTPS.');
+        return;
+    }
+
+    permissionPending = true;
+    setRecordingUi(true);
+
+    navigator.mediaDevices.getUserMedia({ audio: true })
+        .then((stream) => {
+            mediaStream = stream;
+            const mimeType = getPreferredRecorderMimeType();
+            const options = mimeType ? { mimeType } : undefined;
+            mediaRecorder = new MediaRecorder(stream, options);
+            audioChunks = [];
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data && e.data.size > 0) audioChunks.push(e.data);
+            };
+            mediaRecorder.onstop = sendRecordedAudio;
+            mediaRecorder.start();
+            isRecording = true;
+            permissionPending = false;
+            setUiState('user');
+        })
+        .catch((e) => {
+            console.warn('Microphone unavailable:', e);
+            statusLabel.textContent = 'MIC BLOCKED';
+            permissionPending = false;
+            isRecording = false;
+            setRecordingUi(false);
+            setUiState('idle');
+        });
+}
+
+function stopRecording() {
+    if (permissionPending) {
+        permissionPending = false;
+        setRecordingUi(false);
+        setUiState('idle');
+        return;
+    }
+
+    if (!isRecording || !mediaRecorder) {
+        setRecordingUi(false);
+        setUiState('idle');
+        return;
+    }
+
+    if (mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+    }
+    if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+    }
+    isRecording = false;
+    setRecordingUi(false);
+    // Safety net only - the real exit from 'thinking' happens when audio
+    // actually starts playing (see playAudioBase64), not here.
+    setUiState('thinking', 20000);
+}
+
+function handlePointerDown(event) {
+    event.preventDefault();
+    startRecording();
+}
+
+function handlePointerUp(event) {
+    if (event) event.preventDefault();
+    stopRecording();
+}
+
+micBtn.addEventListener('pointerdown', handlePointerDown);
+micBtn.addEventListener('pointerup', handlePointerUp);
+micBtn.addEventListener('pointerleave', handlePointerUp);
+micBtn.addEventListener('pointercancel', handlePointerUp);
+micBtn.addEventListener('touchstart', (event) => {
+    if (event.touches && event.touches.length > 0) {
+        startRecording();
+    }
+}, { passive: true });
+micBtn.addEventListener('touchend', stopRecording, { passive: true });
+micBtn.addEventListener('touchcancel', stopRecording, { passive: true });
+
+async function sendRecordedAudio() {
+    if (!audioChunks.length) return;
+    const mimeType = mediaRecorder && mediaRecorder.mimeType ? mediaRecorder.mimeType : 'audio/webm';
+    const blob = new Blob(audioChunks, { type: mimeType });
+    const arrayBuffer = await blob.arrayBuffer();
+    const b64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+    ws.send(JSON.stringify({ type: 'audio', audio_b64: b64, mime_type: blob.type, final: true }));
+    appendMessage('You', '[Voice Message]', 'user');
+    // uiState is already 'thinking' (set by stopRecording) - leave it running.
+}
+
+// Canvas Visualizer Core
+const canvas = document.getElementById('orbCanvas');
+const ctx = canvas.getContext('2d');
+let angle = 0;
+let waveOffset = 0;
+
+function drawHUDCore() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2;
+
+    let strokeColor = 'rgba(88, 80, 236, ';   // Idle Violet/Indigo
+    if (uiState === 'nova') strokeColor = 'rgba(0, 210, 255, ';       // NOVA Cyan/Blue
+    if (uiState === 'user') strokeColor = 'rgba(99, 102, 241, ';      // User Violet
+    if (uiState === 'thinking') strokeColor = 'rgba(245, 158, 11, ';  // Processing Amber
+
+    const thinking = uiState === 'thinking';
+
+    // 1. Static Outer Ring
+    ctx.beginPath();
+    ctx.arc(cx, cy, 190, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
+    ctx.setLineDash([2, 10]);
+    ctx.stroke();
+
+    // 2. Rotating Segment Ring
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(angle);
+    ctx.beginPath();
+    if (thinking) {
+        ctx.setLineDash([]);
+        ctx.arc(0, 0, 150, 0, Math.PI * 0.55);
+        ctx.strokeStyle = strokeColor + '0.9)';
+        ctx.lineWidth = 3;
+    } else {
+        ctx.setLineDash([40, 20, 10, 20]);
+        ctx.arc(0, 0, 150, 0, Math.PI * 2);
+        ctx.strokeStyle = strokeColor + '0.4)';
+        ctx.lineWidth = 1.5;
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // 3. Counter-Rotating Inner Ring
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(-angle * 1.6);
+    ctx.beginPath();
+    if (thinking) {
+        ctx.setLineDash([]);
+        ctx.arc(0, 0, 110, 0, Math.PI * 0.35);
+        ctx.strokeStyle = strokeColor + '0.65)';
+        ctx.lineWidth = 2;
+    } else {
+        ctx.setLineDash([90, 40]);
+        ctx.arc(0, 0, 110, 0, Math.PI * 2);
+        ctx.strokeStyle = strokeColor + '0.25)';
+        ctx.lineWidth = 1;
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // 4. Dynamic Audio Wave Core
+    ctx.beginPath();
+    const points = 120;
+    const baseRadius = 70;
+    let amp = 3; // idle
+    if (uiState === 'user') amp = 16;
+    if (uiState === 'nova') amp = 28;
+    if (thinking) amp = 6 + Math.sin(waveOffset * 2) * 3;
+
+    for (let i = 0; i <= points; i++) {
+        const theta = (i / points) * Math.PI * 2;
+        const distortion = Math.sin(theta * 7 + waveOffset) * Math.cos(theta * 3 - waveOffset) * amp;
+        const r = baseRadius + distortion;
+        const x = cx + r * Math.cos(theta);
+        const y = cy + r * Math.sin(theta);
+
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.strokeStyle = strokeColor + '0.95)';
+    ctx.lineWidth = 2;
+    ctx.shadowBlur = uiState === 'idle' ? 8 : 20;
+    ctx.shadowColor = strokeColor + '0.8)';
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    let angleStep = 0.003;
+    if (uiState === 'user' || uiState === 'nova') angleStep = 0.012;
+    if (thinking) angleStep = 0.02;
+    angle += angleStep;
+
+    let waveStep = 0.04;
+    if (uiState === 'user' || uiState === 'nova') waveStep = 0.15;
+    if (thinking) waveStep = 0.08;
+    waveOffset += waveStep;
+
+    requestAnimationFrame(drawHUDCore);
+}
+
+drawHUDCore();
+===== END FILE: web_ui/app.js =====

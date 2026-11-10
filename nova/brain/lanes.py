@@ -2,12 +2,23 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterator, Literal
 
+import numpy as np
+
 from nova.brain.context_manager import ContextManager
-from nova.brain.kv_state import restore_snapshot, save_snapshot, snapshot_nbytes
+from nova.brain.kv_state import (
+    load_snapshot_for,
+    restore_snapshot,
+    save_snapshot,
+    snapshot_nbytes,
+    snapshot_to_file,
+)
 
 logger = logging.getLogger("nova.lanes")
 
@@ -63,11 +74,15 @@ class LaneManager:
         backend,
         n_ctx: int,
         max_snapshot_bytes: int = 256 * 1024 * 1024,
+        base_state_dir: str | Path | None = None,
     ) -> None:
         self._llama = llama
         self._backend = backend
         self._n_ctx = n_ctx
         self._max_snapshot_bytes = max_snapshot_bytes
+        # When set, action-lane prefix ("base") states are persisted here and
+        # restored on later runs instead of being prefilled again.
+        self._base_dir = Path(base_state_dir) if base_state_dir is not None else None
         self._lanes: dict[str, Lane] = {}
         self._chat_keys: dict[tuple[str, str], str] = {}
         self._snapshots: dict[str, tuple[object, int]] = {}
@@ -81,6 +96,10 @@ class LaneManager:
             "restore_failures": 0,
             "evictions": 0,
             "warm_prefill_tokens": 0,
+            "base_loaded": 0,
+            "base_saved": 0,
+            "base_invalid": 0,
+            "base_save_failures": 0,
         }
 
     def action_lane(self, spec: LaneSpec) -> Lane:
@@ -93,6 +112,17 @@ class LaneManager:
         lane = self._create_lane(key, "action", spec)
         self._lanes[key] = lane
         return lane
+
+    def forget_action(self, spec_name: str) -> None:
+        """Drop an action lane and its in-memory snapshot (disk states are kept)."""
+        key = f"action:{spec_name}"
+        lane = self._lanes.pop(key, None)
+        if lane is None:
+            return
+        self._drop_snapshot(key)
+        if self._resident is lane:
+            self._llama.reset()
+            self._resident = None
 
     def chat_lane(
         self,
@@ -233,19 +263,99 @@ class LaneManager:
             logger.debug("Cold-started chat lane %s", lane.key)
 
     def _warm_action(self, lane: Lane) -> int:
+        """Make ``lane`` resident with only its system prefix evaluated.
+
+        Restores the persisted base state when one is valid for this exact
+        model, context settings and prompt tokens; otherwise prefills the
+        prefix and persists the result. Returns the tokens actually prefilled
+        (0 when restored from disk).
+        """
         self._park_resident()
-        self._llama.reset()
         system_ids = lane.context.system_ids
-        if system_ids:
-            self._llama.eval(system_ids)
-        prefilled = len(system_ids)
-        self._stats["cold_starts"] += 1
-        self._stats["warm_prefill_tokens"] += prefilled
-        snapshot = save_snapshot(self._llama, meta={"lane": lane.key})
+        meta = self._base_meta(lane, system_ids)
+        snapshot = self._load_base_state(lane, system_ids, meta)
+        if snapshot is not None:
+            prefilled = 0
+            self._stats["base_loaded"] += 1
+            logger.debug("Restored persisted base state for %s (%d tokens)", lane.key, len(system_ids))
+        else:
+            self._llama.reset()
+            if system_ids:
+                self._llama.eval(system_ids)
+            prefilled = len(system_ids)
+            self._stats["cold_starts"] += 1
+            self._stats["warm_prefill_tokens"] += prefilled
+            snapshot = save_snapshot(self._llama, meta=meta)
+            self._save_base_state(lane, snapshot, meta)
+            logger.debug("Warmed action lane %s with %d tokens", lane.key, prefilled)
         self._store_snapshot(lane, snapshot)
         self._resident = lane
-        logger.debug("Warmed action lane %s with %d tokens", lane.key, prefilled)
         return prefilled
+
+    # ---- persisted base states (B2-7) ---------------------------------
+
+    @staticmethod
+    def _base_meta(lane: Lane, system_ids: list[int]) -> dict:
+        digest = hashlib.sha256(np.asarray(system_ids, dtype=np.int64).tobytes()).hexdigest()
+        return {
+            "lane": lane.key,
+            "kind": "action-base",
+            "system_sha256": digest,
+            "n_system": len(system_ids),
+        }
+
+    def _base_path(self, lane: Lane, meta: dict) -> Path | None:
+        if self._base_dir is None:
+            return None
+        return self._base_dir / (
+            f"{self._base_prefix(lane)}-{meta['system_sha256'][:16]}-ctx{self._n_ctx}.npz"
+        )
+
+    @staticmethod
+    def _base_prefix(lane: Lane) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", lane.spec.name).strip("._") or "lane"
+
+    def _load_base_state(self, lane: Lane, system_ids: list[int], meta: dict):
+        path = self._base_path(lane, meta)
+        if path is None or not path.is_file():
+            return None
+        snapshot = load_snapshot_for(self._llama, path, extra_meta=meta)
+        if (
+            snapshot is None
+            or snapshot.n_tokens != len(system_ids)
+            or [int(token) for token in snapshot.input_ids] != [int(token) for token in system_ids]
+        ):
+            self._stats["base_invalid"] += 1
+            logger.info("Ignoring stale or invalid base state %s", path.name)
+            return None
+        try:
+            restore_snapshot(self._llama, snapshot)
+        except Exception:
+            self._llama.reset()
+            self._stats["base_invalid"] += 1
+            logger.warning("Could not restore base state %s; rebuilding.", path.name, exc_info=True)
+            return None
+        return snapshot
+
+    def _save_base_state(self, lane: Lane, snapshot, meta: dict) -> None:
+        path = self._base_path(lane, meta)
+        if path is None:
+            return
+        try:
+            snapshot_to_file(snapshot, path)
+            self._stats["base_saved"] += 1
+        except Exception:
+            self._stats["base_save_failures"] += 1
+            logger.warning("Could not persist base state for %s.", lane.key, exc_info=True)
+            return
+        # A changed persona or tool schema produces a new file name; remove the old ones.
+        pattern = f"{self._base_prefix(lane)}-*-ctx{self._n_ctx}.npz"
+        for stale in path.parent.glob(pattern):
+            if stale != path:
+                try:
+                    stale.unlink()
+                except OSError:
+                    logger.debug("Could not remove stale base state %s", stale, exc_info=True)
 
     def _store_snapshot(self, lane: Lane, snapshot) -> bool:
         size = snapshot_nbytes(snapshot)

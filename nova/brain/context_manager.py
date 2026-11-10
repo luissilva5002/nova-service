@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
+from nova.text_utils import sanitize_text
+
 _DUMMY = [
     {"role": "system", "content": "s"},
     {"role": "user", "content": "u"},
@@ -66,6 +68,8 @@ class LlamaBackend:
             return ""
 
     def encode(self, text: str) -> list[int]:
+        # Lone surrogates cannot be UTF-8 encoded; replace them instead of failing the turn.
+        text = sanitize_text(text, "tokenizer input")
         return list(self._llama.tokenize(text.encode("utf-8"), add_bos=False, special=True))
 
     def render(self, messages, tools, add_generation_prompt) -> str:

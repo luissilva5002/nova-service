@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 
 import yaml
 
-from nova.config import AGENT_API_BASE_URL, AGENT_API_KEY
+from nova.config import AGENT_API_BASE_URL, AGENT_API_KEY, VAULT_MODE
 from nova.memory.query_utils import MEMORY_WRITE_QUERY, extract_memory_keywords
 
 logger = logging.getLogger("nova.knowledge_client")
@@ -27,6 +27,38 @@ _KNOWLEDGE_CONTENT_CHAR_BUDGET = 2500
 
 class KnowledgeApiError(RuntimeError):
     """Raised when WebObsidian cannot complete an Agent API request."""
+
+
+class KnowledgeDisabledError(KnowledgeApiError):
+    """Raised for writes (and any direct API request) when the vault is disabled
+    on this machine. Subclasses KnowledgeApiError so existing handlers for API
+    failures also cover it."""
+
+
+_DISABLED_MESSAGE = "The knowledge vault is not enabled on this machine; nothing was read or saved."
+_disabled_warned = False
+
+
+def _vault_enabled() -> bool:
+    """Evaluated per call, so a runtime change to AGENT_API_KEY is honoured.
+
+    on   -> always enabled (a missing key still fails loudly in _request)
+    off  -> always disabled
+    auto -> enabled only while an API key is configured
+    """
+    return VAULT_MODE == "on" or (VAULT_MODE == "auto" and bool(AGENT_API_KEY))
+
+
+def _warn_disabled_once() -> None:
+    global _disabled_warned
+    if not _disabled_warned:
+        _disabled_warned = True
+        logger.warning(
+            "Knowledge vault is disabled (NOVA_VAULT_ENABLED=%s, AGENT_API_KEY %s): "
+            "reads return empty and writes are refused.",
+            VAULT_MODE,
+            "set" if AGENT_API_KEY else "not set",
+        )
 
 
 def knowledge_path_for_box(box: str, subcategory: Optional[str] = None) -> str:
@@ -60,6 +92,9 @@ def _request(
     payload: Optional[dict] = None,
     not_found_ok: bool = False,
 ) -> Optional[dict]:
+    if not _vault_enabled():
+        _warn_disabled_once()
+        raise KnowledgeDisabledError(_DISABLED_MESSAGE)
     if not AGENT_API_KEY:
         raise KnowledgeApiError(
             "AGENT_API_KEY is not configured. Create a WebObsidian API key with read, write, "
@@ -136,7 +171,10 @@ def search_knowledge(
     if not keywords:
         return []
     params = urlencode({"q": query, "limit": 100})
-    response = _request("GET", f"search?{params}")
+    try:
+        response = _request("GET", f"search?{params}")
+    except KnowledgeDisabledError:
+        return []
     hits = response.get("hits") if isinstance(response, dict) else None
     if not isinstance(hits, list) or any(not isinstance(hit, dict) for hit in hits):
         raise KnowledgeApiError("WebObsidian search response did not contain a valid hits list.")
@@ -214,7 +252,10 @@ def search_knowledge(
 
 def read_knowledge(path: str) -> Optional[dict]:
     path = _validate_knowledge_path(path)
-    result = _request("GET", f"notes/{quote(path, safe='/')}", not_found_ok=True)
+    try:
+        result = _request("GET", f"notes/{quote(path, safe='/')}", not_found_ok=True)
+    except KnowledgeDisabledError:
+        return None
     if result is None:
         return None
     if not isinstance(result, dict) or not isinstance(result.get("content"), str):
