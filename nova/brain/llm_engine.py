@@ -59,6 +59,17 @@ _THINKING_BLOCK = re.compile(r"<think>.*?</think>\s*", re.IGNORECASE | re.DOTALL
 # the legacy path because llama.cpp forces that one tool call with a grammar.
 ACTION_LANE_INTENTS = ("action_calendar", "action_music", "memory_write")
 _WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+# The 14-day date table costs ~200 uncached prompt tokens per calendar turn. It
+# is only needed when the request names a date the model would have to compute.
+_DATE_LOOKUP_NEEDED = re.compile(
+    r"\b(tomorrow|tonight|yesterday|next|last|week|weekend|month|monday|tuesday|wednesday|"
+    r"thursday|friday|saturday|sunday|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|"
+    r"in \d+|days?|"
+    r"create|add|schedule|book|set up|move|reschedule|change|update|delete|cancel|remove)\b"
+    r"|\d{1,2}[/.-]\d{1,2}|\d{4}-\d{2}-\d{2}",
+    re.I,
+)
 _RECENT_EXCHANGE_CHARS = 240
 # Background prewarming only starts a lane build after user-facing work has
 # been quiet this long, so it does not sit in front of a reply that is about
@@ -385,9 +396,16 @@ class LLMEngine:
         return "\n".join(lines)
 
     def _action_context_block(
-        self, intent: str, memory_context: str, history: Optional[list[dict]]
+        self,
+        intent: str,
+        memory_context: str,
+        history: Optional[list[dict]],
+        user_text: Optional[str] = None,
     ) -> str:
-        context = self._current_date_context(intent == "action_calendar")
+        include_lookup = intent == "action_calendar"
+        if include_lookup and user_text is not None and not _DATE_LOOKUP_NEEDED.search(user_text):
+            include_lookup = False  # plain "what's on today" needs only the current date line
+        context = self._current_date_context(include_lookup)
         recent = self._recent_exchange_text(history, LLM_KV_ACTION_HISTORY_TURNS)
         if recent:
             context += f"\n\nRecent conversation:\n{recent}"
@@ -753,7 +771,7 @@ class LLMEngine:
                         intent,
                         tool_schemas,
                         user_text,
-                        self._action_context_block(intent, memory_context, history),
+                        self._action_context_block(intent, memory_context, history, user_text),
                         self._GenerationParams(max_tokens=max_tokens, temperature=LLM_TEMP_TOOLS),
                     )
                 self._log_lane_result(result)
