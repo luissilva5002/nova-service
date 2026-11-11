@@ -47,25 +47,37 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 _REAL_EVENT_ID_PATTERN = re.compile(r"^[a-v0-9]{20,}$")
 
 
+class CalendarAuthError(RuntimeError):
+    """Missing/invalid Google credentials. Message is safe to speak to the user."""
+
+
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     return os.environ.get(name, default)
+
+
+def _project_root() -> str:
+    # handler.py lives at <root>/nova/skills/google_calendar/handler.py
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
 def _token_path() -> str:
     configured = _env("GOOGLE_TOKEN_PATH", os.path.join("persistent_memory", "credentials", "google_calendar_token.json"))
     token_path = os.path.expanduser(configured or "")
-    if not os.path.isabs(token_path):
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        candidates = [
-            os.path.join(os.getcwd(), token_path),
-            os.path.join(project_root, token_path),
-            os.path.join(project_root, "data", os.path.basename(token_path)),
-        ]
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                return candidate
-        return os.path.join(project_root, token_path)
-    return token_path
+    if os.path.isabs(token_path):
+        return token_path
+    root = _project_root()
+    name = os.path.basename(token_path)
+    candidates = [
+        os.path.join(root, token_path),                 # canonical: <root>/persistent_memory/credentials/...
+        os.path.join(os.getcwd(), token_path),
+        os.path.join(root, "data", name),
+        os.path.join(root, name),                       # token dropped in repo root
+        os.path.join(os.getcwd(), name),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
 
 
 def _load_credentials() -> Optional[object]:
@@ -81,26 +93,31 @@ def _load_credentials() -> Optional[object]:
 
     token_file = _token_path()
     if not os.path.exists(token_file):
-        raise RuntimeError(
+        raise CalendarAuthError(
             f"No Google Calendar token found at {token_file}. Run "
-            "scripts/get_google_token.py on Windows first, then restart NOVA."
+            "scripts/get_google_token.py, then restart NOVA."
         )
 
     try:
         creds = Credentials.from_authorized_user_file(token_file, SCOPES)
     except Exception as exc:
-        raise RuntimeError(f"Failed to load credentials from {token_file}: {exc}") from exc
+        raise CalendarAuthError(f"Failed to load credentials from {token_file}: {exc}") from exc
 
     if creds.valid:
         return creds
 
     if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except Exception as exc:
+            raise CalendarAuthError(
+                f"Google token refresh failed ({exc}). Re-run scripts/get_google_token.py."
+            ) from exc
         with open(token_file, "w", encoding="utf-8") as f:
             f.write(creds.to_json())
         return creds
 
-    raise RuntimeError(
+    raise CalendarAuthError(
         "Google Calendar token exists but is invalid and has no refresh token. "
         "Re-run scripts/get_google_token.py."
     )
@@ -219,11 +236,15 @@ class GoogleCalendarSkill(BaseSkill):
                 return self._delete_event(arguments)
 
             return "Unknown Google Calendar command."
+        except CalendarAuthError as exc:
+            logger.error("Calendar auth problem executing %s: %s", tool_name, exc)
+            self._service = None
+            return "Google Calendar isn't connected. The authorization token is missing or expired."
         except Exception as exc:
             logger.exception("Error executing %s", tool_name)
             # Keep the raw exception in logs for debugging, but return a simple user
             # sentence so the interface does not leak API details or stack traces.
-            raise RuntimeError(f"I couldn't complete that calendar task.") from exc
+            raise RuntimeError("I couldn't complete that calendar task.") from exc
 
     def _list_today(self, arguments: dict) -> str:
         calendar_id = arguments.get("calendar_id", "primary")
