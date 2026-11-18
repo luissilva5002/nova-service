@@ -110,6 +110,11 @@ LLM_KV_PREWARM_ACTIONS = _env_flag("NOVA_KV_PREWARM_ACTIONS", "true")
 # Action turns are independent. This many most recent user/assistant exchanges
 # are shown to the model as plain text inside the [Context] block (0 = none).
 LLM_KV_ACTION_HISTORY_TURNS = int(os.getenv("NOVA_KV_ACTION_HISTORY_TURNS", "1"))
+# KV-C-lite (default off until scripts/kv_strip_probe.py passes on this machine):
+# after a chat turn is committed, remove the per-turn [Context] block from the
+# live KV cache so the cache matches the stored history and the next turn does
+# not re-evaluate the previous exchange.
+LLM_KV_STRIP_CONTEXT = _env_flag("NOVA_KV_STRIP_CONTEXT", "false")
 
 # System prompt persona - Tier 1 static memory (KV-cached, ~200 tokens target)
 NOVA_PERSONA_PROMPT = os.getenv(

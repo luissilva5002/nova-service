@@ -24,6 +24,10 @@ services:
       - ./persistent_memory:/app/persistent_memory
 
       - ./tests:/app/tests:ro
+
+      # Application code, read-only: after `git pull`, `docker compose restart nova_server` is enough.
+      # Rebuild only when requirements.txt or the Dockerfile change.
+      - ./nova:/app/nova:ro
     env_file:
       - .env
     environment:

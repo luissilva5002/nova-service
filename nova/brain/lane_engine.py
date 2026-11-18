@@ -14,6 +14,7 @@ from nova.brain.generation import (
     TokenGenerator,
     stop_ids_for,
 )
+from nova.brain.kv_edit import StripResult, strip_context as strip_kv_context
 from nova.brain.lanes import Lane, LaneManager, LaneSpec
 
 logger = logging.getLogger("nova.lane_engine")
@@ -45,7 +46,14 @@ class LaneEngine:
         compact_fraction: float = 0.35,
         max_snapshot_bytes: int = 256 * 1024 * 1024,
         base_state_dir: str | Path | None = None,
+        strip_context: bool | None = None,
     ) -> None:
+        if strip_context is None:
+            try:
+                from nova.config import LLM_KV_STRIP_CONTEXT as strip_context
+            except ImportError:
+                strip_context = False
+        self._strip_context = bool(strip_context)
         self._llama = llama
         self._backend = LlamaBackend(llama)
         self._persona = system_prompt
@@ -73,6 +81,10 @@ class LaneEngine:
             "overflows": 0,
             "external_turns": 0,
             "action_turns": 0,
+            "strip_ok": 0,
+            "strip_skipped": 0,
+            "strip_failed": 0,
+            "strip_tokens_removed": 0,
         }
 
     def chat_stream(
@@ -177,6 +189,8 @@ class LaneEngine:
                         )
                         self._stats["turns"] += 1
                         chat_result = result
+                        if committed and self._strip_context:
+                            result.metrics["kv_strip"] = self._strip_committed_context(lane)
 
                 finally:
                     if token_stream is not None:
@@ -328,6 +342,43 @@ class LaneEngine:
                 "action_lane": lane.key,
             },
         )
+
+    def _strip_committed_context(self, lane: Lane) -> str:
+        """KV-C-lite: drop the [Context] block of the turn just committed from the KV.
+
+        Runs inside ``manager.use(lane)``, after generation has finished. Any
+        problem leaves the lane usable: the next turn simply re-evaluates more.
+        """
+        info = lane.context.last_commit
+        if info is None:
+            outcome = StripResult("skipped", "no_commit_info")
+        else:
+            try:
+                outcome = strip_kv_context(
+                    self._llama,
+                    lane.context.history_ids[: info.user_start],
+                    info.shown,
+                    info.clean,
+                )
+            except Exception as exc:  # noqa: BLE001 - never fail a finished turn over an optimization
+                logger.exception("KV strip raised for lane %s", lane.key)
+                try:
+                    self._llama.reset()
+                except Exception:  # noqa: BLE001
+                    logger.exception("Could not reset llama after a failed KV strip")
+                outcome = StripResult("failed", f"{type(exc).__name__}: {exc}")
+        key = {"stripped": "strip_ok", "skipped": "strip_skipped"}.get(outcome.status, "strip_failed")
+        self._stats[key] += 1
+        self._stats["strip_tokens_removed"] += outcome.removed_tokens
+        logger.info(
+            "KV-STRIP lane=%s status=%s reason=%s removed=%d ms=%.1f",
+            lane.key,
+            outcome.status,
+            outcome.reason or "-",
+            outcome.removed_tokens,
+            outcome.seconds * 1000.0,
+        )
+        return outcome.status if not outcome.reason else f"{outcome.status}:{outcome.reason}"
 
     def _action_lane(self, lane_name: str, tools: list[dict]) -> Lane:
         spec = self._action_specs.get(lane_name)

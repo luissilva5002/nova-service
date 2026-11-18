@@ -56,6 +56,52 @@ Action turns see the last `NOVA_KV_ACTION_HISTORY_TURNS` user/assistant
 exchanges (default 1) as plain text in the `[Context]` block, instead of the
 six turns of chat messages the legacy path sends. Set it to 0 to send none.
 
+## Stripping the context block (KV-C-lite)
+
+Every chat turn shows the model a per-turn `[Context]` block (date, known user
+context) in front of the user's text, but the stored history keeps only the clean
+user message. Without further work the KV cache keeps the block, diverges from
+the history at that user message, and the next turn re-evaluates the whole
+previous exchange (about 185 to 250 tokens on a 10-turn chat).
+
+With `NOVA_KV_STRIP_CONTEXT=1`, after a chat turn is committed the lane engine
+removes the block's tokens from the live cache (`kv_cache_seq_rm`, then
+`kv_cache_seq_shift` for the tokens after it) and updates `llama.input_ids` and
+`llama.n_tokens`. The cache then equals the history token for token, so the next
+turn only evaluates the previous reply's end-of-turn tokens, its own `[Context]`
+block, the new user text and the generation prompt. On the laptop this saved
+about 64 evaluated tokens per turn (146 to 82, roughly 1.4 s of prefill).
+
+It is an approximation, not an exact equivalent. The cached states of the user
+text and reply that follow the removed block were computed while the block was
+still visible, so they keep a trace of it that a cold evaluation of the clean
+history would not have. Replies from a stripped cache therefore differ from cold
+replies more often than plain prefix reuse does (7 of 8 turns diverged early in
+`scripts/kv_strip_probe.py`, against 4 of 8 for the no-shift control), though
+they stayed coherent and on topic. Leave the flag off if exact reproducibility
+of replies matters more than about 1.4 s per chat turn.
+
+Safety rules, all enforced in `nova/brain/kv_edit.py`:
+
+- The edit only runs if the cache still holds exactly `history + shown segment`.
+  Otherwise nothing is touched and the turn is counted as skipped.
+- The clean tokens must be the shown tokens minus one contiguous block. If the
+  tokenizer merged tokens across the block's boundary, the turn is skipped.
+- If the shift fails after the removal, the llama context is reset and the lane
+  cold-starts on its next turn (or restores its snapshot). The finished reply is
+  never affected.
+- Action lanes are not involved: they discard their turn and keep only the prefix.
+
+Each stripped turn logs `KV-STRIP lane=... status=... removed=... ms=...` and
+adds `kv_strip` to the reply's metrics (`stripped`, `skipped:<reason>` or
+`failed:<reason>`). `/api/status` reports `strip_ok`, `strip_skipped`,
+`strip_failed` and `strip_tokens_removed` under `kv_lanes`.
+
+It is off by default. Run `python scripts/kv_strip_probe.py` on the machine
+first: it compares the stripped cache against a cold run of the same prompt at
+temperature 0 and prints whether enabling the flag is safe there. Then verify
+through the server with `python scripts/kv_verify_ws.py --expect-strip`.
+
 ## Settings
 
 | Variable | Default | Meaning |
@@ -68,6 +114,7 @@ six turns of chat messages the legacy path sends. Set it to 0 to send none.
 | `NOVA_KV_BASE_DIR` | `data/kv_base` | Where base states are stored. |
 | `NOVA_KV_PREWARM_ACTIONS` | on | Build or restore action-lane prefixes after startup. |
 | `NOVA_KV_ACTION_HISTORY_TURNS` | 1 | Exchanges shown to action turns as text. |
+| `NOVA_KV_STRIP_CONTEXT` | off | Remove each chat turn's `[Context]` block from the KV after commit (KV-C-lite). |
 
 ## Observability
 
@@ -84,15 +131,19 @@ report `lane=action:<intent>`. At startup the log shows one line per action lane
 
 ## Rolling back
 
-Set `NOVA_KV_ACTION_LANES=0` to keep chat lanes but send tool turns through the
-legacy path. Unset `NOVA_KV_LANES` (or set it to `0`) to disable all lanes.
+Set `NOVA_KV_STRIP_CONTEXT=0` to stop stripping (chat lanes still work, they just
+re-evaluate the previous exchange each turn). Set `NOVA_KV_ACTION_LANES=0` to keep
+chat lanes but send tool turns through the legacy path. Unset `NOVA_KV_LANES` (or set it to `0`) to disable all lanes.
 Deleting `data/kv_base/` is always safe; the states are rebuilt.
 
 ## Known limits
 
-- Compaction rebuilds a chat lane from persisted text and starts cold. In-place
-  cache shifting is being evaluated (see `scripts/kv_shift_probe.py`) and is not
-  used in production.
+- Compaction rebuilds a chat lane from persisted text and starts cold. Shifting
+  out whole old turns instead is validated by `scripts/kv_shift_probe.py` but is
+  not used in production yet; only the context-block strip above is.
+- Stripping needs a llama-cpp-python build with `kv_cache_seq_rm` and
+  `kv_cache_seq_shift` (or `kv_cache_seq_add`), and quantized KV types need flash
+  attention. Without them every turn is skipped and behaviour is unchanged.
 - The calendar date block is re-evaluated when the previous turn was not in the
   same action lane. A per-day prefix snapshot would remove that cost.
 - Qwen3 models are not supported by the lane path.

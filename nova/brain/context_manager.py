@@ -87,6 +87,15 @@ class _Turn:
 
 
 @dataclass
+class CommitInfo:
+    """Where the last committed user segment sits, for KV-C-lite (kv_edit.py)."""
+
+    user_start: int  # history length before the clean user segment was appended
+    shown: list[int]  # the user segment as the model saw it (with the context block)
+    clean: list[int]  # the user segment as stored in history
+
+
+@dataclass
 class LoadReport:
     turns_loaded: int
     turns_dropped: int
@@ -118,6 +127,7 @@ class ContextManager:
         self._started = False
         self._turn: Optional[_Turn] = None
         self._history_loaded = False
+        self.last_commit: Optional[CommitInfo] = None  # set by commit_turn, cleared by begin_turn
 
     # ---------- session ----------
 
@@ -168,6 +178,7 @@ class ContextManager:
                 shown_text = f"{user_text}\n\n{context_block}"
             shown = self._b.encode(self._user_segment(shown_text))
         self._turn = _Turn(clean_user=clean, segments=[shown])
+        self.last_commit = None
         return self._compose_or_abort()
 
     def continue_after_tool(self, tool_call_ids: list[int], tool_result_text: str) -> list[int]:
@@ -186,10 +197,16 @@ class ContextManager:
         """Finish the turn. Stores the clean user message and the exact reply ids."""
         self._require_open_turn()
         turn = self._turn
+        user_start = len(self._history)
         self._history += turn.clean_user
         for segment in turn.segments[1:]:
             self._history += segment
         self._history += self._gen_ids + self._close(assistant_token_ids)
+        self.last_commit = CommitInfo(
+            user_start=user_start,
+            shown=list(turn.segments[0]),
+            clean=list(turn.clean_user),
+        )
         self._turn = None
 
     def append_external_turn(self, user_text: str, assistant_text: str) -> None:
