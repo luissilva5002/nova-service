@@ -24,3 +24,5 @@ venv/
 /persistent_memory/
 
 google_calendar_token.json
+*.log
+data/kv_base/
